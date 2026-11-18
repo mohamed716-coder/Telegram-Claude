@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.constants import ParseMode
+from telegram.error import Forbidden, RetryAfter, TelegramError
 
 from ..content import send_content
-from ..db import InsufficientBalance, ShopError, seller_price
+from ..db import InsufficientBalance, PriceChanged, PurchaseResult, ShopError, seller_price
+from ..ratelimit import FloodWait, wait_seconds
 from .common import (
     BLUE,
     GREEN,
     RED,
     Ctx,
+    answer,
     btn,
     callback_ints,
     cfg_of,
+    clear_state,
+    contact_owner,
     db_of,
     esc,
     grid,
@@ -33,11 +39,11 @@ from .common import (
     pager,
     parse_int,
     set_state,
-    clear_state,
     show,
     short,
     stale_button,
     state_handler,
+    try_show,
 )
 
 log = logging.getLogger("shopbot.shop")
@@ -47,6 +53,15 @@ QUICK_QUANTITIES = (1, 2, 3, 5, 10)
 MAX_QUANTITY = 200
 ORDERS_PAGE_SIZE = 8
 CLOSED_TEXT = "🔒 <b>The shop is closed right now.</b>\nPlease check back later."
+
+# Telegram allows about one message per second in a chat, with short bursts. Products
+# are sent in the background: the first few at once, then one every DELIVERY_INTERVAL
+# seconds, so a big order neither hits flood limits nor holds up other customers.
+DELIVERY_BURST = 5
+DELIVERY_INTERVAL = 1.0
+# A flood wait up to this long (seconds) is sat out once before a product counts as
+# not sent. It only pauses this delivery, not the rest of the bot.
+MAX_DELIVERY_WAIT = 60
 
 
 def shop_open_for(context: Ctx, user_id: int) -> bool:
@@ -85,7 +100,7 @@ async def cb_shop(update: Update, context: Ctx) -> None:
     except ValueError:
         await stale_button(update)
         return
-    await query.answer()
+    await answer(query)
     if not shop_open_for(context, query.from_user.id):
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]))
         return
@@ -200,7 +215,7 @@ async def cb_quantity(update: Update, context: Ctx) -> None:
     except ValueError:
         await stale_button(update)
         return
-    await query.answer()
+    await answer(query)
     if not shop_open_for(context, query.from_user.id):
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]))
         return
@@ -216,18 +231,18 @@ async def cb_custom_quantity(update: Update, context: Ctx) -> None:
         return
     db = db_of(context)
     if not shop_open_for(context, query.from_user.id):
-        await query.answer()
+        await answer(query)
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]))
         return
     label = db.get_label(label_id)
     if label is None or db.has_children(label_id) or label["price"] is None:
-        await query.answer("This product isn't available.", show_alert=True)
+        await answer(query, "This product isn't available.", show_alert=True)
         return
     stock = db.count_items(label_id)
     if not stock:
-        await query.answer("Sorry, this product is sold out.", show_alert=True)
+        await answer(query, "Sorry, this product is sold out.", show_alert=True)
         return
-    await query.answer()
+    await answer(query)
     set_state(context, "buy_quantity", label_id=label_id)
     await show(
         update,
@@ -242,6 +257,10 @@ async def cb_custom_quantity(update: Update, context: Ctx) -> None:
 async def on_quantity(update: Update, context: Ctx, state: dict) -> None:
     text = await need_text(update)
     if text is None:
+        return
+    if not shop_open_for(context, update.effective_user.id):  # type: ignore[union-attr]
+        clear_state(context)
+        await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]), new=True)
         return
     db = db_of(context)
     label_id = state["label_id"]
@@ -265,10 +284,14 @@ async def on_quantity(update: Update, context: Ctx, state: dict) -> None:
 
 
 async def render_confirm(
-    update: Update, context: Ctx, label_id: int, quantity: int, *, new: bool = False
+    update: Update, context: Ctx, label_id: int, quantity: int, *, new: bool = False,
+    note: str = "",
 ) -> None:
     db = db_of(context)
     user_id = update.effective_user.id  # type: ignore[union-attr]
+    if not shop_open_for(context, user_id):
+        await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]), new=new)
+        return
     label = db.get_label(label_id)
     if label is None or db.has_children(label_id) or label["price"] is None:
         await show(update, context, "⚠️ This product isn't available.",
@@ -283,8 +306,9 @@ async def render_confirm(
     total = unit * quantity
     balance = db.get_user(user_id)["balance"]  # type: ignore[index]
     path = esc(db.path_text(label_id))
+    prefix = f"{note}\n\n" if note else ""
     if balance < total:
-        text = (
+        text = prefix + (
             "❌ <b>Not enough balance</b>\n\n"
             f"📦 {path}\n🔢 Quantity: {quantity}\n💰 Total: <b>{money(total)}</b>\n"
             f"💳 Your balance: {money(balance)}\n\n"
@@ -296,9 +320,12 @@ async def render_confirm(
         ]
         await show(update, context, text, markup(rows), new=new)
         return
+    # The Confirm button is valid once, for exactly this product, quantity and price.
     nonce = secrets.token_hex(4)
-    context.user_data["buy_nonce"] = nonce  # type: ignore[index]
-    text = (
+    context.user_data["buy_nonce"] = {  # type: ignore[index]
+        "nonce": nonce, "label_id": label_id, "quantity": quantity, "unit": unit,
+    }
+    text = prefix + (
         "🧾 <b>Confirm your purchase</b>\n\n"
         f"📦 {path}\n🔢 Quantity: <b>{quantity}</b>\n💵 Price each: {money(unit)}\n"
         f"💰 Total: <b>{money(total)}</b>\n💳 Balance after: {money(balance - total)}"
@@ -320,27 +347,45 @@ async def cb_confirm(update: Update, context: Ctx) -> None:
     except (ValueError, IndexError):
         await stale_button(update)
         return
-    if context.user_data.get("buy_nonce") != nonce:  # type: ignore[union-attr]
-        await query.answer("This confirmation has expired. Please choose again.", show_alert=True)
+    quote = context.user_data.get("buy_nonce")  # type: ignore[union-attr]
+    if not (
+        isinstance(quote, dict)
+        and quote.get("nonce") == nonce
+        and quote.get("label_id") == label_id
+        and quote.get("quantity") == quantity
+    ):
+        await answer(query, "This confirmation has expired. Please choose again.", show_alert=True)
         return
     context.user_data.pop("buy_nonce", None)  # type: ignore[union-attr]
     user_id = query.from_user.id
     db, cfg = db_of(context), cfg_of(context)
     if not shop_open_for(context, user_id):
-        await query.answer()
+        await answer(query)
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]))
         return
     try:
-        result = db.purchase(user_id, label_id, quantity, cfg.seller_discount_percent)
+        result = db.purchase(
+            user_id, label_id, quantity, cfg.seller_discount_percent, expected_unit=quote["unit"]
+        )
     except InsufficientBalance:
-        await query.answer()
+        await answer(query)
         await render_confirm(update, context, label_id, quantity)
         return
+    except PriceChanged:
+        await answer(query, "⚠️ The price changed. Please check the new total.", show_alert=True)
+        await render_confirm(
+            update, context, label_id, quantity,
+            note="⚠️ <b>The price changed.</b> Nothing was charged — please check the new total.",
+        )
+        return
     except ShopError as exc:
-        await query.answer(str(exc), show_alert=True)
+        await answer(query, str(exc), show_alert=True)
         await render_product(update, context, label_id, note=f"⚠️ {esc(exc)}")
         return
-    await query.answer("✅ Purchase successful!")
+
+    # The purchase is saved. From here on nothing may stop the delivery: every
+    # Telegram call is best-effort.
+    await answer(query, "✅ Purchase successful!")
     order = result.order
     codes = ", ".join(f"<code>{item['code']}</code>" for item in result.items[:50])
     if len(result.items) > 50:
@@ -353,39 +398,110 @@ async def cb_confirm(update: Update, context: Ctx) -> None:
         f"💰 Paid: <b>{money(order['total'])}</b>\n"
         f"💳 New balance: <b>{money(result.new_balance)}</b>\n"
         f"🆔 Product IDs: {codes}\n\n"
-        "Your product(s) 👇"
+        "Your product(s) 👇" + _eta_note(len(result.items))
     )
-    await show(update, context, summary)
-    failed = await deliver_items(context, user_id, result.items)
+    await try_show(update, context, summary)
+
+    async def deliver() -> None:
+        await _finish_purchase(context, user_id, result)
+
+    start_delivery(context, user_id, deliver)
+
+
+def _eta_note(count: int) -> str:
+    seconds = max(0, count - DELIVERY_BURST) * DELIVERY_INTERVAL
+    if seconds < 60:
+        return ""
+    return f"\n⏳ Sending {count} products takes about {round(seconds / 60)} min — please wait."
+
+
+async def _finish_purchase(context: Ctx, chat_id: int, result: PurchaseResult) -> None:
+    order = result.order
+    failed = await deliver_items(context, chat_id, result.items)
     if failed:
         end = (
             f"⚠️ {failed} product(s) could not be sent. Open 🧾 My Orders to get them again, "
-            f"or contact the owner with order <code>#{order['code']}</code>."
+            f"or {contact_owner(context)} with order <code>#{order['code']}</code>."
         )
     else:
-        end = f"✅ Delivered {len(result.items)} product(s). Thank you for your purchase!"
-    await context.bot.send_message(
-        user_id,
-        end,
-        parse_mode="HTML",
-        reply_markup=markup([
-            [btn("🛍 Shop", "sh:0:0", GREEN), btn("🧾 My Orders", "mo:0", BLUE)],
-            [menu_btn()],
-        ]),
-    )
-    await notify_sellers(context, result.order, result.items, result.credits, user_id)
+        end = (
+            f"✅ Delivered {len(result.items)} product(s) from order <code>#{order['code']}</code>. "
+            "Thank you for your purchase!"
+        )
+    try:
+        await context.bot.send_message(
+            chat_id,
+            end,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup([
+                [btn("🛍 Shop", "sh:0:0", GREEN), btn("🧾 My Orders", "mo:0", BLUE)],
+                [menu_btn()],
+            ]),
+        )
+    except TelegramError as exc:
+        log.warning("Could not send the delivery summary for order %s: %s", order["code"], exc)
+    await notify_sellers(context, order, result.items, result.credits, chat_id)
+
+
+# ------------------------------------------------------------------- delivery
+def delivery_running(context: Ctx, chat_id: int) -> bool:
+    return context.bot_data.get("deliveries", {}).get(chat_id, 0) > 0
+
+
+def start_delivery(context: Ctx, chat_id: int, job: Callable[[], Awaitable[None]]) -> None:
+    """Run ``job`` (which sends products to ``chat_id``) in the background.
+
+    Deliveries to the same chat run one after another, so their pacing adds up; the
+    bot keeps answering everyone else meanwhile. A delivery still running at shutdown
+    is finished first (Application.stop waits for it).
+    """
+    running: dict[int, int] = context.bot_data.setdefault("deliveries", {})
+    locks: dict[int, asyncio.Lock] = context.bot_data.setdefault("delivery_locks", {})
+    running[chat_id] = running.get(chat_id, 0) + 1
+    lock = locks.setdefault(chat_id, asyncio.Lock())
+
+    async def run() -> None:
+        try:
+            async with lock:
+                await job()
+        except Exception:  # never surface as "Something went wrong" after a purchase
+            log.exception("Delivery to %s failed", chat_id)
+        finally:
+            running[chat_id] -= 1
+            if running[chat_id] <= 0:
+                running.pop(chat_id, None)
+                locks.pop(chat_id, None)
+
+    context.application.create_task(run(), name=f"shopbot:delivery:{chat_id}")
 
 
 async def deliver_items(context: Ctx, chat_id: int, items: list[Any]) -> int:
-    """Send each product message. Returns how many could not be sent."""
+    """Send each product message, paced for Telegram. Returns how many weren't sent."""
     failed = 0
-    for item in items:
+    for index, item in enumerate(items):
+        if index >= DELIVERY_BURST and DELIVERY_INTERVAL > 0:
+            await asyncio.sleep(DELIVERY_INTERVAL)
         try:
-            await send_content(context.bot, chat_id, json.loads(item["content"]))
+            await _send_product(context, chat_id, json.loads(item["content"]))
+        except Forbidden as exc:  # the buyer blocked the bot: the rest can't arrive either
+            log.warning("Could not deliver to %s: %s", chat_id, exc)
+            return failed + len(items) - index
         except (TelegramError, ValueError, KeyError) as exc:
             failed += 1
             log.warning("Could not deliver item %s to %s: %s", item["code"], chat_id, exc)
     return failed
+
+
+async def _send_product(context: Ctx, chat_id: int, content: dict) -> None:
+    try:
+        await send_content(context.bot, chat_id, content)
+    except (RetryAfter, FloodWait) as exc:
+        seconds = wait_seconds(exc)
+        if seconds > MAX_DELIVERY_WAIT:
+            raise
+        log.info("Flood wait of %.0fs while delivering to %s; retrying once", seconds, chat_id)
+        await asyncio.sleep(seconds + 0.5)
+        await send_content(context.bot, chat_id, content)
 
 
 async def notify_sellers(
@@ -413,7 +529,7 @@ async def cb_orders(update: Update, context: Ctx) -> None:
     except ValueError:
         await stale_button(update)
         return
-    await query.answer()
+    await answer(query)
     db = db_of(context)
     user_id = query.from_user.id
     total = db.count_user_orders(user_id)
@@ -442,24 +558,40 @@ async def cb_order_view(update: Update, context: Ctx) -> None:
         await stale_button(update)
         return
     db = db_of(context)
+    user_id = query.from_user.id
     order = db.get_order(order_id)
-    if order is None or order["buyer_id"] != query.from_user.id:
-        await query.answer("Order not found.", show_alert=True)
+    if order is None or order["buyer_id"] != user_id:
+        await answer(query, "Order not found.", show_alert=True)
         return
-    await query.answer()
+    if delivery_running(context, user_id):
+        await answer(
+            query, "⏳ Your products are still being sent. Please wait until that's done.",
+            show_alert=True,
+        )
+        return
+    await answer(query)
     items = db.order_items(order_id)
-    await context.bot.send_message(
-        query.from_user.id,
+    header = (
         f"🧾 <b>Order <code>#{order['code']}</code></b>\n"
         f"📦 {esc(order['product_name'])}\n"
         f"🔢 Quantity: {order['quantity']} · 💰 {money(order['total'])}\n"
-        f"🕒 {order['created_at']} UTC\n\nYour product(s) 👇",
-        parse_mode="HTML",
+        f"🕒 {order['created_at']} UTC\n\nYour product(s) 👇" + _eta_note(len(items))
     )
-    failed = await deliver_items(context, query.from_user.id, items)
-    end = "✅ Done." if not failed else f"⚠️ {failed} product(s) could not be sent."
-    await context.bot.send_message(
-        query.from_user.id,
-        end,
-        reply_markup=markup([[btn("🧾 My Orders", "mo:0", BLUE), menu_btn()]]),
-    )
+
+    async def resend() -> None:
+        try:
+            await context.bot.send_message(user_id, header, parse_mode=ParseMode.HTML)
+        except TelegramError as exc:
+            log.info("Could not send the order header to %s: %s", user_id, exc)
+        failed = await deliver_items(context, user_id, items)
+        end = "✅ Done." if not failed else f"⚠️ {failed} product(s) could not be sent."
+        try:
+            await context.bot.send_message(
+                user_id,
+                end,
+                reply_markup=markup([[btn("🧾 My Orders", "mo:0", BLUE), menu_btn()]]),
+            )
+        except TelegramError as exc:
+            log.info("Could not send the re-download summary to %s: %s", user_id, exc)
+
+    start_delivery(context, user_id, resend)

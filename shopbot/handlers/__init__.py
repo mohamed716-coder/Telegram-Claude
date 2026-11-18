@@ -30,6 +30,7 @@ COMMANDS = [
     ("close", owner.cmd_close),
     ("open", owner.cmd_open),
     ("status", owner.cmd_status),
+    ("pending", money.cmd_pending),
 ]
 
 # (regex on callback_data, handler). Callback data formats:
@@ -37,7 +38,8 @@ COMMANDS = [
 #   sc:<label>:<qty>:<nonce>  confirm purchase      mo:<page> / mov:<order>  my orders
 #   lb/ln/lp/lr/ld/ldy  labels    ap/apd/apc  add product
 #   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dno  deposits
-#   ea/ew/wall/wok/wno  earnings & withdrawals      menu/cancel/noop  general
+#   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
+#   menu/cancel/noop  general
 CALLBACKS = [
     (r"^menu$", common.cb_menu),
     (r"^cancel$", common.cb_cancel),
@@ -73,11 +75,14 @@ CALLBACKS = [
     (r"^ew$", money.cb_withdraw),
     (r"^wall$", money.cb_withdraw_all),
     (r"^(wok|wno):", money.cb_withdraw_decide),
+    (r"^pq$", money.cb_pending),
 ]
 
 
 def register_handlers(app: Application) -> None:
-    private = filters.ChatType.PRIVATE
+    # Only new messages are input. python-telegram-bot's filters also match edited
+    # messages, which would run an edited command again (e.g. /addbal twice).
+    private = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
     # Group -1 runs first for every update: user tracking, bans, ending flows.
     app.add_handler(TypeHandler(Update, common.pre_handler), group=-1)
     for name, callback in COMMANDS:
@@ -87,4 +92,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(common.cb_unknown))
     app.add_handler(MessageHandler(private & filters.COMMAND, common.on_unknown_command))
     app.add_handler(MessageHandler(private & ~filters.COMMAND, common.on_message))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.UpdateType.EDITED_MESSAGE, common.on_edited_message
+    ))
     app.add_error_handler(common.on_error)

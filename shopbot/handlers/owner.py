@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable, Optional
 from telegram import Update
 from telegram.constants import ParseMode
 
-from ..db import ShopError
+from ..db import BalanceChanged, ShopError
 from .common import (
     Ctx,
     cancel_kb,
@@ -66,6 +66,11 @@ def _not_started_note(row: Any) -> str:
     return "\nℹ️ This user hasn't started the bot yet."
 
 
+def _who(row: Any, user_id: int) -> str:
+    """A user for a reply, without adding unknown IDs to the database."""
+    return user_html(row) if row is not None else f"User <code>{user_id}</code>"
+
+
 # ------------------------------------------------------------ user actions
 async def do_add_admin(update: Update, context: Ctx, target: int) -> None:
     db = db_of(context)
@@ -85,7 +90,7 @@ async def do_add_admin(update: Update, context: Ctx, target: int) -> None:
 async def do_remove_admin(update: Update, context: Ctx, target: int) -> None:
     db = db_of(context)
     if not db.is_admin(target):
-        await reply(update, f"ℹ️ {user_html(db.get_user(target) or db.ensure_user(target))} isn't an admin.")
+        await reply(update, f"ℹ️ {_who(db.get_user(target), target)} isn't an admin.")
         return
     row = db.set_admin(target, False)
     await sync_commands(context, target)
@@ -94,7 +99,13 @@ async def do_remove_admin(update: Update, context: Ctx, target: int) -> None:
         f"✅ {user_html(row)} is no longer an admin.\n"
         "Their products stay in the shop; you can remove or pull them in 📦 My Products.",
     )
-    await notify(context, target, "ℹ️ Your admin access to this shop was removed.")
+    text = "ℹ️ Your admin access to this shop was removed."
+    if row["earnings"] > 0:
+        text += (
+            f"\n💼 You still have <b>{money(row['earnings'])}</b> in earnings: send /withdraw "
+            "to withdraw them, or use 📊 Earnings in the menu (/start)."
+        )
+    await notify(context, target, text)
 
 
 async def do_add_seller(update: Update, context: Ctx, target: int) -> None:
@@ -118,7 +129,7 @@ async def do_remove_seller(update: Update, context: Ctx, target: int) -> None:
     db = db_of(context)
     current = db.get_user(target)
     if current is None or not current["is_seller"]:
-        await reply(update, f"ℹ️ {user_html(current or db.ensure_user(target))} isn't a seller.")
+        await reply(update, f"ℹ️ {_who(current, target)} isn't a seller.")
         return
     row = db.set_seller(target, False)
     await reply(
@@ -160,7 +171,7 @@ async def do_unban(update: Update, context: Ctx, target: int) -> None:
     db = db_of(context)
     current = db.get_user(target)
     if current is None or not current["is_banned"]:
-        await reply(update, f"ℹ️ {user_html(current or db.ensure_user(target))} isn't banned.")
+        await reply(update, f"ℹ️ {_who(current, target)} isn't banned.")
         return
     row = db.set_banned(target, False)
     await reply(update, f"✅ {user_html(row)} is no longer banned.")
@@ -180,7 +191,9 @@ async def ask_add_balance_amount(update: Update, context: Ctx, target: int) -> N
 
 async def ask_new_balance(update: Update, context: Ctx, target: int) -> None:
     row = db_of(context).get_user(target) or db_of(context).ensure_user(target)
-    set_state(context, "owner_amount", action="modifybal", target=target)
+    # Remember the balance shown: if it changes before the answer (a deposit is
+    # approved, the user buys something), the owner is asked again instead.
+    set_state(context, "owner_amount", action="modifybal", target=target, shown=row["balance"])
     await reply(
         update,
         f"💰 <b>Modify balance</b>\n👤 {user_html(row)}\n"
@@ -205,6 +218,7 @@ async def do_add_balance(update: Update, context: Ctx, target: int, amount: int)
     )
     if became_seller:
         text += f"\n⭐ They reached {cfg.seller_auto_threshold}$ in deposits and are now a seller."
+    text += _not_started_note(row)
     await reply(update, text)
     message = (
         f"💰 <b>{money(amount)}</b> was added to your balance.\n"
@@ -218,17 +232,30 @@ async def do_add_balance(update: Update, context: Ctx, target: int, amount: int)
     await notify(context, target, message, markup([[menu_btn()]]))
 
 
-async def do_set_balance(update: Update, context: Ctx, target: int, amount: int) -> None:
+async def do_set_balance(
+    update: Update, context: Ctx, target: int, amount: int, expected: Optional[int] = None
+) -> None:
     db = db_of(context)
     try:
-        old, new = db.set_balance(target, amount)
+        old, new = db.set_balance(target, amount, expected_old=expected)
+    except BalanceChanged as exc:
+        set_state(context, "owner_amount", action="modifybal", target=target, shown=exc.balance)
+        await reply(
+            update,
+            f"⚠️ The balance of {user_html(db.get_user(target))} changed to "
+            f"<b>{money(exc.balance)}</b> while you were typing (a deposit or a purchase), so "
+            "nothing was changed.\n\nSend the new balance again, or press Cancel.",
+            cancel_kb(),
+        )
+        return
     except ShopError as exc:
         await reply(update, f"⚠️ {esc(exc)}")
         return
+    row = db.get_user(target)
     await reply(
         update,
-        f"✅ Balance of {user_html(db.get_user(target))} changed from "
-        f"{money(old)} to <b>{money(new)}</b>.",
+        f"✅ Balance of {user_html(row)} changed from "
+        f"{money(old)} to <b>{money(new)}</b>.{_not_started_note(row)}",
     )
 
 
@@ -307,7 +334,7 @@ async def on_owner_amount(update: Update, context: Ctx, state: dict) -> None:
     if state["action"] == "addbal":
         await do_add_balance(update, context, state["target"], amount)
     else:
-        await do_set_balance(update, context, state["target"], amount)
+        await do_set_balance(update, context, state["target"], amount, state.get("shown"))
 
 
 def _make(action: str) -> Handler:

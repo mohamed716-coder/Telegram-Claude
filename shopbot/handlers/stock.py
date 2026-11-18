@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.constants import MessageLimit, ParseMode
 from telegram.error import TelegramError
 
 from ..content import extract_content, send_content
@@ -21,12 +21,14 @@ from .common import (
     GREEN,
     RED,
     Ctx,
+    answer,
     btn,
     callback_ints,
     cfg_of,
     clear_state,
     csv_safe,
     db_of,
+    edit_hook,
     esc,
     get_state,
     grid,
@@ -42,7 +44,9 @@ from .common import (
     show,
     stale_button,
     state_handler,
+    try_show,
     user_name,
+    utf16_len,
 )
 
 log = logging.getLogger("shopbot.stock")
@@ -52,6 +56,8 @@ ITEMS_PAGE_SIZE = 30
 MAX_BATCH = 1000
 # Seconds of quiet after the last product message before the "Received N" status.
 STATUS_DELAY = 1.5
+# Product messages remembered per seller after Done, to warn when one is edited later.
+REMEMBERED_SAVED = 2000
 
 ADD_PROMPT = (
     "❗ <b>SEND THE PRODUCTS — ONE MESSAGE PER PRODUCT</b>\n"
@@ -68,7 +74,9 @@ def done_cancel_kb() -> Any:
 async def _staff_only(update: Update, context: Ctx) -> bool:
     if is_staff(context, update.effective_user.id):  # type: ignore[union-attr]
         return True
-    await update.callback_query.answer("This section is for the owner and admins.", show_alert=True)  # type: ignore[union-attr]
+    await answer(
+        update.callback_query, "This section is for the owner and admins.", show_alert=True
+    )
     return False
 
 
@@ -90,15 +98,15 @@ async def cb_add_browse(update: Update, context: Ctx) -> None:
     db = db_of(context)
     label = db.get_label(label_id) if label_id else None
     if label_id and label is None:
-        await query.answer("This label no longer exists.", show_alert=True)
+        await answer(query, "This label no longer exists.", show_alert=True)
         return
     if label is not None and not db.has_children(label_id) and label["price"] is None \
             and not is_owner(context, query.from_user.id):
-        await query.answer(
-            "This product has no price yet. Ask the owner to set one first.", show_alert=True
+        await answer(
+            query, "This product has no price yet. Ask the owner to set one first.", show_alert=True
         )
         return
-    await query.answer()
+    await answer(query)
     await render_add(update, context, label_id, page)
 
 
@@ -166,6 +174,7 @@ async def begin_add(
         label_id=label["id"],
         label_name=label["name"],
         items=[],
+        msg_ids=[],  # message id of each product message, to match later edits
         status_msg_id=None,
     )
     text = ADD_PROMPT.format(path=esc(db.path_text(label["id"])), price=money(label["price"]))
@@ -174,18 +183,41 @@ async def begin_add(
     await show(update, context, text, done_cancel_kb(), new=new)
 
 
+UNSUPPORTED = (
+    "⚠️ This kind of message can't be sold. Send text, a photo, video, GIF, file, "
+    "audio, voice message or sticker."
+)
+
+
+def content_problem(content: Any) -> str:
+    """Why a product message can't be stored, or '' if it can."""
+    if content is None:
+        return UNSUPPORTED
+    caption = content.get("caption")
+    if caption and utf16_len(caption) > MessageLimit.CAPTION_LENGTH:
+        # Telegram Premium lets people send longer captions, but bots can only send 1024
+        # characters with a photo or file, so this product could never be delivered.
+        return (
+            f"⚠️ This caption is too long to deliver: bots can send at most "
+            f"{MessageLimit.CAPTION_LENGTH} characters with a photo or file, and this one has "
+            f"{utf16_len(caption)}. Shorten the caption, or send the text as its own message."
+        )
+    return ""
+
+
 @state_handler("add_items")
 async def on_add_item(update: Update, context: Ctx, state: dict) -> None:
     message = update.effective_message
     if not is_staff(context, update.effective_user.id):  # type: ignore[union-attr]
         clear_state(context)
+        await message.reply_text(  # type: ignore[union-attr]
+            "⛔ You're no longer an admin, so products can't be added. Nothing was saved."
+        )
         return
     content = extract_content(message)  # type: ignore[arg-type]
-    if content is None:
-        await message.reply_text(  # type: ignore[union-attr]
-            "⚠️ This kind of message can't be sold. Send text, a photo, video, GIF, file, "
-            "audio, voice message or sticker."
-        )
+    problem = content_problem(content)
+    if problem:
+        await message.reply_text(problem)  # type: ignore[union-attr]
         return
     if len(state["items"]) >= MAX_BATCH:
         await message.reply_text(  # type: ignore[union-attr]
@@ -193,7 +225,52 @@ async def on_add_item(update: Update, context: Ctx, state: dict) -> None:
         )
         return
     state["items"].append(content)
+    state.setdefault("msg_ids", []).append(message.message_id)  # type: ignore[union-attr]
     _schedule_status(update, context, state)
+
+
+@edit_hook
+async def on_product_edit(update: Update, context: Ctx) -> bool:
+    """An edited product message: replace it if it isn't saved yet, warn if it is."""
+    message = update.edited_message
+    if message is None or context.user_data is None:
+        return False
+    state = get_state(context)
+    if state is not None and state.get("name") == "add_items" and is_staff(context, update.effective_user.id):  # type: ignore[union-attr]
+        msg_ids = state.get("msg_ids") or []
+        if message.message_id in msg_ids:
+            index = msg_ids.index(message.message_id)
+            content = extract_content(message)
+            problem = content_problem(content)
+            if problem:
+                await message.reply_text(problem + "\nThe version you sent first is kept.")
+                return True
+            state["items"][index] = content
+            await message.reply_text(
+                f"✏️ Product {index + 1} updated — the edited version will be saved."
+            )
+            return True
+    code = context.user_data.get("saved_products", {}).get(message.message_id)
+    if code is None:
+        return False
+    item = db_of(context).get_item_by_code(code)
+    if item is not None and item["status"] == "available":
+        text = (
+            f"⚠️ Product <code>{code}</code> was already saved, so this edit doesn't change it.\n"
+            "To fix it, remove it in 📦 My Products and add the corrected one."
+        )
+    else:
+        text = f"⚠️ Product <code>{code}</code> is no longer in stock, so this edit changes nothing."
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    return True
+
+
+def _remember_saved(context: Ctx, msg_ids: list[int], codes: list[str]) -> None:
+    saved: dict[int, str] = context.user_data.setdefault("saved_products", {})  # type: ignore[union-attr]
+    for msg_id, code in zip(msg_ids, codes):
+        saved[msg_id] = code
+    while len(saved) > REMEMBERED_SAVED:
+        saved.pop(next(iter(saved)))
 
 
 def _schedule_status(update: Update, context: Ctx, state: dict) -> None:
@@ -224,7 +301,9 @@ def _schedule_status(update: Update, context: Ctx, state: dict) -> None:
             except TelegramError:
                 pass
 
-    user_data["status_task"] = context.application.create_task(post_status(), update=update)  # type: ignore[index]
+    user_data["status_task"] = context.application.create_task(  # type: ignore[index]
+        post_status(), update=update, name=f"shopbot:status:{chat_id}"
+    )
 
 
 async def _drop_status_message(update: Update, context: Ctx, state: dict) -> None:
@@ -241,15 +320,15 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "add_items":
-        await query.answer("There is nothing to save.", show_alert=True)
+        await answer(query, "There is nothing to save.", show_alert=True)
         return
     user_id = query.from_user.id
     if not is_staff(context, user_id):
         clear_state(context)
-        await query.answer("This section is for the owner and admins.", show_alert=True)
+        await answer(query, "This section is for the owner and admins.", show_alert=True)
         return
     if not state["items"]:
-        await query.answer("Send at least one product message first.", show_alert=True)
+        await answer(query, "Send at least one product message first.", show_alert=True)
         return
     db = db_of(context)
     label_id = state["label_id"]
@@ -257,11 +336,13 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
         codes = db.add_items(label_id, user_id, state["items"])
     except ShopError as exc:
         clear_state(context)
-        await query.answer()
+        await answer(query)
         await show(update, context, f"⚠️ {esc(exc)}", markup([[menu_btn()]]))
         return
+    # Saved. Telegram errors from here on must not look like "nothing was saved".
     clear_state(context)
-    await query.answer(f"✅ Saved {len(codes)}")
+    _remember_saved(context, state.get("msg_ids") or [], codes)
+    await answer(query, f"✅ Saved {len(codes)}")
     await _drop_status_message(update, context, state)
     label = db.get_label(label_id)
     shown = " ".join(f"<code>{code}</code>" for code in codes[:60])
@@ -278,18 +359,21 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
         [btn("➕ Add more", f"ap:{label_id}:0", GREEN), btn("📦 My Products", f"mi:{label_id}:0", BLUE)],
         [menu_btn()],
     ]
-    await show(update, context, text, markup(rows))
+    if not await try_show(update, context, text, markup(rows)):
+        await try_show(update, context, text, markup(rows), new=True)
 
 
 async def cb_add_cancel(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "add_items":
-        await query.answer()
+        # An old Cancel button: it still cancels whatever is in progress, as it says.
+        clear_state(context)
+        await answer(query)
         await show(update, context, "❌ Cancelled.", markup([[menu_btn()]]))
         return
     clear_state(context)
-    await query.answer("Cancelled")
+    await answer(query, "Cancelled")
     await _drop_status_message(update, context, state)
     count = len(state["items"])
     await show(
@@ -310,7 +394,7 @@ async def cb_mine(update: Update, context: Ctx) -> None:
         return
     if not await _staff_only(update, context):
         return
-    await query.answer()
+    await answer(query)
     await render_mine(update, context, label_id, page)
 
 
@@ -369,7 +453,7 @@ async def cb_items(update: Update, context: Ctx) -> None:
         return
     if not await _staff_only(update, context):
         return
-    await query.answer()
+    await answer(query)
     await render_items(update, context, label_id, page)
 
 
@@ -451,10 +535,10 @@ async def _load_item(update: Update, context: Ctx) -> Any:
         return None
     item = db_of(context).get_item(item_id)
     if item is None or item["status"] != "available":
-        await query.answer("This product is no longer in stock.", show_alert=True)  # type: ignore[union-attr]
+        await answer(query, "This product is no longer in stock.", show_alert=True)
         return None
     if not _can_manage(context, query.from_user.id, item):  # type: ignore[union-attr]
-        await query.answer("You can only manage your own products.", show_alert=True)  # type: ignore[union-attr]
+        await answer(query, "You can only manage your own products.", show_alert=True)
         return None
     return item
 
@@ -464,7 +548,7 @@ async def cb_item_view(update: Update, context: Ctx) -> None:
     if item is None:
         return
     query = update.callback_query
-    await query.answer()  # type: ignore[union-attr]
+    await answer(query)
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     try:
         await send_content(context.bot, chat_id, json.loads(item["content"]))
@@ -483,7 +567,7 @@ async def cb_item_remove(update: Update, context: Ctx) -> None:
     item = await _load_item(update, context)
     if item is None:
         return
-    await update.callback_query.answer()  # type: ignore[union-attr]
+    await answer(update.callback_query)
     await show(
         update,
         context,
@@ -503,11 +587,14 @@ async def cb_item_remove_yes(update: Update, context: Ctx) -> None:
     query = update.callback_query
     closed = db_of(context).close_item(item["id"], "removed", query.from_user.id)  # type: ignore[union-attr]
     if closed is None:
-        await query.answer("This product is no longer in stock.", show_alert=True)  # type: ignore[union-attr]
+        await answer(query, "This product is no longer in stock.", show_alert=True)
         return
-    await query.answer("🗑 Removed")  # type: ignore[union-attr]
-    await render_items(update, context, item["label_id"],
-                       note=f"🗑 Product <code>{item['code']}</code> was removed.")
+    await answer(query, "🗑 Removed")
+    try:
+        await render_items(update, context, item["label_id"],
+                           note=f"🗑 Product <code>{item['code']}</code> was removed.")
+    except TelegramError as exc:
+        log.info("Could not show the list after removing %s: %s", item["code"], exc)
 
 
 async def cb_item_pull(update: Update, context: Ctx) -> None:
@@ -518,26 +605,37 @@ async def cb_item_pull(update: Update, context: Ctx) -> None:
     db = db_of(context)
     closed = db.close_item(item["id"], "pulled", query.from_user.id)  # type: ignore[union-attr]
     if closed is None:
-        await query.answer("This product is no longer in stock.", show_alert=True)  # type: ignore[union-attr]
+        await answer(query, "This product is no longer in stock.", show_alert=True)
         return
-    await query.answer("📤 Pulled")  # type: ignore[union-attr]
+    # Pulled. Every Telegram call from here on is best-effort, so the product itself is
+    # always sent even if a step before it fails.
+    await answer(query, "📤 Pulled")
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
-    await show(
+    await try_show(
         update,
         context,
         f"📤 Product <code>{item['code']}</code> was pulled from the shop and sent to you below.",
         markup([[btn("⬅️ Back to list", f"mi:{item['label_id']}:0"), menu_btn()]]),
     )
-    await context.bot.send_message(
-        chat_id,
-        f"📤 <b>Pulled product</b>\n🆔 <code>{item['code']}</code>\n"
-        f"📦 {esc(db.path_text(item['label_id']))}\n\nYour product 👇",
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        await context.bot.send_message(
+            chat_id,
+            f"📤 <b>Pulled product</b>\n🆔 <code>{item['code']}</code>\n"
+            f"📦 {esc(db.path_text(item['label_id']))}\n\nYour product 👇",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        log.info("Could not send the pull header to %s: %s", chat_id, exc)
     try:
         await send_content(context.bot, chat_id, json.loads(item["content"]))
     except (TelegramError, ValueError, KeyError) as exc:
-        await context.bot.send_message(chat_id, f"⚠️ Couldn't send the product's message: {exc}")
+        log.warning("Could not send pulled product %s to %s: %s", item["code"], chat_id, exc)
+        try:
+            await context.bot.send_message(
+                chat_id, f"⚠️ Couldn't send the product's message: {exc}"
+            )
+        except TelegramError:
+            pass
 
 
 # ============================================================ Sales analysis
@@ -550,9 +648,9 @@ async def cb_analysis(update: Update, context: Ctx) -> None:
     owner_filter = _owner_filter(context, user_id)
     rows = db.sales_analysis(owner_filter)
     if not rows:
-        await query.answer("There are no products yet.", show_alert=True)
+        await answer(query, "There are no products yet.", show_alert=True)
         return
-    await query.answer("📥 Preparing the file…")
+    await answer(query, "📥 Preparing the file…")
 
     def seller_label(owner_id: int, owner: Any) -> str:
         return "Owner" if owner_id == cfg.owner_id else user_name(owner)

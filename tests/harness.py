@@ -29,6 +29,7 @@ from telegram.request import BaseRequest
 
 from shopbot.app import build_application
 from shopbot.config import Settings
+from shopbot.handlers import shop as shop_module
 from shopbot.handlers import stock as stock_module
 
 OWNER_ID = 6883493877
@@ -204,6 +205,7 @@ class ShopTest:
         self._update_ids = itertools.count(1)
         self._incoming_ids = itertools.count(1)
         stock_module.STATUS_DELAY = 0  # post the "Received N" status immediately
+        shop_module.DELIVERY_INTERVAL = 0  # deliver products without pacing
 
     async def __aenter__(self) -> "ShopTest":
         await self.app.initialize()
@@ -225,8 +227,18 @@ class ShopTest:
         return self.tg.calls[mark:]
 
     async def settle(self) -> None:
-        """Let background tasks (e.g. the add-product status message) finish."""
-        for _ in range(5):
+        """Let background tasks (deliveries, the add-product status message) finish."""
+        for _ in range(3):
+            await asyncio.sleep(0.005)
+        for _ in range(100):
+            busy = [task for task in asyncio.all_tasks()
+                    if task.get_name().startswith("shopbot:") and not task.done()]
+            if not busy:
+                break
+            await asyncio.wait(busy, timeout=1)
+        else:
+            raise AssertionError(f"background tasks did not finish: {busy}")
+        for _ in range(2):
             await asyncio.sleep(0.005)
 
     def _chat(self, user: dict) -> dict:

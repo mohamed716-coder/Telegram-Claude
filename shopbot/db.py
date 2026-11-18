@@ -10,6 +10,7 @@ Each method that changes several rows does so inside one transaction.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
+
+log = logging.getLogger("shopbot.db")
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I look-alikes
 CODE_LENGTH = 8
@@ -146,6 +149,22 @@ class InsufficientBalance(ShopError):
         self.total = total
 
 
+class PriceChanged(ShopError):
+    """The price is no longer the one the buyer confirmed. Nothing was bought."""
+
+    def __init__(self, unit: int) -> None:
+        super().__init__("The price changed. Please check the new total and confirm again.")
+        self.unit = unit
+
+
+class BalanceChanged(ShopError):
+    """The balance changed after it was shown. Nothing was changed."""
+
+    def __init__(self, balance: int) -> None:
+        super().__init__("The balance changed in the meantime.")
+        self.balance = balance
+
+
 @dataclass
 class PurchaseResult:
     order: sqlite3.Row
@@ -178,9 +197,14 @@ class Database:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._tx_depth = 0
         self.conn.execute("PRAGMA foreign_keys = ON")
         if path != ":memory:":
-            self.conn.execute("PRAGMA journal_mode = WAL")
+            mode = self.conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                # Happens on some network drives. The bot still works, but a program that
+                # reads the file at the same time (e.g. a DB browser) can make writes fail.
+                log.warning("SQLite WAL mode is not available here (journal mode: %s).", mode)
         self.conn.executescript(SCHEMA)
         self.ensure_user(owner_id)
 
@@ -190,17 +214,37 @@ class Database:
     # ------------------------------------------------------------------ helpers
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        if self.conn.in_transaction:  # nested call: join the outer transaction
-            yield self.conn
+        """One transaction. A nested call joins the outer one.
+
+        If COMMIT fails (disk full, database locked by another program), the transaction
+        is rolled back and the error raised, so later writes don't silently end up in a
+        transaction that never commits.
+        """
+        if self._tx_depth:
+            self._tx_depth += 1
+            try:
+                yield self.conn
+            finally:
+                self._tx_depth -= 1
             return
         self.conn.execute("BEGIN IMMEDIATE")
+        self._tx_depth = 1
         try:
             yield self.conn
         except BaseException:
-            self.conn.execute("ROLLBACK")
+            self._tx_depth = 0
+            self._rollback()
             raise
-        else:
+        self._tx_depth = 0
+        try:
             self.conn.execute("COMMIT")
+        except BaseException:
+            self._rollback()
+            raise
+
+    def _rollback(self) -> None:
+        if self.conn.in_transaction:
+            self.conn.execute("ROLLBACK")
 
     def _one(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
         return self.conn.execute(sql, params).fetchone()
@@ -545,6 +589,9 @@ class Database:
     def get_item(self, item_id: int) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM items WHERE id = ?", (item_id,))
 
+    def get_item_by_code(self, code: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM items WHERE code = ?", (code,))
+
     def list_items(
         self, label_id: int, owner_id: Optional[int] = None, offset: int = 0, limit: int = 30
     ) -> list[sqlite3.Row]:
@@ -578,8 +625,19 @@ class Database:
 
     # ---------------------------------------------------------------- purchases
     def purchase(
-        self, buyer_id: int, label_id: int, quantity: int, seller_discount_percent: int
+        self,
+        buyer_id: int,
+        label_id: int,
+        quantity: int,
+        seller_discount_percent: int,
+        expected_unit: Optional[int] = None,
     ) -> PurchaseResult:
+        """Buy ``quantity`` items of a product, oldest stock first.
+
+        ``expected_unit`` is the price each that the buyer was shown and confirmed; if the
+        price is different now (the owner changed it, or the seller discount ended),
+        PriceChanged is raised and nothing is bought.
+        """
         if quantity < 1:
             raise ShopError("The quantity must be at least 1.")
         with self.tx():
@@ -594,6 +652,8 @@ class Database:
             unit = label["price"]
             if buyer["is_seller"]:
                 unit = seller_price(unit, seller_discount_percent)
+            if expected_unit is not None and unit != expected_unit:
+                raise PriceChanged(unit)
             total = unit * quantity
             rows = self._all(
                 "SELECT id, owner_id FROM items WHERE label_id = ? AND status = 'available'"
@@ -721,12 +781,20 @@ class Database:
             became_seller = self._maybe_auto_seller(user_id, seller_threshold)
         return self.get_user(user_id), became_seller  # type: ignore[return-value]
 
-    def set_balance(self, user_id: int, new_balance: int) -> tuple[int, int]:
-        """Owner correction (/modifybal). Returns (old, new). Not counted as a deposit."""
+    def set_balance(
+        self, user_id: int, new_balance: int, expected_old: Optional[int] = None
+    ) -> tuple[int, int]:
+        """Owner correction (/modifybal). Returns (old, new). Not counted as a deposit.
+
+        With ``expected_old`` (the balance the owner was shown), BalanceChanged is raised
+        instead if the balance changed since, e.g. because a deposit was approved.
+        """
         if new_balance < 0:
             raise ShopError("The balance can't be negative.")
         with self.tx():
             old = int(self.ensure_user(user_id)["balance"])
+            if expected_old is not None and old != expected_old:
+                raise BalanceChanged(old)
             self.conn.execute(
                 "UPDATE users SET balance = ? WHERE id = ?", (new_balance, user_id)
             )
@@ -765,6 +833,25 @@ class Database:
 
     def get_withdrawal(self, withdrawal_id: int) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+
+    # ------------------------------------------------------- pending requests
+    def pending_deposits(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM deposits WHERE status = 'pending' ORDER BY id LIMIT ?", (limit,)
+        )
+
+    def pending_withdrawals(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id LIMIT ?", (limit,)
+        )
+
+    def count_pending_requests(self) -> int:
+        return int(
+            self._scalar(
+                "SELECT (SELECT COUNT(*) FROM deposits WHERE status = 'pending')"
+                " + (SELECT COUNT(*) FROM withdrawals WHERE status = 'pending')"
+            )
+        )
 
     def decide_withdrawal(self, withdrawal_id: int, approve: bool) -> sqlite3.Row:
         with self.tx():

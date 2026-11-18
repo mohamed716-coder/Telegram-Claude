@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 import logging
 import re
 from typing import Any, Awaitable, Callable, Optional
@@ -10,6 +12,7 @@ from typing import Any, Awaitable, Callable, Optional
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -31,11 +34,15 @@ GREEN, BLUE, RED = "success", "primary", "danger"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 OWNER, ADMIN, USER = "owner", "admin", "user"
 
+# The largest number SQLite can store. Bigger ids in callback data are invalid.
+MAX_DB_INT = 2**63 - 1
+
 # Callback prefixes that must NOT end the action in progress (see pre_handler).
 KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "wall", "dok", "dno", "wok", "wno", "noop"}
 
 BOT_DESCRIPTION = "🛍 Welcome to the shop!\n\nPress /start to start the shop."
 BOT_SHORT_DESCRIPTION = "🛍 Send /start to start the shop."
+EDIT_HINT = "✏️ Edited messages are ignored. Please send a new message instead."
 
 USER_COMMANDS = [
     ("start", "Start the shop"),
@@ -63,6 +70,7 @@ OWNER_COMMANDS = [
     ("close", "Close the shop"),
     ("open", "Open the shop"),
     ("status", "All users, balances and deposits"),
+    ("pending", "Deposits and withdrawals to review"),
     ("cancel", "Cancel the current action"),
 ]
 
@@ -90,6 +98,26 @@ def is_owner(context: Ctx, user_id: int) -> bool:
 
 def is_staff(context: Ctx, user_id: int) -> bool:
     return role_of(context, user_id) in (OWNER, ADMIN)
+
+
+def support_contact(context: Ctx) -> str:
+    """Who customers should write to: SUPPORT_CONTACT, else the owner's @username."""
+    cfg = cfg_of(context)
+    value = (cfg.support_contact or "").strip()
+    if value.lower() in ("none", "off", "no", "-"):
+        return ""
+    if value:
+        return value
+    row = db_of(context).get_user(cfg.owner_id)
+    if row is not None and row["username"]:
+        return f"@{row['username']}"
+    return ""
+
+
+def contact_owner(context: Ctx) -> str:
+    """'contact @support' when a contact is known, else 'contact the owner' (HTML)."""
+    contact = support_contact(context)
+    return f"contact {esc(contact)}" if contact else "contact the owner"
 
 
 # ----------------------------------------------------------------- formatting
@@ -122,6 +150,11 @@ def parse_int(text: Optional[str]) -> Optional[int]:
     """A whole number such as '25' or '25$'. None when invalid."""
     match = _INT_RE.match((text or "").strip())
     return int(match.group(1)) if match else None
+
+
+def utf16_len(text: Optional[str]) -> int:
+    """Length as Telegram counts it (UTF-16 code units)."""
+    return len((text or "").encode("utf-16-le")) // 2
 
 
 def user_name(row: Any) -> str:
@@ -196,13 +229,13 @@ def page_count(total: int, size: int) -> int:
     return max(1, (total + size - 1) // size)
 
 
-def callback_ints(data: str, count: int) -> list[int]:
-    """'xx:1:2' -> [1, 2]. Raises ValueError for malformed data."""
-    parts = data.split(":")[1:]
+def callback_ints(data: Optional[str], count: int) -> list[int]:
+    """'xx:1:2' -> [1, 2]. Raises ValueError for malformed or out-of-range data."""
+    parts = (data or "").split(":")[1:]
     if len(parts) < count:
         raise ValueError(data)
     values = [int(p) for p in parts[:count]]
-    if any(v < 0 for v in values):
+    if any(v < 0 or v > MAX_DB_INT for v in values):
         raise ValueError(data)
     return values
 
@@ -211,6 +244,10 @@ def callback_ints(data: str, count: int) -> list[int]:
 StateHandler = Callable[[Update, Ctx, dict], Awaitable[None]]
 STATE_HANDLERS: dict[str, StateHandler] = {}
 
+# Called for edited messages, in order, until one returns True (it handled the edit).
+EditHook = Callable[[Update, Ctx], Awaitable[bool]]
+EDIT_HOOKS: list[EditHook] = []
+
 
 def state_handler(name: str) -> Callable[[StateHandler], StateHandler]:
     def decorator(func: StateHandler) -> StateHandler:
@@ -218,6 +255,11 @@ def state_handler(name: str) -> Callable[[StateHandler], StateHandler]:
         return func
 
     return decorator
+
+
+def edit_hook(func: EditHook) -> EditHook:
+    EDIT_HOOKS.append(func)
+    return func
 
 
 def get_state(context: Ctx) -> Optional[dict]:
@@ -243,6 +285,22 @@ def set_state(context: Ctx, name: str, **data: Any) -> dict:
 
 
 # --------------------------------------------------------------------- output
+async def answer(
+    query: Optional[CallbackQuery], text: Optional[str] = None, show_alert: bool = False
+) -> None:
+    """Answer a button press. Never raises.
+
+    Telegram refuses to answer a press that waited too long ("query is too old"), and
+    the network can time out. Neither may stop the action the press asked for.
+    """
+    if query is None:
+        return
+    try:
+        await query.answer(text, show_alert=show_alert)
+    except TelegramError as exc:
+        log.info("Could not answer a button press: %s", exc)
+
+
 async def show(
     update: Update,
     context: Ctx,
@@ -280,6 +338,24 @@ async def show(
     )
 
 
+async def try_show(
+    update: Update,
+    context: Ctx,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    *,
+    new: bool = False,
+) -> bool:
+    """show() for use after a change was saved: a Telegram error is logged, not raised,
+    so the steps that follow (deliveries, notifications) still run."""
+    try:
+        await show(update, context, text, reply_markup, new=new)
+        return True
+    except TelegramError as exc:
+        log.warning("Could not show a message to %s: %s", update.effective_chat.id, exc)  # type: ignore[union-attr]
+        return False
+
+
 async def notify(
     context: Ctx, chat_id: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None
 ) -> bool:
@@ -296,6 +372,20 @@ async def notify(
     except TelegramError as exc:
         log.info("Could not notify %s: %s", chat_id, exc)
         return False
+
+
+async def tell(update: Update, text: str, *, alert: bool = False) -> None:
+    """Best-effort short reply: an alert for a button press, else a message."""
+    if update.callback_query is not None:
+        await answer(update.callback_query, text, show_alert=alert)
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    try:
+        await message.reply_text(text)
+    except TelegramError as exc:
+        log.info("Could not reply to %s: %s", update.effective_chat.id, exc)  # type: ignore[union-attr]
 
 
 async def need_text(update: Update) -> Optional[str]:
@@ -322,14 +412,17 @@ def panel_text(context: Ctx, user_id: int) -> str:
     lines = [f"👋 <b>{title}</b>", "", f"💰 Balance: <b>{money(row['balance'])}</b>"]
     if row["is_seller"]:
         lines.append(f"⭐ Seller — <b>{cfg.seller_discount_percent}% off</b> all products")
-    if role in (OWNER, ADMIN):
+    if role in (OWNER, ADMIN) or row["earnings"] > 0:
         lines.append(f"💼 Earnings: <b>{money(row['earnings'])}</b>")
     if role == OWNER:
         lines.append("🏪 Shop: " + ("🟢 Open" if db.shop_is_open() else "🔴 Closed"))
+        pending = db.count_pending_requests()
+        if pending:
+            lines.append(f"📥 Requests waiting for you: <b>{pending}</b>")
     return "\n".join(lines)
 
 
-def panel_keyboard(role: str) -> InlineKeyboardMarkup:
+def panel_keyboard(role: str, *, earnings: int = 0, pending: int = 0) -> InlineKeyboardMarkup:
     shop = btn("🛍 Shop", "sh:0:0", GREEN)
     add_balance = btn("💳 Add Balance", "dp", GREEN)
     if role == OWNER:
@@ -338,6 +431,8 @@ def panel_keyboard(role: str) -> InlineKeyboardMarkup:
             [btn("➕ Add Product", "ap:0:0", GREEN), btn("🏷 Add Label", "lb:0:0", GREEN)],
             [btn("📊 Earnings", "ea", BLUE), add_balance],
         ]
+        if pending:
+            rows.append([btn(f"📥 Pending requests ({pending})", "pq", BLUE)])
     elif role == ADMIN:
         rows = [
             [shop, btn("📦 My Products", "mp:0:0", BLUE)],
@@ -346,18 +441,28 @@ def panel_keyboard(role: str) -> InlineKeyboardMarkup:
         ]
     else:
         rows = [[shop, add_balance], [btn("🧾 My Orders", "mo:0", BLUE)]]
+        if earnings > 0:  # e.g. a removed admin who still has money to withdraw
+            rows[1].append(btn("📊 Earnings", "ea", BLUE))
     return markup(rows)
 
 
 async def send_panel(update: Update, context: Ctx, *, new: bool = False, note: str = "") -> None:
     user_id = update.effective_user.id  # type: ignore[union-attr]
+    db = db_of(context)
     text = panel_text(context, user_id)
     if note:
         text = f"{note}\n\n{text}"
-    await show(update, context, text, panel_keyboard(role_of(context, user_id)), new=new)
+    role = role_of(context, user_id)
+    row = db.get_user(user_id)
+    keyboard = panel_keyboard(
+        role,
+        earnings=row["earnings"] if row is not None else 0,
+        pending=db.count_pending_requests() if role == OWNER else 0,
+    )
+    await show(update, context, text, keyboard, new=new)
 
 
-def help_text(role: str, cfg: Settings) -> str:
+def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "") -> str:
     lines = ["📖 <b>Commands</b>"]
     if role == OWNER:
         lines += [
@@ -374,6 +479,7 @@ def help_text(role: str, cfg: Settings) -> str:
             "/close — close the shop",
             "/open — open the shop",
             "/status — all users with ID, name, balance and deposits",
+            "/pending — deposits and withdrawals waiting for your answer",
             "",
             "Buttons: 🛍 Shop · 📦 My Products · ➕ Add Product · 🏷 Add Label · "
             "📊 Earnings · 💳 Add Balance",
@@ -397,12 +503,16 @@ def help_text(role: str, cfg: Settings) -> str:
         "/cancel — cancel the current action",
     ]
     if role == USER:
+        if earnings > 0:
+            lines.append(f"/withdraw — withdraw your earnings ({money(earnings)} available)")
         lines.append("Buttons: 🛍 Shop · 💳 Add Balance · 🧾 My Orders")
     lines += [
         "",
         f"⭐ Sellers get {cfg.seller_discount_percent}% off every product. You become a seller "
         f"automatically once your total deposits reach {cfg.seller_auto_threshold}$.",
     ]
+    if support and role != OWNER:
+        lines += ["", f"💬 Questions or problems? Contact {esc(support)}"]
     return "\n".join(lines)
 
 
@@ -429,25 +539,53 @@ async def sync_commands(context: Ctx, user_id: int) -> None:
         log.info("Could not set commands for %s: %s", user_id, exc)
 
 
+PROFILE_SETTING = "bot_profile"
+
+
+def _profile_signature(owner_id: int, admin_ids: list[int]) -> str:
+    payload = json.dumps(
+        [BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION, USER_COMMANDS, ADMIN_COMMANDS,
+         OWNER_COMMANDS, owner_id, admin_ids],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 async def setup_bot_profile(application: Any) -> None:
-    """Bot description, default command list and per-chat lists for staff."""
+    """Bot description, default command list and per-chat lists for staff.
+
+    Skipped when nothing changed since the last successful run, so restarting the bot
+    doesn't call Telegram's bot-settings methods (which have strict flood limits) again.
+    """
     bot = application.bot
     db: Database = application.bot_data["db"]
     cfg: Settings = application.bot_data["settings"]
-    try:
-        await bot.set_my_description(BOT_DESCRIPTION)
-        await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
-        await bot.set_my_commands(_commands(USER_COMMANDS))
-    except TelegramError as exc:
-        log.warning("Could not set the bot description/commands: %s", exc)
-    staff = [(cfg.owner_id, OWNER_COMMANDS)] + [
-        (row["id"], ADMIN_COMMANDS) for row in db.list_admins() if row["id"] != cfg.owner_id
-    ]
+    admins = [row["id"] for row in db.list_admins() if row["id"] != cfg.owner_id]
+    signature = _profile_signature(cfg.owner_id, admins)
+    if db.get_setting(PROFILE_SETTING) == signature:
+        log.info("Bot profile is up to date.")
+        return
+
+    profile_ok = True
+    for what, call in (
+        ("description", lambda: bot.set_my_description(BOT_DESCRIPTION)),
+        ("short description", lambda: bot.set_my_short_description(BOT_SHORT_DESCRIPTION)),
+        ("command menu", lambda: bot.set_my_commands(_commands(USER_COMMANDS))),
+    ):
+        try:
+            await call()
+        except TelegramError as exc:
+            profile_ok = False
+            log.warning("Could not set the bot %s: %s", what, exc)
+
+    staff = [(cfg.owner_id, OWNER_COMMANDS)] + [(admin_id, ADMIN_COMMANDS) for admin_id in admins]
     for chat_id, commands in staff:
         try:
             await bot.set_my_commands(_commands(commands), scope=BotCommandScopeChat(chat_id))
         except TelegramError as exc:  # e.g. that user never opened the bot yet
             log.info("Could not set commands for %s: %s", chat_id, exc)
+    if profile_ok:
+        db.set_setting(PROFILE_SETTING, signature)
 
 
 # ------------------------------------------------------------------- handlers
@@ -459,21 +597,34 @@ def _is_command(update: Update) -> bool:
 
 
 async def pre_handler(update: Update, context: Ctx) -> None:
-    """Runs before every other handler: private chats only, register user, bans, flows."""
+    """Runs before every other handler: private chats only, register user, bans, flows.
+
+    Raising ApplicationHandlerStop is the only way to keep an update away from the
+    other handlers, so every path that must block an update ends with it, even when
+    the database or Telegram fails on the way.
+    """
     chat = update.effective_chat
     user = update.effective_user
     if chat is None or chat.type != ChatType.PRIVATE or user is None or user.is_bot:
         raise ApplicationHandlerStop
     db = db_of(context)
-    db.touch_user(user.id, user.first_name, user.last_name, user.username)
+    try:
+        db.touch_user(user.id, user.first_name, user.last_name, user.username)
+        banned = db.is_banned(user.id)
+    except Exception as exc:  # e.g. the database is locked: don't let the update through unchecked
+        log.exception("Could not check user %s", user.id)
+        await tell(update, "⚠️ Something went wrong. Please try again in a moment.", alert=True)
+        raise ApplicationHandlerStop from exc
 
-    if db.is_banned(user.id):
+    edited = update.edited_message is not None
+    if banned:
         clear_state(context)
-        if update.callback_query is not None:
-            await update.callback_query.answer("🚫 You are banned from this bot.", show_alert=True)
-        elif update.effective_message is not None:
-            await update.effective_message.reply_text("🚫 You are banned from this bot.")
+        if not edited:
+            await tell(update, "🚫 You are banned from this bot.", alert=True)
         raise ApplicationHandlerStop
+
+    if edited:
+        return  # an edit never ends the action in progress (see on_edited_message)
 
     # Pressing a menu button or sending a command ends the action in progress.
     ends_flow = False
@@ -485,10 +636,13 @@ async def pre_handler(update: Update, context: Ctx) -> None:
     if ends_flow:
         old = clear_state(context)
         if old and old.get("name") == "add_items" and old.get("items"):
-            await context.bot.send_message(
-                chat.id,
-                f"⚠️ Add Product stopped — {len(old['items'])} unsaved product(s) were discarded.",
-            )
+            try:
+                await context.bot.send_message(
+                    chat.id,
+                    f"⚠️ Add Product stopped — {len(old['items'])} unsaved product(s) were discarded.",
+                )
+            except TelegramError as exc:
+                log.info("Could not send the discard warning to %s: %s", chat.id, exc)
 
 
 async def cmd_start(update: Update, context: Ctx) -> None:
@@ -502,9 +656,14 @@ async def cmd_start(update: Update, context: Ctx) -> None:
 
 async def cmd_help(update: Update, context: Ctx) -> None:
     user_id = update.effective_user.id  # type: ignore[union-attr]
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        help_text(role_of(context, user_id), cfg_of(context)), parse_mode=ParseMode.HTML
+    row = db_of(context).get_user(user_id)
+    text = help_text(
+        role_of(context, user_id),
+        cfg_of(context),
+        earnings=row["earnings"] if row is not None else 0,
+        support=support_contact(context),
     )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
 async def cmd_cancel(update: Update, context: Ctx) -> None:
@@ -513,29 +672,29 @@ async def cmd_cancel(update: Update, context: Ctx) -> None:
 
 
 async def cb_menu(update: Update, context: Ctx) -> None:
-    await update.callback_query.answer()  # type: ignore[union-attr]
+    await answer(update.callback_query)
     await send_panel(update, context)
 
 
 async def cb_cancel(update: Update, context: Ctx) -> None:
     clear_state(context)
-    await update.callback_query.answer("Cancelled")  # type: ignore[union-attr]
+    await answer(update.callback_query, "Cancelled")
     await send_panel(update, context, note="❌ Cancelled.")
 
 
 async def cb_noop(update: Update, context: Ctx) -> None:
-    await update.callback_query.answer()  # type: ignore[union-attr]
+    await answer(update.callback_query)
 
 
 async def cb_unknown(update: Update, context: Ctx) -> None:
-    await update.callback_query.answer(  # type: ignore[union-attr]
-        "This button is no longer active. Send /start.", show_alert=True
+    await answer(
+        update.callback_query, "This button is no longer active. Send /start.", show_alert=True
     )
 
 
 async def stale_button(update: Update) -> None:
-    await update.callback_query.answer(  # type: ignore[union-attr]
-        "This button is no longer valid. Send /start.", show_alert=True
+    await answer(
+        update.callback_query, "This button is no longer valid. Send /start.", show_alert=True
     )
 
 
@@ -559,6 +718,21 @@ async def on_message(update: Update, context: Ctx) -> None:
         await update.effective_message.reply_text("👋 Send /start to open the shop menu.")  # type: ignore[union-attr]
         return
     await handler(update, context, state)
+
+
+async def on_edited_message(update: Update, context: Ctx) -> None:
+    """An edited message is never new input.
+
+    Running an edited command again would, for example, add an /addbal amount twice,
+    and taking an edit as the answer to the current step could send money to the
+    wrong user. Edit hooks may still handle an edit (Add Product replaces a product
+    that isn't saved yet); otherwise the user is told to send a new message.
+    """
+    for hook in EDIT_HOOKS:
+        if await hook(update, context):
+            return
+    if get_state(context) is not None or _is_command(update):
+        await tell(update, EDIT_HINT)
 
 
 async def on_error(update: object, context: Ctx) -> None:

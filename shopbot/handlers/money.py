@@ -7,7 +7,7 @@ from typing import Any
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import TelegramError
 
 from ..db import ShopError
 from .common import (
@@ -17,11 +17,13 @@ from .common import (
     RED,
     USER,
     Ctx,
+    answer,
     btn,
     callback_ints,
     cancel_kb,
     cfg_of,
     clear_state,
+    contact_owner,
     db_of,
     esc,
     get_state,
@@ -39,6 +41,7 @@ from .common import (
     show,
     stale_button,
     state_handler,
+    try_show,
     user_html,
     user_name,
 )
@@ -51,7 +54,7 @@ MAX_ADMINS_LISTED = 25
 # ================================================================ deposits
 async def cb_deposit_menu(update: Update, context: Ctx) -> None:
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     cfg = cfg_of(context)
     buttons = [btn(f"{amount}$", f"da:{amount}", GREEN) for amount in cfg.deposit_presets]
     rows = grid(buttons, 3)
@@ -77,12 +80,12 @@ async def cb_deposit_amount(update: Update, context: Ctx) -> None:
     if not 1 <= amount <= cfg_of(context).max_custom_deposit:
         await stale_button(update)
         return
-    await query.answer()
+    await answer(query)
     await ask_receipt(update, context, amount)
 
 
 async def cb_deposit_custom(update: Update, context: Ctx) -> None:
-    await update.callback_query.answer()  # type: ignore[union-attr]
+    await answer(update.callback_query)
     set_state(context, "deposit_amount")
     await show(
         update,
@@ -165,46 +168,71 @@ async def cb_deposit_send(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "deposit_receipt" or not state.get("receipt"):
-        await query.answer(
-            "This request has expired. Start again from 💳 Add Balance.", show_alert=True
+        await answer(
+            query, "This request has expired. Start again from 💳 Add Balance.", show_alert=True
         )
         return
-    db, cfg = db_of(context), cfg_of(context)
+    db = db_of(context)
     file_id, kind = state["receipt"]
     deposit = db.create_deposit(query.from_user.id, state["amount"] * 100, file_id, kind)
+    # Saved: from here on Telegram errors are best-effort, and the owner hears first.
     clear_state(context)
-    await query.answer("✅ Sent")
-    await show(
-        update,
-        context,
+    await answer(query, "✅ Sent")
+    reached = await send_deposit_to_owner(context, deposit)
+    text = (
         f"✅ <b>Request sent!</b>\n\n🧾 Deposit #{deposit['id']} · {money(deposit['amount'])}\n"
-        "You'll get a message here as soon as the owner reviews it.",
-        markup([[menu_btn()]]),
+        "You'll get a message here as soon as the owner reviews it."
     )
-    keyboard = markup([[
-        btn("✅ Approve", f"dok:{deposit['id']}", GREEN),
-        btn("❌ Reject", f"dno:{deposit['id']}", RED),
+    if not reached:
+        text += "\n\nℹ️ The owner couldn't be notified right now, but your request is saved and waiting."
+    await try_show(update, context, text, markup([[menu_btn()]]))
+
+
+def _decision_keyboard(prefix_ok: str, prefix_no: str, request_id: int) -> Any:
+    return markup([[
+        btn("✅ Approve", f"{prefix_ok}:{request_id}", GREEN),
+        btn("❌ Reject", f"{prefix_no}:{request_id}", RED),
     ]])
+
+
+async def send_deposit_to_owner(context: Ctx, deposit: Any) -> bool:
+    """The receipt with Approve/Reject buttons. False if the owner couldn't be reached."""
+    cfg = cfg_of(context)
+    keyboard = _decision_keyboard("dok", "dno", deposit["id"])
     caption = deposit_caption(context, deposit)
-    try:
-        if kind == "photo":
-            await context.bot.send_photo(
-                cfg.owner_id, file_id, caption=caption, parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
-        else:
-            await context.bot.send_document(
-                cfg.owner_id, file_id, caption=caption, parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
-    except TelegramError as exc:
-        log.warning("Could not send deposit #%s to the owner: %s", deposit["id"], exc)
-        await notify(context, cfg.owner_id, caption + "\n\n⚠️ The receipt couldn't be attached.",
-                     keyboard)
+    file_id, kind = deposit["receipt_file_id"], deposit["receipt_kind"]
+    if file_id:
+        try:
+            if kind == "photo":
+                await context.bot.send_photo(
+                    cfg.owner_id, file_id, caption=caption, parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            else:
+                await context.bot.send_document(
+                    cfg.owner_id, file_id, caption=caption, parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            return True
+        except TelegramError as exc:
+            log.warning("Could not send deposit #%s to the owner: %s", deposit["id"], exc)
+    return await notify(
+        context, cfg.owner_id, caption + "\n\n⚠️ The receipt couldn't be attached.", keyboard
+    )
+
+
+async def send_withdrawal_to_owner(context: Ctx, withdrawal: Any) -> bool:
+    """The request with Approve/Reject buttons. False if the owner couldn't be reached."""
+    return await notify(
+        context,
+        cfg_of(context).owner_id,
+        withdrawal_text(context, withdrawal),
+        _decision_keyboard("wok", "wno", withdrawal["id"]),
+    )
 
 
 async def _edit_request(update: Update, text: str) -> None:
-    """Replace a request message's caption/text and remove its buttons."""
+    """Replace a request message's caption/text and remove its buttons (best-effort)."""
     query = update.callback_query
     message = query.message  # type: ignore[union-attr]
     try:
@@ -212,7 +240,7 @@ async def _edit_request(update: Update, text: str) -> None:
             await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=None)  # type: ignore[union-attr]
         else:
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=None)  # type: ignore[union-attr]
-    except BadRequest as exc:
+    except TelegramError as exc:
         log.info("Could not edit request message: %s", exc)
 
 
@@ -225,16 +253,16 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         await stale_button(update)
         return
     if not is_owner(context, query.from_user.id):
-        await query.answer("Only the owner can do that.", show_alert=True)
+        await answer(query, "Only the owner can do that.", show_alert=True)
         return
     db, cfg = db_of(context), cfg_of(context)
     try:
         decision = db.decide_deposit(deposit_id, approve, cfg.seller_auto_threshold * 100)
     except ShopError as exc:
-        await query.answer(str(exc), show_alert=True)
+        await answer(query, str(exc), show_alert=True)
         return
     deposit, user = decision.deposit, decision.user
-    await query.answer("✅ Approved" if approve else "❌ Rejected")
+    await answer(query, "✅ Approved" if approve else "❌ Rejected")
     if approve:
         status = f"✅ <b>Approved</b> — new balance {money(user['balance'])}"
         if decision.became_seller:
@@ -256,7 +284,7 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
     else:
         text = (
             f"❌ Your deposit request #{deposit['id']} of {money(deposit['amount'])} was "
-            "rejected.\nIf you think this is a mistake, please contact the owner."
+            f"rejected.\nIf you think this is a mistake, please {contact_owner(context)}."
         )
     await notify(context, deposit["user_id"], text, markup([[menu_btn()]]))
 
@@ -269,14 +297,17 @@ async def cb_earnings(update: Update, context: Ctx) -> None:
     role = role_of(context, user_id)
     row = db.get_user(user_id)
     if role == USER and not (row and row["earnings"]):
-        await query.answer("Earnings are for the owner and admins.", show_alert=True)
+        await answer(query, "Earnings are for the owner and admins.", show_alert=True)
         return
-    await query.answer()
+    await answer(query)
+    rows = [[btn("💸 Withdraw", "ew", GREEN)], [menu_btn()]]
     if role == OWNER:
         text = owner_earnings_text(context)
+        pending = db.count_pending_requests()
+        if pending:
+            rows.insert(1, [btn(f"📥 Pending requests ({pending})", "pq", BLUE)])
     else:
         text = own_earnings_text(context, user_id)
-    rows = [[btn("💸 Withdraw", "ew", GREEN)], [menu_btn()]]
     await show(update, context, text, markup(rows))
 
 
@@ -343,7 +374,7 @@ async def cmd_withdraw(update: Update, context: Ctx) -> None:
 
 
 async def cb_withdraw(update: Update, context: Ctx) -> None:
-    await update.callback_query.answer()  # type: ignore[union-attr]
+    await answer(update.callback_query)
     await start_withdraw(update, context)
 
 
@@ -381,14 +412,14 @@ async def cb_withdraw_all(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "withdraw_amount":
-        await query.answer("This request has expired. Send /withdraw again.", show_alert=True)
+        await answer(query, "This request has expired. Send /withdraw again.", show_alert=True)
         return
     earnings = db_of(context).get_user(query.from_user.id)["earnings"]  # type: ignore[index]
     if earnings <= 0:
         clear_state(context)
-        await query.answer("You have no earnings to withdraw.", show_alert=True)
+        await answer(query, "You have no earnings to withdraw.", show_alert=True)
         return
-    await query.answer()
+    await answer(query)
     await ask_binance_id(update, context, earnings)
 
 
@@ -431,7 +462,7 @@ async def on_withdraw_binance(update: Update, context: Ctx, state: dict) -> None
         await update.effective_message.reply_text("🏦 Please send a valid Binance ID.")  # type: ignore[union-attr]
         return
     user_id = update.effective_user.id  # type: ignore[union-attr]
-    db, cfg = db_of(context), cfg_of(context)
+    db = db_of(context)
     owner = is_owner(context, user_id)
     try:
         withdrawal = db.create_withdrawal(user_id, state["amount"], binance_id, auto_approve=owner)
@@ -439,10 +470,12 @@ async def on_withdraw_binance(update: Update, context: Ctx, state: dict) -> None
         clear_state(context)
         await update.effective_message.reply_text(f"⚠️ {exc}")  # type: ignore[union-attr]
         return
+    # Saved (the earnings are reserved): Telegram errors from here on are best-effort,
+    # and the owner hears first so the request can always be decided.
     clear_state(context)
     left = db.get_user(user_id)["earnings"]  # type: ignore[index]
     if owner:
-        await show(
+        await try_show(
             update,
             context,
             f"✅ <b>Withdrawal recorded</b>\n\n💵 {money(withdrawal['amount'])}\n"
@@ -451,24 +484,15 @@ async def on_withdraw_binance(update: Update, context: Ctx, state: dict) -> None
             new=True,
         )
         return
-    await show(
-        update,
-        context,
+    reached = await send_withdrawal_to_owner(context, withdrawal)
+    text = (
         f"✅ <b>Withdrawal request sent</b>\n\n💵 {money(withdrawal['amount'])}\n"
         f"🏦 Binance ID: <code>{esc(binance_id)}</code>\n💼 Earnings left: {money(left)}\n\n"
-        "The owner will review it. If it's rejected, the money goes back to your earnings.",
-        markup([[menu_btn()]]),
-        new=True,
+        "The owner will review it. If it's rejected, the money goes back to your earnings."
     )
-    await notify(
-        context,
-        cfg.owner_id,
-        withdrawal_text(context, withdrawal),
-        markup([[
-            btn("✅ Approve", f"wok:{withdrawal['id']}", GREEN),
-            btn("❌ Reject", f"wno:{withdrawal['id']}", RED),
-        ]]),
-    )
+    if not reached:
+        text += "\n\nℹ️ The owner couldn't be notified right now, but your request is saved and waiting."
+    await try_show(update, context, text, markup([[menu_btn()]]), new=True)
 
 
 def withdrawal_text(context: Ctx, withdrawal: Any) -> str:
@@ -492,15 +516,15 @@ async def cb_withdraw_decide(update: Update, context: Ctx) -> None:
         await stale_button(update)
         return
     if not is_owner(context, query.from_user.id):
-        await query.answer("Only the owner can do that.", show_alert=True)
+        await answer(query, "Only the owner can do that.", show_alert=True)
         return
     db = db_of(context)
     try:
         withdrawal = db.decide_withdrawal(withdrawal_id, approve)
     except ShopError as exc:
-        await query.answer(str(exc), show_alert=True)
+        await answer(query, str(exc), show_alert=True)
         return
-    await query.answer("✅ Approved" if approve else "❌ Rejected")
+    await answer(query, "✅ Approved" if approve else "❌ Rejected")
     status = (
         "✅ <b>Approved</b> — remember to send the payment."
         if approve
@@ -519,3 +543,44 @@ async def cb_withdraw_decide(update: Update, context: Ctx) -> None:
             f"The amount was returned to your earnings (available: {money(left)})."
         )
     await notify(context, withdrawal["user_id"], text, markup([[menu_btn()]]))
+
+
+# ========================================================== pending requests
+async def cmd_pending(update: Update, context: Ctx) -> None:
+    if not is_owner(context, update.effective_user.id):  # type: ignore[union-attr]
+        await update.effective_message.reply_text("⛔ Only the owner can use this command.")  # type: ignore[union-attr]
+        return
+    await send_pending(context)
+
+
+async def cb_pending(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    if not is_owner(context, query.from_user.id):  # type: ignore[union-attr]
+        await answer(query, "Only the owner can do that.", show_alert=True)
+        return
+    await answer(query)
+    await send_pending(context)
+
+
+async def send_pending(context: Ctx) -> None:
+    """Send every pending deposit and withdrawal again, each with Approve/Reject."""
+    db, cfg = db_of(context), cfg_of(context)
+    deposits, withdrawals = db.pending_deposits(), db.pending_withdrawals()
+    total = db.count_pending_requests()
+    if not total:
+        await notify(context, cfg.owner_id, "✅ No deposits or withdrawals are waiting for you.",
+                     markup([[menu_btn()]]))
+        return
+    head = (
+        f"📥 <b>Pending requests: {total}</b>\n"
+        f"💳 Deposits: {len(deposits)} · 💸 Withdrawals: {len(withdrawals)}\n"
+        "Each one follows with its Approve / Reject buttons."
+    )
+    shown = len(deposits) + len(withdrawals)
+    if shown < total:
+        head += f"\nShowing the oldest {shown}; send /pending again after deciding these."
+    await notify(context, cfg.owner_id, head)
+    for deposit in deposits:
+        await send_deposit_to_owner(context, deposit)
+    for withdrawal in withdrawals:
+        await send_withdrawal_to_owner(context, withdrawal)

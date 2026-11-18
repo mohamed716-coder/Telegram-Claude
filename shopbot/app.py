@@ -6,13 +6,14 @@ import logging
 from typing import Optional
 
 from telegram import Update
-from telegram.ext import AIORateLimiter, Application
+from telegram.ext import Application
 from telegram.request import BaseRequest
 
 from .config import Settings
 from .db import Database
 from .handlers import register_handlers
 from .handlers.common import setup_bot_profile
+from .ratelimit import ShopRateLimiter
 
 log = logging.getLogger("shopbot")
 
@@ -33,8 +34,9 @@ def build_application(
     if request is not None:
         builder = builder.request(request).get_updates_request(request)
     if rate_limit:
-        # Waits and retries automatically when Telegram says "too many requests".
-        builder = builder.rate_limiter(AIORateLimiter(max_retries=5))
+        # Waits and retries automatically when Telegram says "too many requests"
+        # (short waits only; see ratelimit.py).
+        builder = builder.rate_limiter(ShopRateLimiter(max_retries=5))
     app = builder.build()
     app.bot_data["db"] = Database(settings.db_path, settings.owner_id)
     app.bot_data["settings"] = settings
@@ -54,4 +56,6 @@ def main() -> None:
             ".env file (BOT_TOKEN=123456:ABC...) or in the BOT_TOKEN environment variable."
         )
     app = build_application(settings)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY]
+    )

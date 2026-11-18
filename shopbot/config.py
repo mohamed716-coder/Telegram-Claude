@@ -55,6 +55,9 @@ class Settings:
     seller_discount_percent: int = 10
     # Users become sellers automatically once their total deposits reach this ($).
     seller_auto_threshold: int = 1000
+    # Shown to customers who need help ("@username" or a link). Empty: the owner's
+    # @username. "none": don't show any contact.
+    support_contact: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,4 +81,5 @@ class Settings:
             db_path=str(db_path),
             seller_discount_percent=discount,
             seller_auto_threshold=_env_int("SELLER_AUTO_THRESHOLD", 1000),
+            support_contact=os.environ.get("SUPPORT_CONTACT", "").strip(),
         )

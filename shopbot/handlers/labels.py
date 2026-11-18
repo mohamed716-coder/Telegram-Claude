@@ -16,6 +16,7 @@ from .common import (
     GREEN,
     RED,
     Ctx,
+    answer,
     btn,
     callback_ints,
     clear_state,
@@ -38,12 +39,15 @@ from .common import (
 )
 
 PAGE_SIZE = 30
+# Names listed in the "Added: …" reply; a long paste is summarised so the reply fits
+# in one Telegram message.
+NAMES_LISTED = 25
 
 
 async def _owner_only(update: Update, context: Ctx) -> bool:
     if is_owner(context, update.effective_user.id):  # type: ignore[union-attr]
         return True
-    await update.callback_query.answer("Only the owner can manage labels.", show_alert=True)  # type: ignore[union-attr]
+    await answer(update.callback_query, "Only the owner can manage labels.", show_alert=True)
     return False
 
 
@@ -56,7 +60,7 @@ async def cb_labels(update: Update, context: Ctx) -> None:
         return
     if not await _owner_only(update, context):
         return
-    await query.answer()
+    await answer(query)
     await render_labels(update, context, label_id, page)
 
 
@@ -136,15 +140,14 @@ async def cb_new_label(update: Update, context: Ctx) -> None:
     db = db_of(context)
     parent = db.get_label(parent_id) if parent_id else None
     if parent_id and parent is None:
-        await query.answer("This label no longer exists.", show_alert=True)
+        await answer(query, "This label no longer exists.", show_alert=True)
         return
     if parent is not None and db.count_items(parent_id):
-        await query.answer(
-            "This product has stock, so it can't contain labels. Remove or pull its products first.",
-            show_alert=True,
+        await answer(
+            query, "This product has stock, so it can't contain labels. Remove or pull its products first.", show_alert=True,
         )
         return
-    await query.answer()
+    await answer(query)
     set_state(context, "label_name", parent_id=parent_id or None)
     where = f"inside <b>{esc(db.path_text(parent_id))}</b>" if parent else "at the top level"
     await show(
@@ -175,10 +178,22 @@ async def on_label_name(update: Update, context: Ctx, state: dict) -> None:
     clear_state(context)
     parts = []
     if created:
-        parts.append("✅ Added: " + ", ".join(f"<b>{esc(row['name'])}</b>" for row in created))
+        parts.append(f"✅ Added{_count(created)}: "
+                     + _names([f"<b>{esc(row['name'])}</b>" for row in created]))
     if skipped:
-        parts.append("ℹ️ Already existed: " + ", ".join(esc(name) for name in skipped))
+        parts.append(f"ℹ️ Already existed{_count(skipped)}: " + _names([esc(n) for n in skipped]))
     await render_labels(update, context, parent_id or 0, new=True, note="\n".join(parts))
+
+
+def _count(names: list) -> str:
+    return f" ({len(names)})" if len(names) > NAMES_LISTED else ""
+
+
+def _names(names: list[str]) -> str:
+    text = ", ".join(names[:NAMES_LISTED])
+    if len(names) > NAMES_LISTED:
+        text += f" … and {len(names) - NAMES_LISTED} more"
+    return text
 
 
 # ----------------------------------------------------------------------- price
@@ -194,12 +209,12 @@ async def cb_set_price(update: Update, context: Ctx) -> None:
     db = db_of(context)
     label = db.get_label(label_id)
     if label is None:
-        await query.answer("This label no longer exists.", show_alert=True)
+        await answer(query, "This label no longer exists.", show_alert=True)
         return
     if db.has_children(label_id):
-        await query.answer("Only the last label (the product) has a price.", show_alert=True)
+        await answer(query, "Only the last label (the product) has a price.", show_alert=True)
         return
-    await query.answer()
+    await answer(query)
     await ask_price(update, context, label, then="labels")
 
 
@@ -264,9 +279,9 @@ async def cb_rename(update: Update, context: Ctx) -> None:
     db = db_of(context)
     label = db.get_label(label_id)
     if label is None:
-        await query.answer("This label no longer exists.", show_alert=True)
+        await answer(query, "This label no longer exists.", show_alert=True)
         return
-    await query.answer()
+    await answer(query)
     set_state(context, "label_rename", label_id=label_id)
     await show(
         update,
@@ -308,17 +323,15 @@ async def cb_delete(update: Update, context: Ctx) -> None:
     db = db_of(context)
     label = db.get_label(label_id)
     if label is None:
-        await query.answer("This label no longer exists.", show_alert=True)
+        await answer(query, "This label no longer exists.", show_alert=True)
         return
     stock = db.count_subtree_items(label_id)
     if stock:
-        await query.answer(
-            f"There are {stock} product(s) in stock inside this label. "
-            "Remove or pull them from 📦 My Products first.",
-            show_alert=True,
+        await answer(
+            query, f"There are {stock} product(s) in stock inside this label. " "Remove or pull them from 📦 My Products first.", show_alert=True,
         )
         return
-    await query.answer()
+    await answer(query)
     inside = len(db.subtree_ids(label_id)) - 1
     extra = f" and the {inside} label(s) inside it" if inside else ""
     await show(
@@ -345,13 +358,13 @@ async def cb_delete_yes(update: Update, context: Ctx) -> None:
     db = db_of(context)
     label = db.get_label(label_id)
     if label is None:
-        await query.answer("This label was already deleted.", show_alert=True)
+        await answer(query, "This label was already deleted.", show_alert=True)
         return
     try:
         db.delete_label(label_id)
     except ShopError as exc:
-        await query.answer(str(exc), show_alert=True)
+        await answer(query, str(exc), show_alert=True)
         return
-    await query.answer("🗑 Deleted")
+    await answer(query, "🗑 Deleted")
     await render_labels(update, context, label["parent_id"] or 0,
                         note=f"🗑 Deleted <b>{esc(label['name'])}</b>.")

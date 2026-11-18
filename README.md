@@ -53,7 +53,8 @@ in that list.
 | 💳 Add Balance | | |
 
 `/start` greets with **Welcome Owner**, **Welcome Admin**, or **Welcome _first name_**, and
-shows the balance.
+shows the balance. When deposits or withdrawals are waiting for the owner, the owner panel
+also shows a **📥 Pending requests** button.
 
 ## How the shop works
 
@@ -83,6 +84,12 @@ file, video…). Each message is delivered to the buyer exactly as you sent it. 
 green **Done** to save them all (or red **Cancel**). Every product gets a unique
 **product ID**, e.g. `K7Q2M9XA`.
 
+- Made a typo? **Edit the message before pressing Done** and the edited version is saved
+  instead. After Done, an edit no longer changes the product: remove it in 📦 My Products
+  and send the corrected one.
+- Captions on photos and files can be at most 1024 characters (Telegram's limit for bots);
+  send longer text as its own message.
+
 ### 3. My Products (📦)
 
 Browse like the shop; a product shows the IDs of its products in stock. Tap an ID to see
@@ -101,12 +108,19 @@ Customers open 🛍 Shop, pick a product and a quantity, and confirm. The price 
 their balance and the products are sent right away. The money goes to the **earnings** of
 whoever added each product (owner or admin).
 
+- The buyer always pays the total shown on the **Confirm** screen. If the price changes
+  before they press Confirm, nothing is charged and they're shown the new total to confirm.
+- Big orders are sent at about one message per second (Telegram's limit per chat) while
+  the bot keeps serving everyone else. Customers can get an order again any time from
+  🧾 **My Orders**.
+
 ### 5. Adding balance (💳 Add Balance)
 
 Pick 10 / 20 / 30 / 50 / 100 $ or **Custom** (whole numbers only), send the money to
 Binance Pay ID **850940840**, send a **photo of the receipt**, and press **Confirm**. The
 owner gets the receipt with **Approve** / **Reject** buttons; on approval the balance is
-added.
+added. If that message ever doesn't reach the owner (or gets deleted), `/pending` sends
+every waiting request again with its buttons.
 
 **Sellers** get **10% off** every product. Anyone whose total deposits reach **1000$**
 becomes a seller automatically, or the owner can use `/seller ID`.
@@ -117,7 +131,8 @@ becomes a seller automatically, or the owner can use `/seller ID`.
 the total purchases. Admins see their own. `/withdraw` asks for an amount and a Binance ID;
 the amount leaves your earnings straight away and the owner gets **Approve** / **Reject**
 buttons (if rejected, the money returns to the admin's earnings). The owner's own
-withdrawals are recorded immediately.
+withdrawals are recorded immediately. An admin who is removed keeps the money they
+earned: they still see 📊 Earnings and can use `/withdraw`.
 
 ## Commands
 
@@ -134,9 +149,14 @@ withdrawals are recorded immediately.
 | `/ban ID` / `/unban ID` | owner | Block / unblock a user from the bot |
 | `/close` / `/open` | owner | Close / open the shop for customers |
 | `/status` | owner | All users: ID, name, balance, total deposits (+ CSV file) |
+| `/pending` | owner | Show the deposits and withdrawals waiting for your answer again |
 
 Commands that need a user also work without arguments: e.g. send `/ban` and the bot asks
 for the ID.
+
+**Edited messages are ignored**: editing a message you already sent (a command, an amount,
+an ID) never runs it again. Send a new message instead. The one exception is a product
+message in ➕ Add Product before you press Done (see above).
 
 ## Settings (`.env`)
 
@@ -148,6 +168,7 @@ for the ID.
 | `DB_PATH` | `data/shop.db` | Database file |
 | `SELLER_DISCOUNT_PERCENT` | `10` | Seller discount |
 | `SELLER_AUTO_THRESHOLD` | `1000` | Total deposits ($) that make someone a seller |
+| `SUPPORT_CONTACT` | owner's @username | Who customers are told to contact (`@name`, a link, or `none`) |
 
 Back up `data/shop.db` regularly: it holds all products, balances and orders.
 
