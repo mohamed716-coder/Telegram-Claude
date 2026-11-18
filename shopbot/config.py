@@ -8,6 +8,7 @@ from pathlib import Path
 
 DEFAULT_OWNER_ID = 6883493877
 DEFAULT_BINANCE_PAY_ID = "850940840"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
@@ -57,16 +58,24 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv()
+        # .env next to bot.py works even when the bot is started from another folder.
+        load_dotenv(Path.cwd() / ".env")
+        load_dotenv(PROJECT_ROOT / ".env")
         token = (
             os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
         ).strip()
+        db_path = Path(os.environ.get("DB_PATH", "").strip() or "data/shop.db")
+        if not db_path.is_absolute():
+            db_path = PROJECT_ROOT / db_path
+        discount = _env_int("SELLER_DISCOUNT_PERCENT", 10)
+        if not 0 <= discount <= 100:
+            raise SystemExit("SELLER_DISCOUNT_PERCENT must be between 0 and 100")
         return cls(
             bot_token=token,
             owner_id=_env_int("OWNER_ID", DEFAULT_OWNER_ID),
             binance_pay_id=os.environ.get("BINANCE_PAY_ID", DEFAULT_BINANCE_PAY_ID).strip()
             or DEFAULT_BINANCE_PAY_ID,
-            db_path=os.environ.get("DB_PATH", "data/shop.db").strip() or "data/shop.db",
-            seller_discount_percent=_env_int("SELLER_DISCOUNT_PERCENT", 10),
+            db_path=str(db_path),
+            seller_discount_percent=discount,
             seller_auto_threshold=_env_int("SELLER_AUTO_THRESHOLD", 1000),
         )
