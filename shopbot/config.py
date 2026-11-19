@@ -20,7 +20,7 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
     env_file = Path(path)
     if not env_file.is_file():
         return
-    for raw in env_file.read_text(encoding="utf-8").splitlines():
+    for raw in env_file.read_text(encoding="utf-8-sig").splitlines():  # -sig: Windows BOM
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -33,6 +33,12 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
             value = value[1:-1]
         if key:
             os.environ.setdefault(key, value)
+
+
+def _default_db_path() -> str:
+    """data/shop.db, or on Railway the attached volume, wherever it is mounted."""
+    volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    return f"{volume.rstrip('/')}/shop.db" if volume else "data/shop.db"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -71,7 +77,7 @@ class Settings:
         token = (
             os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
         ).strip()
-        db_path = Path(os.environ.get("DB_PATH", "").strip() or "data/shop.db")
+        db_path = Path(os.environ.get("DB_PATH", "").strip() or _default_db_path())
         if not db_path.is_absolute():
             db_path = PROJECT_ROOT / db_path
         discount = _env_int("SELLER_DISCOUNT_PERCENT", 10)

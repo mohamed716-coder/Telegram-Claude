@@ -4,8 +4,9 @@
 #   docker compose up -d --build
 #   docker compose logs -f      see what it's doing
 #
-# The database lives in the "shop-data" volume (/app/data in the container), so it
+# The database lives in the "shopbot_shop-data" volume (/app/data in the container), so it
 # survives restarts, rebuilds and updates. Run only one copy of the bot at a time.
+name: shopbot  # fixed, so the volume is always "shopbot_shop-data", whatever the folder is called
 services:
   bot:
     build: .

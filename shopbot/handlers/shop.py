@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from telegram import Update
@@ -62,6 +63,10 @@ DELIVERY_INTERVAL = 1.0
 # A flood wait up to this long (seconds) is sat out once before a product counts as
 # not sent. It only pauses this delivery, not the rest of the bot.
 MAX_DELIVERY_WAIT = 60
+# When the bot is stopping, deliveries go on for at most this long (seconds); the rest
+# count as not sent (the buyer gets them from 🧾 My Orders), so a restart stays well
+# inside the service manager's stop timeout (systemd TimeoutStopSec=300).
+STOP_GRACE = 120
 
 
 def shop_open_for(context: Ctx, user_id: int) -> bool:
@@ -479,6 +484,11 @@ async def deliver_items(context: Ctx, chat_id: int, items: list[Any]) -> int:
     """Send each product message, paced for Telegram. Returns how many weren't sent."""
     failed = 0
     for index, item in enumerate(items):
+        if not context.application.running:  # stopping: finish soon
+            since = context.bot_data.setdefault("stopping_since", time.monotonic())
+            if time.monotonic() - since > STOP_GRACE:
+                log.warning("Stopping: %s product(s) for %s left for My Orders", len(items) - index, chat_id)
+                return failed + len(items) - index
         if index >= DELIVERY_BURST and DELIVERY_INTERVAL > 0:
             await asyncio.sleep(DELIVERY_INTERVAL)
         try:

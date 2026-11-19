@@ -19,7 +19,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from ..config import Settings
@@ -542,10 +542,10 @@ async def sync_commands(context: Ctx, user_id: int) -> None:
 PROFILE_SETTING = "bot_profile"
 
 
-def _profile_signature(owner_id: int, admin_ids: list[int]) -> str:
+def _profile_signature(bot_id: int, owner_id: int, admin_ids: list[int]) -> str:
     payload = json.dumps(
         [BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION, USER_COMMANDS, ADMIN_COMMANDS,
-         OWNER_COMMANDS, owner_id, admin_ids],
+         OWNER_COMMANDS, bot_id, owner_id, admin_ids],
         ensure_ascii=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -561,7 +561,7 @@ async def setup_bot_profile(application: Any) -> None:
     db: Database = application.bot_data["db"]
     cfg: Settings = application.bot_data["settings"]
     admins = [row["id"] for row in db.list_admins() if row["id"] != cfg.owner_id]
-    signature = _profile_signature(cfg.owner_id, admins)
+    signature = _profile_signature(bot.id, cfg.owner_id, admins)  # a new token may be a new bot
     if db.get_setting(PROFILE_SETTING) == signature:
         log.info("Bot profile is up to date.")
         return
@@ -736,7 +736,15 @@ async def on_edited_message(update: Update, context: Ctx) -> None:
 
 
 async def on_error(update: object, context: Ctx) -> None:
-    log.error("Error while handling an update", exc_info=context.error)
+    error = context.error
+    if update is None and isinstance(error, Conflict):  # from polling, not from a user's action
+        log.warning("Telegram says another copy of this bot is running (Conflict). Only one "
+                    "copy may run: stop the other one (on your PC, another server, Docker...).")
+        return
+    if update is None and isinstance(error, NetworkError):
+        log.warning("Can't reach Telegram right now (%s). The bot keeps trying by itself.", error)
+        return
+    log.error("Error while handling an update", exc_info=error)
     if isinstance(update, Update) and update.effective_chat is not None:
         if update.effective_chat.type != ChatType.PRIVATE:
             return

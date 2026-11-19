@@ -666,3 +666,37 @@ def test_a_long_list_of_new_labels_is_summarised(tmp_path):
         assert len(t.db.children(None)) == 60
 
     run(tmp_path, scenario)
+
+
+def test_stopping_cuts_a_long_delivery_short_and_leaves_the_rest_for_my_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(shop_module, "STOP_GRACE", 0.3)
+
+    async def main() -> None:
+        t = ShopTest(tmp_path)
+        await t.__aenter__()
+        shop_module.DELIVERY_INTERVAL = 0.05
+        five = make_label(t, "Esim/5GB", 100)
+        add_stock(t, five, *(f"CODE-{i:02d}" for i in range(40)))
+        register(t, ALICE)
+        t.db.set_balance(ALICE["id"], 10000)
+        confirm = t.button(await t.press(ALICE, f"sb:{five}:40"), "Confirm")
+
+        async def quick_settle() -> None:
+            await asyncio.sleep(0.005)
+
+        t.settle = quick_settle  # type: ignore[method-assign]
+        mark = len(t.tg.calls)
+        await t.press(ALICE, confirm)
+        await asyncio.sleep(0.2)
+        started = time.monotonic()
+        await t.app.stop()  # what a restart does while products are still going out
+        assert time.monotonic() - started < 3
+        sent = [c.text for c in t.tg.calls[mark:] if c.method == "sendMessage" and c.chat_id == ALICE["id"]]
+        codes = [x for x in sent if x.startswith("CODE-")]
+        assert 0 < len(codes) < 40
+        assert f"{40 - len(codes)} product(s) could not be sent" in sent[-1] and "My Orders" in sent[-1]
+        assert len(orders(t, ALICE)) == 1  # paid, and every product is in My Orders
+        await t.app.shutdown()
+        t.db.close()
+
+    asyncio.run(main())

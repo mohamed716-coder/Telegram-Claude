@@ -320,7 +320,12 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "add_items":
-        await answer(query, "There is nothing to save.", show_alert=True)
+        await answer(
+            query,
+            "There is nothing to save. If you had sent products, they were not saved (Add Product "
+            "was stopped, or the bot restarted): open ➕ Add Product and send them again.",
+            show_alert=True,
+        )
         return
     user_id = query.from_user.id
     if not is_staff(context, user_id):

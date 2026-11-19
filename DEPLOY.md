@@ -6,7 +6,8 @@ The bot has to run on a computer that is always on and online. Two things matter
   Hosts whose disk is wiped on every restart (for example free "web service" plans) would
   lose your shop. The options below all keep it.
 - **Run one copy only.** Two copies with the same token fight over messages
-  (Telegram answers *409 Conflict*). Stop the bot on your PC once it runs on a server.
+  (Telegram answers *409 Conflict*). If the bot runs on your PC, stop it there before
+  starting it on a server.
 
 Choose one:
 
@@ -18,49 +19,60 @@ Choose one:
 
 ---
 
-## A. Linux server (Ubuntu or Debian)
+## A. Linux server (Ubuntu 22.04+ or Debian 12+)
 
 You need: the server's **IP address** and **root password** (or a user that can use `sudo`),
 and the **bot token** from [@BotFather](https://t.me/BotFather).
 
 ### 1. Log in to the server
 
-- **Windows 10/11:** open *PowerShell* and type `ssh root@YOUR_SERVER_IP`.
-- **Mac or Linux:** open *Terminal* and type the same.
-- **Phone:** use an SSH app (for example Termius), or your provider's web console.
+- **Windows 10/11:** press the Windows key, type `PowerShell`, press Enter. Then type
+  `ssh root@` followed by your server's IP, e.g. `ssh root@203.0.113.25`, and press Enter.
+- **Mac:** open *Terminal* and type the same.
+- **Phone:** use an SSH app such as Termius (long-press to paste).
 
-The first time, type `yes` to trust the server. When it asks for the password, type or
-paste it: nothing appears while you type, that's normal. Press Enter.
+The first time, type `yes` to trust the server. Then type or paste the password: nothing
+appears while you type, that's normal. Press Enter.
 
-To paste into the terminal: right-click (Windows), Cmd+V (Mac), or Ctrl+Shift+V (Linux).
+**Pasting:** right-click (Windows), Cmd+V (Mac). After pasting a box below, press Enter if
+nothing happens, and wait until the line ending in `#` comes back before the next one.
+Provider "web consoles" often can't paste; use PowerShell or an SSH app instead.
 
 ### 2. Let the server download the code
 
-The repository is private, so the server needs its own read-only key. Paste this:
+The repository is private, so the server needs its own read-only key. Paste this (it's one
+command):
 
 ```bash
-apt-get update && apt-get install -y git
-ssh-keygen -t ed25519 -N "" -C "shop-server" -f ~/.ssh/shopbot_deploy
+apt-get -o DPkg::Lock::Timeout=600 update && \
+apt-get -o DPkg::Lock::Timeout=600 install -y git && \
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+{ [ -f ~/.ssh/shopbot_deploy ] || ssh-keygen -t ed25519 -N "" -C "shop-server" -f ~/.ssh/shopbot_deploy; } && \
 cat ~/.ssh/shopbot_deploy.pub
 ```
 
-It prints one line starting with `ssh-ed25519`. Copy that whole line, then on GitHub open
-the repository → **Settings** → **Deploy keys** → **Add deploy key**
+(On a brand-new server this can wait a few minutes while the server installs its own
+updates.) It ends by printing one line starting with `ssh-ed25519`. Copy that whole line,
+then on GitHub open the repository → **Settings** → **Deploy keys** → **Add deploy key**
 (direct link: <https://github.com/mohamed716-coder/Telegram-Claude/settings/keys/new>).
-Title: `shop server`; Key: paste the line; leave **Allow write access** unticked; click
-**Add key**.
+Title: `shop server`; Key: paste the line; leave **Allow write access** unticked (the server
+only needs to read); click **Add key**.
 
 ### 3. Download the bot
 
 ```bash
-cd ~
+cd ~ && \
 GIT_SSH_COMMAND="ssh -i ~/.ssh/shopbot_deploy -o StrictHostKeyChecking=accept-new" \
-  git clone --branch main git@github.com:mohamed716-coder/Telegram-Claude.git
-cd Telegram-Claude
+  git clone --branch claude/telegram-bot-vphwhx git@github.com:mohamed716-coder/Telegram-Claude.git && \
+cd Telegram-Claude && \
 git config core.sshCommand "ssh -i ~/.ssh/shopbot_deploy"
 ```
 
-(If the code is on another branch, put its name instead of `main`.)
+(`claude/telegram-bot-vphwhx` is the branch with the code. Once it is merged into `main`,
+clone `main` instead.)
+
+**Already used the bot on your PC?** Stop it there now, and bring its data along: see
+[Moving an existing shop](#moving-an-existing-shop-to-the-server) right after step 4.
 
 ### 4. Install and start it
 
@@ -73,38 +85,48 @@ Logged in as a normal user instead of root? Use `sudo bash deploy/install.sh`.
 It installs what's needed, asks for the bot token (paste it, press Enter), checks it with
 Telegram, and starts the bot as a service: it keeps running when you log out, starts
 again when the server reboots, and restarts by itself if it ever crashes. It also makes a
-backup of the database every night.
+backup of the database every night. (As root it says the bot runs as root: that's expected.)
 
 When it says **"The bot @yourbot is running"**, open the bot in Telegram and send `/start`.
-You can now close the terminal.
+You can now close the window.
 
 ### Everyday commands
 
-Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`). Add `sudo` in
-front if you're not root.
+Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`). Not root? Put
+`sudo` in front of the `systemctl`, `journalctl` and `bash deploy/install.sh` commands only,
+never in front of `git` or `.venv/bin/python`.
 
 | What | Command |
 |---|---|
-| Watch what the bot is doing (Ctrl+C to stop watching) | `journalctl -u shopbot -f` |
-| Is it running? | `systemctl status shopbot` |
+| Is it running? (look for *active (running)*) | `systemctl status shopbot --no-pager` |
+| The last messages, e.g. why it doesn't answer | `journalctl -u shopbot -n 30 --no-pager` |
+| Watch what it's doing (Ctrl+C to stop watching) | `journalctl -u shopbot -f` |
 | Restart / stop / start | `systemctl restart shopbot` (or `stop`, `start`) |
 | Update to the newest code | `git pull && bash deploy/install.sh` |
-| Make a backup now | `.venv/bin/python -m shopbot.backup` |
+| Make a backup now | `systemctl start shopbot-backup` |
 | List the backups | `.venv/bin/python -m shopbot.backup --list` |
-| Change the bot token | `nano .env` (edit `BOT_TOKEN=`, save with Ctrl+O, Enter, Ctrl+X), then `bash deploy/install.sh` |
+| New token (after `/revoke` in @BotFather) | `bash deploy/install.sh`: it sees the old one is revoked and asks for the new one |
+| Switch to a different bot | `BOT_TOKEN=paste-the-new-token bash deploy/install.sh` |
 | Remove the service (keeps your data) | `bash deploy/install.sh --uninstall` |
+
+If the screen shows `(END)` or `lines 1-23`, press `q` to get back.
 
 ### Backups
 
-A backup is made every night (around 03:17 server time) in `data/backups/`; the newest 14
-are kept. They are on the same server, so now and then copy one to your own computer.
-On **your computer** (not the server):
+A backup is made every night between 03:17 and 03:32 **server time** (most servers use UTC:
+that's 06:17 in Istanbul, for example) in `data/backups/`; the newest 14 are kept. The
+installer also keeps a safety copy from before each run in `data/backups/before-update/`.
+Backups are on the same server, so now and then copy them to your own computer. On **your
+computer** (not the server), in PowerShell or Terminal:
 
 ```bash
-scp root@YOUR_SERVER_IP:Telegram-Claude/data/backups/*.db .
+scp "root@YOUR_SERVER_IP:Telegram-Claude/data/backups/*.db" .
 ```
 
-**Restore a backup** (on the server):
+It asks for the server password. The files arrive in the folder the window is in (on
+Windows usually `C:\Users\YOUR-NAME`). On a phone, use your SSH app's SFTP feature.
+
+**Restore a backup** (on the server, in the bot folder):
 
 ```bash
 systemctl stop shopbot
@@ -112,39 +134,39 @@ systemctl stop shopbot
 systemctl start shopbot
 ```
 
-The database you had before the restore is kept as a backup too.
+Use the real file name from `--list`. The database you had before is kept as a backup too.
 
 ### Moving an existing shop to the server
 
-Already used the bot on your PC? Bring its data along:
+Do this right after step 4, if the bot already ran on your PC:
 
-1. On the PC, stop the bot (Ctrl+C), then in the bot folder run
+1. On the PC, stop the bot (Ctrl+C) and don't start it there again. In the bot folder run
    `python -m shopbot.backup`. It prints the backup file's name.
-2. Copy that file to the server, e.g. from the PC: `scp data/backups/shop-....db root@YOUR_SERVER_IP:`
-3. On the server: `systemctl stop shopbot`, then
+2. Copy that file to the server, from the PC (keep the `:` at the end):
+   `scp data/backups/shop-....db root@YOUR_SERVER_IP:`
+3. On the server: `cd ~/Telegram-Claude && systemctl stop shopbot`, then
    `.venv/bin/python -m shopbot.backup --restore ~/shop-....db`, then `systemctl start shopbot`.
-
-Don't start the bot on the PC again afterwards.
 
 ### Keep the server safe
 
 - **Change the root password** if it was ever shared (for example in a chat or email):
-  type `passwd` on the server.
-- Better still, log in with an SSH key instead of a password
-  ([GitHub's guide to SSH keys](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent)
-  shows how to make one; your provider's panel usually lets you add it).
+  type `passwd` on the server and choose a long new one.
+- Better still, log in with an SSH key instead of a password; your provider's panel
+  usually lets you add one.
 - If the bot token was ever shared, get a new one: in @BotFather send `/revoke`, choose
-  the bot, then put the new token in `.env` and run `bash deploy/install.sh`.
+  the bot, then run `bash deploy/install.sh` and paste the new token when it asks.
+- If you stop using a server, delete its key on GitHub (repository → Settings → Deploy keys).
 
 ### If something goes wrong
 
 | You see | What to do |
 |---|---|
-| `Telegram rejected BOT_TOKEN` | The token is wrong or was revoked. Get it from @BotFather (`/mybots` → your bot → *API Token*), put it in `.env`, run `bash deploy/install.sh`. |
-| `Conflict: terminated by other getUpdates request` in the logs | Another copy of the bot runs somewhere (your PC, an old server). Stop that one. |
+| `Telegram rejected BOT_TOKEN` | The token is wrong or was revoked. Run `bash deploy/install.sh` and paste the right token from @BotFather (`/mybots` → your bot → *API Token*). |
+| `another copy of this bot is running (Conflict)` | Another copy runs somewhere (your PC, an old server). Stop that one. |
 | `Another copy of the bot is already running` | You started `python bot.py` by hand while the service runs. Use `systemctl restart shopbot` instead. |
-| `Couldn't reach Telegram` | The server has no internet right now. The bot keeps trying by itself. |
-| The bot doesn't answer | `systemctl status shopbot` and `journalctl -u shopbot -n 50` show why. |
+| `Still trying to reach Telegram` / `Can't reach Telegram` | The server has no internet right now. The bot keeps trying by itself. |
+| `Could not get lock` | The server is installing its own updates. Wait 5 minutes, then run the command again. |
+| The bot doesn't answer | `journalctl -u shopbot -n 30 --no-pager` shows why. |
 
 ---
 
@@ -159,17 +181,25 @@ docker compose up -d --build
 docker compose logs -f          # Ctrl+C to stop watching
 ```
 
-The data is in the Docker volume `shop-data`, so it survives restarts and updates.
+The data is in the Docker volume `shopbot_shop-data`, so it survives restarts and updates.
 
 | What | Command |
 |---|---|
 | Update | `git pull && docker compose up -d --build` |
+| Change the token or a setting | `nano .env`, then `docker compose up -d` (`restart` keeps the old settings) |
 | Stop / start | `docker compose stop` / `docker compose start` |
 | Backup now | `docker compose exec -u bot bot python -m shopbot.backup` |
-| Copy the backups out | `docker compose cp bot:/app/data/backups ./backups` |
+| Copy the backups out | `docker compose cp bot:/app/data/backups/. ./backups/` (then fetch `Telegram-Claude/backups/*.db` with `scp`, as in part A) |
+
+Docker makes **no automatic backups**. For one every night, run `crontab -e` and add this
+line (with your folder):
+
+```
+17 3 * * * cd /root/Telegram-Claude && docker compose exec -T -u bot bot python -m shopbot.backup >/dev/null
+```
 
 Restore: `docker compose stop`, then
-`docker compose cp ./shop-....db bot:/app/data/restore.db`, then
+`docker compose cp ./backups/shop-....db bot:/app/data/restore.db`, then
 `docker compose run --rm bot python -m shopbot.backup --restore /app/data/restore.db`,
 then `docker compose start`.
 
@@ -179,23 +209,31 @@ Keep `DB_PATH` at its default in `.env` when using Docker.
 
 ## C. Railway (no server)
 
-1. Sign up at [railway.com](https://railway.com) with your GitHub account, and allow the
-   Railway GitHub app to see this repository.
-2. **New Project** → **Deploy from GitHub repo** → pick the repository. Railway finds the
-   `Dockerfile` and builds it. In the service's **Settings → Source**, pick the branch
-   that has the code.
+Check the current price on [railway.com/pricing](https://railway.com/pricing) first: the
+bot needs the **Hobby** plan (about $5 a month); the trial's small one-time credit runs out.
+
+1. Sign up at [railway.com](https://railway.com) with your GitHub account, and let the
+   Railway GitHub app see this repository (GitHub → Settings → Applications → Railway →
+   Configure).
+2. **New Project** → **Deploy from GitHub repo** → pick the repository. In the service's
+   **Settings → Source**, choose the branch that has the code (not an empty `main`).
+   Railway finds the `Dockerfile` and builds it (the build log says it used the Dockerfile).
 3. In **Variables**, add:
    - `BOT_TOKEN` = your token
    - `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` = `300` (gives the bot time to finish sending
      an order when Railway restarts it; the default stops it at once)
 4. Add a **Volume** to the service (right-click the service → *Attach Volume*) with the
    mount path **`/app/data`**. Without it, the shop's data is lost on every deploy.
-5. Leave *Serverless* off, don't add a public domain or a healthcheck, and leave the
-   *Custom Start Command* empty. Click **Deploy**, then check **Deploy Logs** for
+   Leave `DB_PATH` unset.
+5. In **Settings**, set the restart policy to **Always** (the default gives up after 10
+   failed starts), leave *Serverless* off, add no public domain or healthcheck, and leave
+   the *Custom Start Command* empty. Click **Deploy**, then check **Deploy Logs** for
    "Bot @yourbot is running".
 
-Railway's trial gives a small one-time credit; to keep the bot running you need the
-Hobby plan (about $5 a month). Back up from time to time with Railway's volume backups.
+Settings changes go in Railway's Variables tab, not a `.env` file. Railway's own volume
+backups need its Pro plan; on Hobby, make a backup with the Railway CLI
+(`railway ssh -- sh -c 'cd /app && python -m shopbot.backup'`) and download it from the
+volume (`railway volume files download /backups/<file>`).
 
 ---
 

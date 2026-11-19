@@ -17,7 +17,12 @@ def acquire(path: Path) -> Optional[IO[str]]:
     """Lock ``path``; return the open file (keep it open while running) or None if
     another process holds the lock. The lock is released when the process exits."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+", encoding="utf-8")
+    writable = True
+    try:
+        handle = open(path, "a+", encoding="utf-8")
+    except PermissionError:  # made by another user (e.g. root): locking works read-only too
+        handle = open(path, "r", encoding="utf-8")
+        writable = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -31,7 +36,7 @@ def acquire(path: Path) -> Optional[IO[str]]:
     except OSError:
         handle.close()
         return None
-    if os.name != "nt":
+    if writable and os.name != "nt":
         handle.seek(0)
         handle.truncate()
         handle.write(f"{os.getpid()}\n")

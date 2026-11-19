@@ -2,13 +2,16 @@
 # Install (or update) the Telegram shop bot as a service on an Ubuntu or Debian server.
 #
 #   cd Telegram-Claude
-#   sudo bash deploy/install.sh              install, or update after "git pull"
-#   sudo bash deploy/install.sh --uninstall  remove the service (keeps your data)
+#   bash deploy/install.sh               install, or update after "git pull" (as root)
+#   sudo bash deploy/install.sh          the same, logged in as a normal user
+#   bash deploy/install.sh --uninstall   remove the service (keeps your data)
 #
 # The bot then starts by itself when the server boots and restarts if it crashes.
 # A backup of the database is made every night (data/backups, the newest 14 are kept).
 # Running this again is safe: it never deletes data/shop.db.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"  # started with "sh install.sh"
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SERVICE=shopbot
 UNIT_DIR=/etc/systemd/system
@@ -20,8 +23,10 @@ die() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$APP_DIR/.venv"
 ENV_FILE="$APP_DIR/.env"
+S=""  # "sudo " in the commands we print, for someone who used sudo
+[ -z "${SUDO_USER:-}" ] || S="sudo "
 
-[ "$(id -u)" -eq 0 ] || die "Run this with sudo:  sudo bash deploy/install.sh"
+[ "$(id -u)" -eq 0 ] || die "Run this as root, or with sudo:  sudo bash deploy/install.sh"
 [ -f "$APP_DIR/bot.py" ] && [ -f "$APP_DIR/requirements.txt" ] \
     || die "Run deploy/install.sh from inside the bot's folder."
 
@@ -36,29 +41,33 @@ fi
 [ $# -eq 0 ] || die "Unknown option: $1 (use --uninstall, or nothing)"
 
 [ -d /run/systemd/system ] && command -v systemctl >/dev/null \
-    || die "This needs a Linux server that runs systemd (Ubuntu or Debian)."
+    || die "This needs a Linux server that runs systemd (Ubuntu 22.04+ or Debian 12+)."
 case "$APP_DIR" in
     *[!A-Za-z0-9._/-]*) die "Move the bot to a folder whose path has no spaces or special characters (now: $APP_DIR)." ;;
 esac
 
 # The bot runs as the user who owns the folder (the one who downloaded it).
-RUN_USER="$(stat -c %U "$APP_DIR")"
+owner_uid="$(stat -c %u "$APP_DIR")"
+RUN_USER="$(id -nu "$owner_uid" 2>/dev/null)" \
+    || die "The folder belongs to user id $owner_uid, which has no name here. Run: chown -R root: $APP_DIR"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 as_user() {
     if [ "$RUN_USER" = root ]; then "$@"; else runuser -u "$RUN_USER" -- "$@"; fi
 }
 if [ "$RUN_USER" = root ]; then
-    warn "The folder belongs to root, so the bot will run as root. That works; a normal user is safer."
+    say "The folder belongs to root, so the bot runs as root (normal when you log in as root)."
+elif ! as_user test -r "$APP_DIR/bot.py"; then
+    die "The user $RUN_USER can't open $APP_DIR (a folder above it is private). Move it to /home/$RUN_USER and run this again."
 fi
 
 apt_install() {
     command -v apt-get >/dev/null || die "Please install $* yourself, then run this again."
-    say "Installing $* ..."
+    say "Installing $* (if the server is busy with its own updates, this waits for them) ..."
     # A mirror hiccup in "update" shouldn't stop us if the package can still be installed.
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq \
         || warn "apt-get update reported problems; trying to install anyway."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null \
-        || die "Couldn't install $*. Run 'sudo apt-get update', fix what it reports, then run this again."
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq "$@" >/dev/null \
+        || die "Couldn't install $*. If it says 'Could not get lock', the server is still installing updates: wait 5 minutes and run this again. Otherwise run 'apt-get update' and fix what it reports."
 }
 
 # ---------------------------------------------------------------- Python
@@ -68,7 +77,7 @@ if [ -z "$PY" ]; then
     PY="$(command -v python3)"
 fi
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
-    || die "Python 3.10 or newer is needed; this server has $("$PY" -V 2>&1)."
+    || die "Python 3.10 or newer is needed; this server has $("$PY" -V 2>&1). Use Ubuntu 22.04+ or Debian 12+, or Docker (DEPLOY.md, part B)."
 
 if ! { [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip --version >/dev/null 2>&1; }; then
     rm -rf "$VENV"
@@ -108,7 +117,7 @@ except Exception:
 PY
 }
 
-save_token() {  # write BOT_TOKEN=... into .env, keeping every other line
+save_token() (  # write BOT_TOKEN=... into .env, keeping every other line (subshell: umask stays here)
     umask 077
     [ -f "$ENV_FILE" ] || cp "$APP_DIR/.env.example" "$ENV_FILE"
     ENV_FILE="$ENV_FILE" TOKEN="$1" PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - <<'PY'
@@ -130,7 +139,7 @@ if not done:
 with open(path, "w", encoding="utf-8") as fh:
     fh.write("\n".join(out) + "\n")
 PY
-}
+)
 
 ask_token() {
     ( exec </dev/tty ) 2>/dev/null \
@@ -138,14 +147,17 @@ ask_token() {
     printf 'Paste the bot token from @BotFather (looks like 123456789:AAH...) and press Enter:\n> ' >/dev/tty
     IFS= read -r token </dev/tty || die "No token entered."
     token="$(printf '%s' "$token" | tr -d "[:space:]\"'")"
+    where=""
 }
 
 file_token="$(token_in_env_file || true)"
 token="${BOT_TOKEN:-$file_token}"
+where=""
+[ -n "${BOT_TOKEN:-}" ] || where=" in .env"
 bot_name=""
 while :; do
     if ! [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
-        [ -z "$token" ] || warn "That doesn't look like a bot token."
+        [ -z "$token" ] || warn "The token$where doesn't look like a real bot token (is it still the example?)."
         ask_token
         continue
     fi
@@ -155,7 +167,7 @@ while :; do
         say "Token OK: the bot is $bot_name"
         break
     elif [ "$rc" -eq 2 ]; then
-        warn "Telegram says this token is wrong. Copy it again from @BotFather (/mybots -> your bot -> API Token)."
+        warn "Telegram says the token$where is wrong or was revoked. Copy it again from @BotFather (/mybots -> your bot -> API Token)."
         token=""
     else
         warn "Couldn't reach Telegram to check the token (no internet yet?). Using it anyway."
@@ -167,16 +179,35 @@ chown "$RUN_USER:$RUN_GROUP" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ------------------------------------------------------------------ data
-DATA_DIR="$(cd "$APP_DIR" && PYTHONDONTWRITEBYTECODE=1 as_user "$VENV/bin/python" -c \
-    'import os; from shopbot.config import Settings; print(os.path.dirname(Settings.from_env().db_path))')" \
-    || die "The settings in $ENV_FILE are not valid (see the message above)."
+DB_FILE="$(cd "$APP_DIR" && PYTHONDONTWRITEBYTECODE=1 as_user "$VENV/bin/python" - <<'PY'
+import sys
+from shopbot.config import ConfigError, Settings
+try:
+    print(Settings.from_env().db_path)
+except ConfigError as exc:
+    print(f"Error in the settings: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+)" || die "Fix that in $ENV_FILE, then run this again."
+DATA_DIR="$(dirname "$DB_FILE")"
 case "$DATA_DIR" in
-    *[!A-Za-z0-9._/-]*) die "DB_PATH must not contain spaces or special characters (now: $DATA_DIR)." ;;
+    *[!A-Za-z0-9._/-]*) die "DB_PATH must not contain spaces or special characters (now: $DB_FILE)." ;;
 esac
+if [ -d "$DATA_DIR" ]; then  # it gets chown'ed and made writable: it must be the bot's own
+    for entry in "$DATA_DIR"/* "$DATA_DIR"/.[!.]*; do
+        [ -e "$entry" ] || continue
+        name="$(basename "$entry")"
+        case "$name" in
+            *.db | *.db-* | *.db.* | bot.lock | backups | tmp*) ;;
+            *) die "DB_PATH must point into a folder of its own, but $DATA_DIR also holds '$name'. Use the default (DB_PATH=data/shop.db) or a new folder." ;;
+        esac
+    done
+fi
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
-if [ -f "$DATA_DIR/shop.db" ]; then
-    backup="$(cd "$APP_DIR" && as_user "$VENV/bin/python" -m shopbot.backup)" \
+if [ -f "$DB_FILE" ]; then  # a safety copy before changing anything (own folder: 5 kept)
+    backup="$(cd "$APP_DIR" && as_user "$VENV/bin/python" -m shopbot.backup \
+        --dir "$DATA_DIR/backups/before-update" --keep 5)" \
         && say "Backed up the database first: $backup" \
         || warn "Couldn't back up the database first (see above). Continuing."
 fi
@@ -190,7 +221,9 @@ AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
+ProtectHome=read-only
 ReadWritePaths=$DATA_DIR
+InaccessiblePaths=-/root/.ssh -/etc/shadow -/etc/gshadow
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -206,6 +239,8 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 UMask=0077"
+
+umask 022
 cat >"$UNIT_DIR/$SERVICE.service" <<EOF
 [Unit]
 Description=Telegram shop bot
@@ -259,24 +294,43 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --quiet "$SERVICE.service" "$SERVICE-backup.timer"
+systemctl reset-failed "$SERVICE.service" 2>/dev/null || true
+started_at="$(date +%s)"
 systemctl restart "$SERVICE.service"
 systemctl start "$SERVICE-backup.timer"
 
 say "Starting ..."
-sleep 8
-if systemctl is-active --quiet "$SERVICE.service" \
-        && [ "$(systemctl show -p NRestarts --value "$SERVICE.service")" = "0" ]; then
-    say "The bot ${bot_name:+$bot_name }is running. Open it in Telegram and send /start."
+# Wait until the bot says it is connected to Telegram (or stops).
+connected=""
+for _ in $(seq 1 45); do
+    sleep 1
+    if journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null \
+            | grep -q "is running. Owner ID"; then
+        connected=yes
+        break
+    fi
+    systemctl is-active --quiet "$SERVICE.service" || break
+done
+
+help_text() {
     cat <<EOF
 
-  See what it's doing:   sudo journalctl -u $SERVICE -f
-  Stop / start / restart: sudo systemctl stop|start|restart $SERVICE
-  Update to new code:    git pull && sudo bash deploy/install.sh
-  Backups:               $DATA_DIR/backups (made every night)
+  See what it's doing:    ${S}journalctl -u $SERVICE -f        (Ctrl+C to stop watching)
+  Stop / start / restart: ${S}systemctl stop|start|restart $SERVICE
+  Update to new code:     git pull && ${S}bash deploy/install.sh
+  Backups:                $DATA_DIR/backups (made every night)
 
 EOF
+}
+if [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service"; then
+    say "The bot ${bot_name:+$bot_name }is running. Open it in Telegram and send /start."
+    help_text
+elif systemctl is-active --quiet "$SERVICE.service"; then
+    warn "The service runs, but the bot can't reach Telegram yet. It keeps trying by itself."
+    warn "Check the server's internet connection, and watch it with: ${S}journalctl -u $SERVICE -f"
+    help_text
 else
-    warn "The bot did not start properly. Its last messages:"
-    journalctl -u "$SERVICE.service" -n 25 --no-pager >&2 || true
+    warn "The bot did not start. Its last messages:"
+    journalctl -u "$SERVICE.service" --since "@$started_at" -n 25 --no-pager -o cat >&2 || true
     exit 1
 fi
