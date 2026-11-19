@@ -71,6 +71,7 @@ OWNER_COMMANDS = [
     ("open", "Open the shop"),
     ("status", "All users, balances and deposits"),
     ("pending", "Deposits and withdrawals to review"),
+    ("announce", "Send a message to all users"),
     ("cancel", "Cancel the current action"),
 ]
 
@@ -480,6 +481,7 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
             "/open — open the shop",
             "/status — all users with ID, name, balance and deposits",
             "/pending — deposits and withdrawals waiting for your answer",
+            "/announce — send a message to all users (or <code>/announce your text</code>)",
             "",
             "Buttons: 🛍 Shop · 📦 My Products · ➕ Add Product · 🏷 Add Label · "
             "📊 Earnings · 💳 Add Balance",

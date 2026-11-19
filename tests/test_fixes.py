@@ -214,7 +214,7 @@ def test_editing_an_unsaved_product_replaces_it_and_a_saved_one_is_flagged(tmp_p
         calls = await edit(t, OWNER, 50, "CODE-FIXED")
         assert "Product 1 updated" in t.last_text(calls)
         calls = await t.press(OWNER, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, OWNER["id"])
         assert contents(t, five) == ["CODE-FIXED", "CODE-2"]
 
         code = t.db.list_items(five)[1]["code"]
@@ -277,7 +277,7 @@ def test_long_captions_are_refused_when_adding_products(tmp_path):
         assert "Send at least one product message first." in t.alert(calls)
         await t.send(OWNER, photo=photo("b"), caption="y" * 1024)
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
 
     run(tmp_path, scenario)
 

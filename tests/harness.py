@@ -29,6 +29,7 @@ from telegram.request import BaseRequest
 
 from shopbot.app import build_application
 from shopbot.config import Settings
+from shopbot.handlers import broadcast as broadcast_module
 from shopbot.handlers import shop as shop_module
 from shopbot.handlers import stock as stock_module
 
@@ -206,6 +207,8 @@ class ShopTest:
         self._incoming_ids = itertools.count(1)
         stock_module.STATUS_DELAY = 0  # post the "Received N" status immediately
         shop_module.DELIVERY_INTERVAL = 0  # deliver products without pacing
+        broadcast_module.SEND_INTERVAL = 0  # announcements and stock alerts without pacing
+        broadcast_module.NEW_STOCK_DELAY = 0  # the stock alert goes out right away
 
     async def __aenter__(self) -> "ShopTest":
         await self.app.initialize()

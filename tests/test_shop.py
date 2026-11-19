@@ -165,7 +165,7 @@ async def ui_add_products(t: ShopTest, user: dict, path: list[str], messages: li
         fields = dict(fields)
         await t.send(user, fields.pop("text", None), **fields)
     calls = await t.press(user, t.button(calls, "Done"))
-    assert f"Saved {len(messages)} product(s)" in t.last_text(calls), t.last_text(calls)
+    assert f"Saved {len(messages)} product(s)" in t.last_text(calls, user["id"]), t.last_text(calls, user["id"])
 
 
 # ================================================================== browsing

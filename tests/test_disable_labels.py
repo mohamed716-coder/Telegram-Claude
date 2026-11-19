@@ -218,7 +218,7 @@ def test_admins_can_still_stock_a_disabled_product_and_see_it_marked(tmp_path):
         assert "This product is disabled, so customers don't see it" in t.last_text(calls)
         await t.send(ADMIN, "code-123")
         calls = await t.press(ADMIN, t.button(calls, "Done"))
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, ADMIN["id"])
 
         calls = await t.press(ADMIN, "mp:0:0")
         calls = await t.press(ADMIN, t.button(calls, "Esim"))

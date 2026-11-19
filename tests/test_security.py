@@ -1008,9 +1008,9 @@ def test_two_admins_adding_products_at_the_same_time(tmp_path):
             calls = await t.send(user, text)
             assert t.messages(calls) and all(c.chat_id == user["id"] for c in t.messages(calls))
         calls = await t.press(ADMIN2, "apd")
-        assert "Saved 3 product(s)" in t.last_text(calls)
+        assert "Saved 3 product(s)" in t.last_text(calls, ADMIN2["id"])
         calls = await t.press(ADMIN, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, ADMIN["id"])
 
         def contents(owner: int) -> list[str]:
             rows = t.db.conn.execute("SELECT content FROM items WHERE owner_id = ? ORDER BY id", (owner,))
@@ -1036,7 +1036,7 @@ def test_owner_approving_requests_keeps_their_own_add_product_batch(tmp_path):
         assert DISCARDED not in all_text(calls)
         await t.send(OWNER, "BATCH-3")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 3 product(s)" in t.last_text(calls)
+        assert "Saved 3 product(s)" in t.last_text(calls, OWNER["id"])
         assert t.db.count_items(five) == stock + 3
         assert t.db.get_user(BOB["id"])["balance"] == 2000
         assert t.db.get_user(ADMIN["id"])["earnings"] == 5000
@@ -1272,7 +1272,7 @@ def test_emoji_and_arabic_labels_work_end_to_end(tmp_path):
         await t.press(OWNER, f"ap:{leaf}:0")
         await t.send(OWNER, product, entities=entities)
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
         assert f"{country} › {provider} › {plan}" in t.last_text(calls)
 
         # A customer with an Arabic name buys it by pressing the emoji/Arabic buttons.
@@ -1374,7 +1374,7 @@ def test_big_catalog_stays_within_telegram_limits(tmp_path):
                 text = f"CODE-{i:03d} 🔑 كود <b>raw</b> & more"
                 await t.send(OWNER, text, entities=[{"type": "bold", "offset": 0, "length": 8}])
         calls = await t.press(OWNER, "apd")
-        assert "Saved 100 product(s)" in t.last_text(calls) and "(+40 more)" in t.last_text(calls)
+        assert "Saved 100 product(s)" in t.last_text(calls, OWNER["id"]) and "(+40 more)" in t.last_text(calls, OWNER["id"])
         # An admin stocks another plan.
         await t.press(ADMIN, f"ap:{plans['10GB']}:0")
         for i in range(20):

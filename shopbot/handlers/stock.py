@@ -364,12 +364,20 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
     shown = " ".join(f"<code>{code}</code>" for code in codes[:60])
     if len(codes) > 60:
         shown += f" … (+{len(codes) - 60} more)"
+    from .broadcast import stock_added  # local import: broadcast imports this module
+
+    try:
+        alert = stock_added(context, label_id, len(codes), user_id)
+    except Exception:  # the products are saved; a failed alert must not hide that
+        log.exception("Could not note the new stock for the customers' message")
+        alert = ""
     text = (
         f"✅ <b>Saved {len(codes)} product(s)</b>\n"
         f"📂 {esc(db.path_text(label_id))}\n"
         f"💵 Price: {money(label['price']) if label and label['price'] is not None else '—'}\n"
         f"📦 Now in stock: <b>{db.count_items(label_id)}</b>\n\n"
         f"🆔 Product IDs:\n{shown}"
+        + (f"\n\n{alert}" if alert else "")
     )
     rows = [
         [btn("➕ Add more", f"ap:{label_id}:0", GREEN), btn("📦 My Products", f"mi:{label_id}:0", BLUE)],

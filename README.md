@@ -95,6 +95,10 @@ green **Done** to save them all (or red **Cancel**). Every product gets a unique
   and send the corrected one.
 - Captions on photos and files can be at most 1024 characters (Telegram's limit for bots);
   send longer text as its own message.
+- After Done, everyone who uses the bot (not the owner, banned users, or whoever added
+  the stock) gets a **🆕 New in the shop** message with the product, its price (sellers
+  see theirs) and a button to buy it. Stock added within about a minute goes out as one
+  message. Nothing is sent while the shop is closed or for a disabled product.
 
 ### 3. My Products (📦)
 
@@ -156,6 +160,7 @@ earned: they still see 📊 Earnings and can use `/withdraw`.
 | `/close` / `/open` | owner | Close / open the shop for customers |
 | `/status` | owner | All users: ID, name, balance, total deposits (+ CSV file) |
 | `/pending` | owner | Show the deposits and withdrawals waiting for your answer again |
+| `/announce` | owner | Send a message to every user (not you or banned users): `/announce your text`, or `/announce` and then any message (photo, file, video…). You see it first and confirm with **✅ Send** |
 
 Commands that need a user also work without arguments: e.g. send `/ban` and the bot asks
 for the ID.

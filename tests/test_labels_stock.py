@@ -236,7 +236,7 @@ async def add_products(t: ShopTest, user: dict, label_id: int, products: list) -
     for product in products:
         await send_product(t, user, product)
     calls = await t.press(user, "apd")
-    assert f"Saved {len(products)} product(s)" in t.last_text(calls), t.texts(calls)
+    assert f"Saved {len(products)} product(s)" in t.last_text(calls, user["id"]), t.texts(calls)
     return [r["code"] for r in items_of(t, label_id) if r["id"] not in before]
 
 
@@ -849,7 +849,7 @@ def test_owner_asked_for_price_first_then_add_mode_starts(tmp_path):
         assert raw_label(t, ids["ten"])["price"] == 1200
         await t.send(OWNER, "TEN-GB-CODE")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
         assert [content(r)["text"] for r in items_of(t, ids["ten"])] == ["TEN-GB-CODE"]
 
     run(tmp_path, scenario)
@@ -908,7 +908,7 @@ def test_admin_adds_products_to_priced_label(tmp_path):
         await t.send(ADMIN, "ADMIN-1")
         await t.send(ADMIN, "ADMIN-2")
         calls = await t.press(ADMIN, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, ADMIN["id"])
         rows = items_of(t, ids["five"])
         assert [r["owner_id"] for r in rows] == [ADMIN["id"], ADMIN["id"]]
         assert [content(r)["text"] for r in rows] == ["ADMIN-1", "ADMIN-2"]
@@ -1061,7 +1061,7 @@ def test_unsupported_messages_rejected_with_hint(tmp_path):
         calls = await t.send(OWNER, "REAL-CODE")
         assert "Received <b>1</b> product(s)" in t.last_text(calls)
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
         assert [content(r)["text"] for r in items_of(t, ids["five"])] == ["REAL-CODE"]
 
     run(tmp_path, scenario)
@@ -1078,7 +1078,7 @@ def test_done_without_products_alerts(tmp_path):
         # Add mode is still on.
         await t.send(OWNER, "CODE-1")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
 
     run(tmp_path, scenario)
 
@@ -1202,7 +1202,7 @@ def test_status_message_shows_count_with_done_cancel(tmp_path):
         calls = await t.press(OWNER, "apd", message_id=1)
         assert {"chat_id": OWNER_ID, "message_id": second_id} in [
             c.params for c in calls if c.method == "deleteMessage"]
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, OWNER["id"])
 
     run(tmp_path, scenario)
 
@@ -1231,7 +1231,7 @@ def test_double_done_saves_once(tmp_path):
         await t.send(OWNER, "CODE-1")
         await t.send(OWNER, "CODE-2")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, OWNER["id"])
         calls = await t.press(OWNER, "apd")
         assert_alert(calls, "There is nothing to save.")
         assert t.db.count_items(ids["five"]) == 2
@@ -1258,7 +1258,7 @@ def test_owner_stays_in_add_mode_while_approving_a_deposit(tmp_path):
         assert t.app.user_data[OWNER_ID]["state"]["name"] == "add_items"
         await t.send(OWNER, "CODE-2")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, OWNER["id"])
         assert [content(r)["text"] for r in items_of(t, ids["five"])] == ["CODE-1", "CODE-2"]
 
     run(tmp_path, scenario)
@@ -1272,7 +1272,7 @@ def test_edited_product_message_does_not_add_another_product(tmp_path):
         # The owner fixes a typo by editing the message they just sent.
         await send_edit(t, OWNER, 777, "CODE-FIXED")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
         assert t.db.count_items(ids["five"]) == 1
 
     run(tmp_path, scenario)
@@ -1320,7 +1320,7 @@ def test_batch_limit_per_session(tmp_path, monkeypatch):
         calls = await t.send(OWNER, "CODE-3")
         assert "You can add up to 2 products at a time. Press Done to save these first." in t.last_text(calls)
         calls = await t.press(OWNER, "apd")
-        assert "Saved 2 product(s)" in t.last_text(calls)
+        assert "Saved 2 product(s)" in t.last_text(calls, OWNER["id"])
         assert [content(r)["text"] for r in items_of(t, ids["five"])] == ["CODE-1", "CODE-2"]
 
     run(tmp_path, scenario)

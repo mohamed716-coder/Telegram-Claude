@@ -43,7 +43,7 @@ async def build_esim_shop(t: ShopTest) -> int:
     calls = await t.send_photo(OWNER, "esim-qr-photo", caption="QR for eSIM")
     assert "Received <b>3</b>" in t.last_text(calls)
     calls = await t.press(OWNER, "apd")
-    assert "Saved 3 product(s)" in t.last_text(calls)
+    assert "Saved 3 product(s)" in t.last_text(calls, OWNER["id"])
     assert t.db.count_items(five["id"]) == 3
     return five["id"]
 

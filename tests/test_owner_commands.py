@@ -40,7 +40,7 @@ ASK_ID = "Send the user's Telegram ID"
 
 OWNER_COMMAND_NAMES = {
     "addbal", "modifybal", "addadmin", "removeadmin", "seller", "removeseller",
-    "ban", "unban", "close", "open", "status", "pending",
+    "ban", "unban", "close", "open", "status", "pending", "announce",
 }
 
 

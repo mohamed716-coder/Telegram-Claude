@@ -17,13 +17,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 log = logging.getLogger("shopbot.db")
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I look-alikes
 CODE_LENGTH = 8
 MAX_LABEL_NAME = 40
+# settings key: stock added since the last "New in the shop" message (see broadcast.py)
+PENDING_STOCK = "pending_stock_alert"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -919,6 +921,57 @@ class Database:
                 ("approved" if approve else "rejected", now(), withdrawal_id),
             )
         return self.get_withdrawal(withdrawal_id)  # type: ignore[return-value]
+
+    # --------------------------------------------------------------- broadcasts
+    def broadcast_recipients(self, exclude: Iterable[int] = ()) -> list[sqlite3.Row]:
+        """Everyone who has started the bot and isn't banned, oldest first, without the
+        owner and without ``exclude``."""
+        skip = {self.owner_id, *exclude}
+        rows = self._all("SELECT * FROM users WHERE started = 1 AND is_banned = 0 ORDER BY id")
+        return [row for row in rows if row["id"] not in skip]
+
+    def _pending_stock(self) -> dict[str, Any]:
+        raw = self.get_setting(PENDING_STOCK)
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+        adders = data.get("adders") if isinstance(data.get("adders"), list) else []
+        return {"labels": labels, "adders": adders}
+
+    def add_pending_stock(self, label_id: int, count: int, adder_id: int) -> None:
+        """Note stock that was just added, for the next "New in the shop" message. It
+        is kept in the database, so a restart in the meantime doesn't lose it."""
+        with self.tx():
+            pending = self._pending_stock()
+            key = str(label_id)
+            pending["labels"][key] = int(pending["labels"].get(key, 0)) + count
+            if adder_id not in pending["adders"]:
+                pending["adders"].append(adder_id)
+            self.set_setting(PENDING_STOCK, json.dumps(pending))
+
+    def has_pending_stock(self) -> bool:
+        return self.get_setting(PENDING_STOCK) is not None
+
+    def take_pending_stock(self) -> Optional[dict[str, Any]]:
+        """The noted stock ({label id: count}, adder ids), removed from the database;
+        None if there is none."""
+        with self.tx():
+            if self.get_setting(PENDING_STOCK) is None:
+                return None
+            pending = self._pending_stock()
+            self.conn.execute("DELETE FROM settings WHERE key = ?", (PENDING_STOCK,))
+        labels: dict[int, int] = {}
+        for key, count in pending["labels"].items():
+            try:
+                labels[int(key)] = int(count)
+            except (TypeError, ValueError):
+                continue
+        adders = [a for a in pending["adders"] if isinstance(a, int)]
+        return {"labels": labels, "adders": adders}
 
     # -------------------------------------------------------------------- stats
     def seller_stats(self, user_id: int) -> dict[str, Any]:

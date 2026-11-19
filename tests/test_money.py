@@ -1320,7 +1320,7 @@ def test_owner_deciding_a_withdrawal_keeps_add_product_going(tmp_path):
         await t.send(OWNER, "CODE-1")
         await t.press(OWNER, f"wok:{wd['id']}")
         calls = await t.press(OWNER, "apd")
-        assert "Saved 1 product(s)" in t.last_text(calls)
+        assert "Saved 1 product(s)" in t.last_text(calls, OWNER["id"])
         assert t.db.count_items(five) == 1
         assert t.db.get_withdrawal(wd["id"])["status"] == "approved"
 
