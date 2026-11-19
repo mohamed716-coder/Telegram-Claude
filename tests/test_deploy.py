@@ -651,6 +651,13 @@ def test_the_deploy_log_turns_the_servers_binance_check_into_warnings(tmp_path):
     assert warnings("  Binance check: Binance: the key works from this server; 0 Pay payment(s).",
                     "  Binance check: WARNING: this key belongs to Binance ID 1, but ...") == [
         "Binance key: this key belongs to Binance ID 1, but ..."]
+    # A log line before the verdict (the server's clock was adjusted) isn't the verdict ...
+    assert warnings("  Binance check: This computer's clock is -3001 ms off Binance's; adjusted",
+                    "  Binance check: Binance: the key works from this server; 1 Pay payment(s).") == []
+    # ... but without a verdict line (a crash), the first line is what went wrong.
+    (crash,) = warnings("  Binance check: Traceback (most recent call last):",
+                        "  Binance check:   File \"shopbot/binance.py\", line 1")
+    assert crash.startswith("Automatic deposits don't work: Traceback (most recent call last):")
 
 
 def test_the_workflow_deploys_only_the_servers_branch_one_at_a_time():

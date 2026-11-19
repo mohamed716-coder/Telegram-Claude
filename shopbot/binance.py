@@ -83,10 +83,14 @@ class Payment:
 
 
 def clean_order_id(text: str) -> Optional[str]:
-    """The Order ID (digits) or transaction ID a customer sent, or None if it isn't one."""
+    """The Order ID (digits) or transaction ID a customer sent, or None if it isn't one.
+    Leading zeros are dropped: "0466..." is the same payment as "466...", and one payment
+    must have only one spelling, or it could be claimed twice."""
     value = re.sub(r"[\s\-]", "", text or "").strip().strip("#").upper()
     if value.startswith("ORDERID:"):
         value = value[len("ORDERID:"):]
+    if value.isdigit():
+        value = value.lstrip("0")
     if ORDER_ID_RE.fullmatch(value) or TRANSACTION_ID_RE.fullmatch(value):
         return value
     return None
@@ -109,8 +113,9 @@ def _payment(raw: dict) -> Optional[Payment]:
     except InvalidOperation:
         return None
     payer = raw.get("payerInfo") or {}
+    order_id = str(raw.get("orderId") or "")
     return Payment(
-        order_id=str(raw.get("orderId") or ""),
+        order_id=order_id.lstrip("0") if order_id.isdigit() else order_id,  # as clean_order_id
         transaction_id=str(raw.get("transactionId") or ""),
         order_type=str(raw.get("orderType") or ""),
         amount=amount,
@@ -199,8 +204,8 @@ class BinancePay:
             raise BinanceKeyError(f"Binance refused the API key ({message}). Check the key and "
                                   "secret, that \"Enable Reading\" is on, and that the key allows "
                                   "this server's IP address.")
-        if response.status_code == 451:
-            raise BinanceUnavailable("Binance doesn't serve this server's location (HTTP 451)")
+        if response.status_code == 451:  # lasting, and the same on every host
+            raise BinanceError("Binance doesn't serve this server's location (HTTP 451)")
         if response.status_code in (418, 429) or response.status_code >= 500:
             raise BinanceUnavailable(f"Binance is busy (HTTP {response.status_code})")
         raise BinanceError(f"Binance answered HTTP {response.status_code}: {message}")
@@ -245,6 +250,15 @@ class BinancePay:
 
     async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
         """The payment a customer claims, made after since_ms; None if it isn't there (yet)."""
+        offset = self._offset_ms
+        found = await self._find(wanted, since_ms)
+        if found is None and self._offset_ms != offset:
+            # Our clock was corrected during the search, which therefore ended too early
+            # (by our slow clock): search again up to Binance's "now".
+            found = await self._find(wanted, since_ms)
+        return found
+
+    async def _find(self, wanted: str, since_ms: int) -> Optional[Payment]:
         now = int(time.time() * 1000) + self._offset_ms
         hint = order_id_time(wanted)
         if hint is not None and hint >= since_ms - 3_600_000:  # first look near when it was paid

@@ -5,9 +5,11 @@ ID, and sends the payment's Order ID here. The bot finds the payment in the owne
 history (shopbot/binance.py) and adds it when the coin and the amount match exactly.
 
 A check that fails is reported to the owner and the customer is asked for the Order ID
-again. When that fails too, the deposit becomes a request the owner approves or rejects
-(so does every deposit while Binance refuses the API key). Without a key, deposits go to
-the owner with a receipt (money.py).
+again. When that fails too, the deposit becomes a request the owner approves or rejects.
+So does a deposit Binance can't be asked about (the key is refused, or Binance can't be
+reached for a while), and a payment the owner may have decided on already (a request with
+an Order ID Binance didn't confirm came after it, or it was in a request that was decided).
+Without a key, deposits go to the owner with a receipt (money.py).
 
 Binance is asked in the background, so the bot keeps answering everyone meanwhile.
 """
@@ -24,8 +26,9 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application
 
-from ..binance import BinanceError, BinanceKeyError, BinancePay, Payment, check, clean_order_id
-from ..db import PaymentUsed, ShopError
+from ..binance import (BinanceError, BinanceKeyError, BinancePay, BinanceUnavailable, Payment, check,
+                       clean_order_id)
+from ..db import PaymentInDoubt, PaymentUsed, ShopError
 from .common import (
     BLUE,
     GREEN,
@@ -54,6 +57,8 @@ log = logging.getLogger("shopbot.autopay")
 
 CHECK_GAP = 5.0  # seconds between two checks of one customer
 TRIES = 2  # failed checks of one deposit before the owner decides
+UNREACHABLE_TRIES = 3  # checks of one deposit while Binance can't be reached, before the owner
+UNREACHABLE_FOR = 60.0  # decides; they must span this many seconds (short outages pass)
 OWNER_ALERT_GAP = 6 * 3600  # seconds between two "automatic deposits don't work" alerts
 
 
@@ -207,40 +212,40 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
     user_id = update.effective_user.id  # type: ignore[union-attr]
     order_id, amount = state["order_id"], state["amount"]
     used = db.binance_payment(order_id)
-    if used is not None and used["user_id"] == user_id:
-        _done(context, state)
-        await reply(_used_text(used), markup([[menu_btn()]]))
-        return
     if used is not None:
-        await _failed(update, context, state, reply, "This Order ID was already used.",
-                      "already used by someone else")
+        await _already_used(update, context, state, reply, used)
         return
     client = client_of(context)
     if client is None:  # the key was taken out meanwhile: the owner checks it
-        await _to_owner(update, context, state, reply, f"{order_id}: not checked (no Binance key)")
+        await _to_owner(update, context, state, reply, f"{order_id}: not checked (no Binance key)",
+                        unverified=True)
         return
     since = max(db.binance_auto_since(), int(time.time() * 1000) - cfg.binance_max_age_hours * 3_600_000)
     try:
         payment = await client.find(order_id, since)
-    except BinanceKeyError as exc:
+    except BinanceUnavailable as exc:  # for now: the network, maintenance, too many requests
+        log.warning("Couldn't check a payment with Binance: %s", exc)
+        await _unreachable(update, context, state, reply, exc)
+        return
+    except BinanceError as exc:  # until it's fixed: the key, the server's location, Binance's answers
         log.error("Automatic deposits don't work: %s", exc)
         await _alert_owner(context, f"⚠️ <b>Automatic deposits don't work</b>: {esc(exc)}\n"
                                     "Deposits come to you to approve until it's fixed.")
-        await _to_owner(update, context, state, reply,
-                        f"{order_id}: not checked (Binance refused the API key)")
-        return
-    except BinanceError as exc:
-        log.warning("Couldn't check a payment with Binance: %s", exc)
-        await reply("⏳ Binance can't be reached right now. Please press 🔄 Check again in a minute.",
-                    _cancel_kb(again=True))
+        why = "Binance refused the API key" if isinstance(exc, BinanceKeyError) else str(exc)
+        await _to_owner(update, context, state, reply, f"{order_id}: not checked ({why})",
+                        unverified=True)
         return
     if payment is None:
         await _failed(
             update, context, state, reply,
             f"I can't find a payment with Order ID <code>{esc(order_id)}</code> to Binance ID "
             f"<code>{esc(cfg.binance_pay_id)}</code> in the last {cfg.binance_max_age_hours} hours.",
-            "not found in your Binance Pay history", again=True,
+            "not found in your Binance Pay history", again=True, unverified=True,
         )
+        return
+    used = db.binance_payment(payment.order_id, payment.transaction_id)  # sent by its other ID?
+    if used is not None:
+        await _already_used(update, context, state, reply, db.link_payment(used, payment))
         return
     if not payment.received:
         await _failed(update, context, state, reply, "This Order ID isn't a payment to this shop.",
@@ -259,12 +264,17 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         decision = db.credit_binance_payment(user_id, payment, amount * 100,
                                              cfg.seller_auto_threshold * 100)
     except PaymentUsed as exc:  # claimed a moment earlier
-        if exc.row["user_id"] == user_id:
-            _done(context, state)
-            await reply(_used_text(exc.row), markup([[menu_btn()]]))
-        else:
-            await _failed(update, context, state, reply, "This Order ID was already used.",
-                          "already used by someone else")
+        await _already_used(update, context, state, reply, exc.row)
+        return
+    except PaymentInDoubt as exc:  # the owner may have approved or settled it by hand already
+        state["found"].append(payment)  # kept for the owner's decision
+        before = [f"the {money(r['amount'])} you added by hand at {r['created_at']} UTC"
+                  if r["method"] == "manual" else
+                  f"request #{r['id']} ({r['status']}) with an Order ID Binance didn't confirm"
+                  for r in exc.requests]
+        await _to_owner(update, context, state, reply,
+                        f"{order_id}: paid before {' and '.join(before)}, which may have been "
+                        "for this payment")
         return
     except ShopError as exc:
         _done(context, state)
@@ -286,11 +296,44 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
                  f"🧾 Order ID <code>{esc(payment.order_id or payment.transaction_id)}</code>")
 
 
+async def _already_used(update: Update, context: Ctx, state: dict, reply: _Reply, row: Any) -> None:
+    """The payment is in the bot's records already (``row``, from binance_payments)."""
+    if row["user_id"] != update.effective_user.id:  # type: ignore[union-attr]
+        await _failed(update, context, state, reply, "This Order ID was already used.",
+                      "already used by someone else")
+        return
+    request = db_of(context).get_deposit(row["deposit_id"]) if row["status"] == "owner" else None
+    if request is not None and request["status"] != "pending":
+        # Kept for a request the owner decided already (e.g. rejected for its amount):
+        # it can't be added automatically, so the owner looks at it again.
+        await _to_owner(update, context, state, reply,
+                        f"{state['order_id']}: was in request #{request['id']}, which you {request['status']}")
+        return
+    _done(context, state)
+    await reply(_used_text(row), markup([[menu_btn()]]))
+
+
+async def _unreachable(update: Update, context: Ctx, state: dict, reply: _Reply, exc: Exception) -> None:
+    """Binance can't be reached right now. That usually passes by itself, so it's not a
+    failed try; when it lasts, the owner checks the payment by hand."""
+    times = state.setdefault("unreachable", [])
+    times.append(time.monotonic())
+    if len(times) >= UNREACHABLE_TRIES and times[-1] - times[0] >= UNREACHABLE_FOR:
+        await _to_owner(update, context, state, reply,
+                        f"{state['order_id']}: not checked (Binance couldn't be reached: {exc})",
+                        unverified=True)
+        return
+    await reply("⏳ Binance can't be reached right now. Please press 🔄 Check again in a minute. "
+                "If it still can't be reached, the owner checks your payment by hand.",
+                _cancel_kb(again=True))
+
+
 async def _failed(update: Update, context: Ctx, state: dict, reply: _Reply, reason: str, why: str,
-                  *, again: bool = False) -> None:
+                  *, again: bool = False, unverified: bool = False) -> None:
     """A check that didn't work out. The owner hears of it and the customer sends the Order
     ID again; after the last try the deposit goes to the owner to approve or reject.
-    ``reason`` is for the customer (HTML), ``why`` for the owner (text)."""
+    ``reason`` is for the customer (HTML), ``why`` for the owner (text); ``unverified``:
+    Binance didn't confirm the Order ID (it doesn't know it)."""
     db, cfg = db_of(context), cfg_of(context)
     user_id = update.effective_user.id  # type: ignore[union-attr]
     if get_state(context) is not state:  # cancelled while Binance was asked: just say why
@@ -298,6 +341,8 @@ async def _failed(update: Update, context: Ctx, state: dict, reply: _Reply, reas
         return
     state["tries"] = state.get("tries", 0) + 1
     state.setdefault("notes", []).append(f"{state['order_id']}: {why}")
+    if unverified:
+        state["unverified"] = True
     if state["tries"] >= TRIES:
         await _to_owner(update, context, state, reply)
         return
@@ -318,9 +363,11 @@ async def _failed(update: Update, context: Ctx, state: dict, reply: _Reply, reas
     )
 
 
-async def _to_owner(update: Update, context: Ctx, state: dict, reply: _Reply, note: str = "") -> None:
+async def _to_owner(update: Update, context: Ctx, state: dict, reply: _Reply, note: str = "",
+                    *, unverified: bool = False) -> None:
     """The bot can't add this deposit: it becomes a request the owner approves or rejects.
-    Payments Binance did find are kept for it, so nobody can claim them meanwhile."""
+    Payments Binance did find are kept for it, so nobody can claim them meanwhile.
+    ``unverified``: Binance couldn't be asked about the Order ID."""
     from .money import send_deposit_to_owner  # local import: money imports this module
 
     db = db_of(context)
@@ -330,8 +377,9 @@ async def _to_owner(update: Update, context: Ctx, state: dict, reply: _Reply, no
         return
     notes = list(state.get("notes", [])) + ([note] if note else [])
     found = [p for p in state.get("found", []) if p.received]
-    order_id = (found[0].order_id or found[0].transaction_id) if found else state["order_id"]
-    deposit = db.create_review_request(user_id, state["amount"] * 100, order_id, "\n".join(notes), found)
+    deposit = db.create_review_request(user_id, state["amount"] * 100, state["order_id"],
+                                       "\n".join(notes), found,
+                                       unverified=unverified or bool(state.get("unverified")))
     _done(context, state)
     reached = await send_deposit_to_owner(context, deposit)
     text = (f"🧾 <b>Sent to the owner</b>\n\nYour deposit of <b>{state['amount']}$</b> couldn't be "

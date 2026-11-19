@@ -265,7 +265,10 @@ if [ "$rc" -ne 0 ]; then
 fi
 # Automatic deposits: what the server's own check of the Binance key said (ci-remote.sh).
 check="$(sed -n 's/^  Binance check: //p' "$work/install.log")"
-first="${check%%$'\n'*}"
+# The verdict is its "Binance: ..." line; a log line (e.g. the clock was adjusted) may come
+# first. Without one (an error or a traceback), the first line is what went wrong.
+first="$(grep -m1 '^Binance: ' <<<"$check" || true)"
+[ -n "$first" ] || first="${check%%$'\n'*}"
 case "$first" in
     "" | "Binance: the key works"* | "Binance: no API key"*) ;;
     *) note "Automatic deposits don't work: ${first#Binance: } Until it's fixed, every deposit comes to you to approve ($BINANCE_GUIDE)." ;;

@@ -36,6 +36,7 @@ EXIT_RUNNING = 75  # another copy is already running with the same data folder
 TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]{30,}")
 OFFLINE_NOTICE_EVERY = 30  # seconds between "still trying" log lines while starting
 TOKEN_CHECK_EVERY = 120  # seconds between checks that the token still works
+CHECKS_TIMEOUT = 60  # seconds a stop waits for payment checks (systemd allows 300)
 
 _connected = threading.Event()
 
@@ -59,6 +60,13 @@ async def _post_stop(app: Application) -> None:
     task = app.bot_data.pop("token_watch", None)
     if task is not None:
         task.cancel()
+    # A payment check started while stopping isn't awaited by Application.stop(): let it
+    # finish (it usually takes seconds) before its connection to Binance is closed.
+    checks = [t for t in asyncio.all_tasks()
+              if t.get_name().startswith("shopbot:binance:") and not t.done()]
+    if checks:
+        log.info("Finishing %s payment check(s) before stopping ...", len(checks))
+        await asyncio.wait(checks, timeout=CHECKS_TIMEOUT)
     client = app.bot_data.get("binance")
     if client is not None:
         await client.close()

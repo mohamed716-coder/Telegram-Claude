@@ -185,6 +185,9 @@ def deposit_caption(context: Ctx, deposit: Any) -> str:
         + (f"🧾 Binance Order ID: <code>{esc(order)}</code>\n" if order else "")
         + found
         + (f"⚠️ Not added automatically:\n{notes}" if notes else "")
+        + ("❗ Binance didn't confirm this Order ID. Approve only if you find the payment in "
+           "your Binance app and haven't added it already (each automatic deposit sent you a "
+           "💳 message).\n" if deposit["unverified"] else "")
         + f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
         f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
         f"🕒 {deposit['created_at']} UTC"
