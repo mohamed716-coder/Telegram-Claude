@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs on the server, started by deploy/ci-deploy.sh (not meant to be run by hand). It puts
 # the uploaded code into ~/Telegram-Claude, a git checkout (git never touches the shop's
-# data/ folder or .env), then runs deploy/install.sh from there.
+# data/ folder or .env), runs deploy/install.sh from there, and goes back to the code
+# the server had if the new version doesn't install or start.
 set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export GIT_TERMINAL_PROMPT=0
@@ -10,24 +11,48 @@ say() { printf '==> %s\n' "$*"; }
 warn() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-trap 'rm -rf "$here"' EXIT
+# Only ever clean up the folder deploy/ci-deploy.sh uploaded this to, never "wherever
+# this file happens to be".
+src="${BASH_SOURCE[0]:-}"
+here="$(cd "$(dirname "${src:-/nonexistent/x}")" 2>/dev/null && pwd -P || true)"
+home="$(cd "$HOME" 2>/dev/null && pwd -P || true)"
+case "$here" in
+    "$home"/.shopbot-deploy.*) ;;
+    *) die "This is started by deploy/ci-deploy.sh only. Nothing was changed." ;;
+esac
+[ -n "$src" ] && [ -n "$home" ] && [ -f "$here/code.bundle" ] \
+    || die "This is started by deploy/ci-deploy.sh only. Nothing was changed."
+trap 'rm -f "$here/code.bundle" "$here/remote.sh" "$here/token"; rmdir "$here" 2>/dev/null || true' EXIT
+token="$(cat "$here/token" 2>/dev/null || true)"
+rm -f "$here/token"
+
 branch="${1:?usage: ci-remote.sh BRANCH [OWNER/REPO]}"
 repo="${2:-}"
 app="$HOME/Telegram-Claude"
 bundle="$here/code.bundle"
-token="$(cat "$here/token" 2>/dev/null || true)"
-rm -f "$here/token"
-
 [ "$(id -u)" -eq 0 ] || die "Log in as root: this deploy needs root."
+# Uploads left behind by a deploy that was cut off (older than a day).
+find "$HOME" -maxdepth 1 -name '.shopbot-deploy.*' -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+
+# One deploy at a time (e.g. a re-run while the last one still runs here).
+exec 9>"$HOME/.shopbot-deploy-lock"
+if ! flock -n 9; then
+    say "Waiting for another deploy on this server to finish ..."
+    flock -w 1800 9 || die "Another deploy is running on this server for 30 minutes already."
+fi
+
 if ! command -v git >/dev/null; then
     say "Installing git (if the server is busy with its own updates, this waits for them) ..."
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq || true
+    for _ in $(seq 1 20); do  # "update" doesn't wait for apt's lock by itself
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq && break
+        sleep 30
+    done
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq git >/dev/null \
-        || die "Couldn't install git. Log in and run: apt-get install git"
+        || die "Couldn't install git. Log in and run: apt-get update && apt-get install git"
 fi
 
 first=""
+previous=""
 if [ ! -e "$app" ]; then
     say "Putting the code in $app ..."
     first=yes
@@ -36,6 +61,7 @@ if [ ! -e "$app" ]; then
     git -C "$app" config core.sshCommand "ssh -i ~/.ssh/shopbot_deploy"
 elif [ -d "$app/.git" ]; then
     say "Updating the code in $app ..."
+    previous="$(git -C "$app" rev-parse --verify --quiet HEAD || true)"
 else
     die "$app exists but is not a git copy of the bot. Rename it (mv $app $app.old) and run the deploy again. Its data stays in $app.old/data: bring it over with a backup and --restore (DEPLOY.md)."
 fi
@@ -63,6 +89,8 @@ else
         git merge --quiet --ff-only "$new"
     elif git merge-base --is-ancestor "$new" HEAD; then
         warn "The server already has newer code ($(git rev-parse --short HEAD)), so it stays; not going back to $(git rev-parse --short "$new")."
+    elif [ "$(git log -1 --format=%ct "$new")" -lt "$(git log -1 --format=%ct HEAD)" ]; then
+        warn "The uploaded code is older than the server's ($(git rev-parse --short "$new") vs $(git rev-parse --short HEAD)), so the server keeps its code."
     else  # the history on GitHub was rewritten (or someone committed on the server)
         keep="before-deploy-$(date -u +%Y%m%d-%H%M%S)"
         git branch -f "$keep" HEAD
@@ -74,8 +102,30 @@ if git remote get-url origin >/dev/null 2>&1; then
     git branch --quiet --set-upstream-to="origin/$branch" 2>/dev/null || true
 fi
 say "Code on the server: $(git log -1 --format='%h %s')"
-if [ -n "$token" ]; then export OFFERED_BOT_TOKEN="$token"; fi
-bash deploy/install.sh
+
+# The BOT_TOKEN secret: offered to the installer, which takes it only if Telegram accepts
+# it. One that hasn't changed since the last deploy doesn't undo a token changed here.
+seen="$app/.git/shopbot-token-secret.sha256"  # git ignores files in .git; not in data/
+sum=""
+if [ -n "$token" ]; then
+    export OFFERED_BOT_TOKEN="$token"
+    sum="$(printf '%s' "$token" | sha256sum | cut -c1-64)"
+    if [ "$(cat "$seen" 2>/dev/null || true)" = "$sum" ]; then export OFFERED_BOT_TOKEN_SEEN=yes; fi
+fi
+export SHOPBOT_VIA_CI=1  # the installer's messages then talk about secrets, not .env
+rc=0
+bash deploy/install.sh || rc=$?
+if [ "$rc" -ne 0 ]; then
+    if [ -n "$previous" ] && [ "$previous" != "$(git rev-parse HEAD)" ]; then
+        warn "The new version didn't install or start, so the server went back to $(git rev-parse --short "$previous")."
+        git reset --quiet --hard "$previous"
+        if [ "$rc" -eq 3 ]; then  # the bot was restarted on the new code: start the old one
+            bash deploy/install.sh || true
+        fi
+    fi
+    exit 1
+fi
+if [ -n "$sum" ]; then (umask 077 && printf '%s\n' "$sum" >"$seen"); fi
 
 # ------------------------------------------------------------------ status
 # Only information from here on: nothing below may fail the deploy.

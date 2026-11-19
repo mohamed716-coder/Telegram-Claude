@@ -1,0 +1,6 @@
+# The SSH key fingerprint of the server that GitHub installs the bot on. deploy/ci-deploy.sh
+# refuses to log in to a server whose key doesn't match, so root's password never goes to
+# an impostor. It is public (it can't be used to log in) and was seen at the first deploy.
+# Reinstalled the server or changed its SSH keys? Put the new fingerprint here (the deploy
+# log prints it when this file is missing), one per line.
+SHA256:fq5XSzxMSx7leZFHgJY6woB70fLt52bjTXOVPv62rjo

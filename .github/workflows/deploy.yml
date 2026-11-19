@@ -1,6 +1,7 @@
 # Installs the bot on your server (VPS) whenever the bot's code changes on its branch, and
-# when you start it again (open a run in the Actions tab -> "Re-run all jobs"). It needs the
-# repository secrets VPS_HOST, VPS_PASSWORD and BOT_TOKEN: see DEPLOY.md, "Let GitHub install it".
+# when you start it again (open a run in the Actions tab -> Re-run jobs -> Re-run all jobs).
+# It needs the repository secrets VPS_HOST, VPS_PASSWORD and BOT_TOKEN: see DEPLOY.md,
+# "The easy way: GitHub installs it for you".
 # To stop it: Actions -> "Deploy to the server" -> "..." -> Disable workflow.
 name: Deploy to the server
 
@@ -18,15 +19,17 @@ on:
 permissions:
   contents: read
 
-concurrency:  # one deploy at a time, and never cut one off halfway
-  group: deploy-to-server
-  cancel-in-progress: false
-
 jobs:
   deploy:
-    # Only the branch the server runs. To deploy another one (e.g. main after merging), set
-    # the repository variable DEPLOY_BRANCH (Settings -> Secrets and variables -> Variables).
+    # Only the branch the server runs. After merging into main, add the repository variable
+    # DEPLOY_BRANCH = main (Settings -> Secrets and variables -> Actions -> Variables tab ->
+    # New repository variable). Runs on other branches show as skipped (grey).
     if: github.ref_name == (vars.DEPLOY_BRANCH || 'claude/telegram-bot-vphwhx')
+    # One deploy at a time, never cut off halfway. On the job, not the workflow, so a
+    # skipped run can't cancel a deploy that is waiting.
+    concurrency:
+      group: deploy-to-server
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

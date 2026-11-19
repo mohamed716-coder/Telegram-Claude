@@ -31,8 +31,9 @@ and use your user name instead of `root` in `scp`.
 
 > **Were your root password or bot token ever sent in a chat, email or message?** Then
 > do this first. In @BotFather send `/revoke`, choose the bot, and keep the new token for
-> step 4. Right after logging in (step 1), type `passwd` and set a new long password
-> (20+ random characters, kept in a password manager).
+> step 4 (or for the `BOT_TOKEN` secret). Log in once (step 1), type `passwd` and set a new
+> long password (20+ random characters, kept in a password manager), and use that one for
+> the `VPS_PASSWORD` secret.
 
 ### The easy way: GitHub installs it for you
 
@@ -53,8 +54,8 @@ add three secrets, once.
 
    If the server's SSH port isn't 22, also add `VPS_PORT` with the port number.
 2. Open the repository's **Actions** tab → **Deploy to the server** → the newest run →
-   **Re-run all jobs**. (A run starts by itself when the code changes; the very first one
-   may have started before your secrets were there.)
+   **Re-run jobs** → **Re-run all jobs**. (A run starts by itself when the code changes;
+   the very first one may have started before your secrets were there.)
 3. After about 3 minutes it shows a green check. Click the run → **deploy** → **Install the
    bot on the server**: near the end it says *The bot @yourbot is running*. Open the bot in
    Telegram and send `/start`.
@@ -63,17 +64,32 @@ GitHub keeps the secrets encrypted and hides them in the logs. If something goes
 
 | You see | What to do |
 |---|---|
-| A red cross | The first red line says what's wrong (a missing secret, a wrong password...). Fix it, then **Re-run all jobs**. |
+| A red cross | The red line at the top of the run says what's wrong (a missing secret, a wrong password...). Fix it, then **Re-run jobs** → **Re-run all jobs**. |
+| A grey run (skipped) | Nothing was installed: GitHub installs only the branch the server follows (`claude/telegram-bot-vphwhx`, or the `DEPLOY_BRANCH` variable, see below). |
+| `The server wants a new root password` | Log in once by hand (step 1), set the new password it asks for, put it in `VPS_PASSWORD`, then re-run. |
+| `The new version didn't start, so the server went back` (a yellow warning) | The bot keeps running the code it had. Nothing to do for you; the log says what went wrong. |
+| `Lost the connection to the server` | Check that the server is on. Wait 5 minutes, then re-run: the install may have finished anyway. |
 | `The server refused the password` | Check `VPS_PASSWORD`. If it's right, the server doesn't let root log in with a password: set it up by hand instead (below). |
 | `Telegram rejected the BOT_TOKEN secret` (a yellow warning) | The bot still runs with the token it had. Put the current token in the `BOT_TOKEN` secret. |
-| `The server's SSH key is not the one seen at the first deploy` | Did you reinstall the server? Then delete the cache whose name starts with `server-ssh-key` (Actions tab → **Caches**, under *Management*) and re-run. If you didn't, stop: someone may be intercepting the connection. |
+| `The server's SSH key doesn't match deploy/server-fingerprint` (or `is not the one seen at the first deploy`) | Did you reinstall the server or change its SSH keys? Then its new fingerprint has to go into `deploy/server-fingerprint` (ask whoever maintains the code). If not, stop and change root's password: someone may be intercepting the connection. |
 
-- **Changed the root password or the bot token?** Update that secret too (the same
-  Secrets page → the pencil next to it).
+- **Changed the root password?** Put the new one in `VPS_PASSWORD` (the same Secrets page →
+  the pencil next to it).
+- **New bot token (after `/revoke`), or a different bot?** The bot stops until the server
+  has it. Put it in `BOT_TOKEN` (pencil), then let GitHub install it: Actions tab →
+  **Deploy to the server** → the newest run → **Re-run jobs** → **Re-run all jobs**. (No
+  Re-run button because that run is over 30 days old? Log in to the server and run
+  `cd ~/Telegram-Claude && bash deploy/install.sh`: it asks for the new token.)
 - **To stop the automatic updates:** Actions tab → **Deploy to the server** → **...** →
-  **Disable workflow**.
-- Everything further down (everyday commands, backups, restore) works the same once you log
-  in to the server: the bot is in `/root/Telegram-Claude`.
+  **Disable workflow**. Do this first if you want to stop or remove the bot for good,
+  or the next code change installs and starts it again.
+- **Moved the code to `main`** (merged it)? Add the repository variable `DEPLOY_BRANCH` with
+  the value `main`: Settings → Secrets and variables → Actions → **Variables** tab → **New
+  repository variable**. Then re-run the newest run on `main`.
+- Everything further down (everyday commands, backups, restore) works once you log in to
+  the server (the bot is in `/root/Telegram-Claude`), except: updates come from GitHub
+  (`git pull` there needs the key from step 2), and to switch bots use the `BOT_TOKEN`
+  secret as above.
 
 **Or set it up by hand**, step by step:
 
@@ -156,9 +172,9 @@ Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`).
 | Update to the newest code | `git pull && bash deploy/install.sh` (if GitHub installs it for you: automatic) |
 | Make a backup now | `systemctl start shopbot-backup` |
 | List the backups | `.venv/bin/python -m shopbot.backup --list` |
-| New token (after `/revoke` in @BotFather) | `bash deploy/install.sh`: it sees the old one is revoked and asks for the new one |
-| Switch to a different bot | `BOT_TOKEN=paste-the-new-token bash deploy/install.sh` (as a normal user: `sudo BOT_TOKEN=paste-the-new-token bash deploy/install.sh`) |
-| Remove the service (keeps your data) | `bash deploy/install.sh --uninstall` |
+| New token (after `/revoke` in @BotFather) | `bash deploy/install.sh`: it sees the old one is revoked and asks for the new one (if GitHub installs it for you: the `BOT_TOKEN` secret, see above) |
+| Switch to a different bot | `BOT_TOKEN=paste-the-new-token bash deploy/install.sh` (as a normal user: `sudo BOT_TOKEN=paste-the-new-token bash deploy/install.sh`; if GitHub installs it for you: the `BOT_TOKEN` secret, see above) |
+| Remove the service (keeps your data) | `bash deploy/install.sh --uninstall` (if GitHub installs it for you, disable its workflow first, see above) |
 
 If the screen shows `(END)` or `lines 1-23`, press `q` to get back.
 

@@ -495,9 +495,9 @@ def run_ci_deploy(tmp_path, **env):
 def test_the_deploy_job_says_which_secrets_are_missing(tmp_path):
     done = run_ci_deploy(tmp_path)
     assert done.returncode == 1
-    assert "Add the secret(s) VPS_HOST VPS_PASSWORD" in done.stderr
-    done = run_ci_deploy(tmp_path, VPS_HOST="203.0.113.25")
-    assert "Add the secret(s) VPS_PASSWORD:" in done.stderr
+    assert "Add the repository secret(s) VPS_HOST VPS_PASSWORD BOT_TOKEN:" in done.stderr
+    done = run_ci_deploy(tmp_path, VPS_HOST="203.0.113.25", BOT_TOKEN=GOOD_TOKEN)
+    assert "Add the repository secret(s) VPS_PASSWORD:" in done.stderr
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
@@ -540,7 +540,7 @@ def test_install_sh_takes_an_offered_token_only_when_telegram_accepts_it():
     text = (ROOT / "deploy" / "install.sh").read_text()
     block = text[text.index('offered="${OFFERED_BOT_TOKEN:-}"'):text.index('bot_name=""')]
 
-    def decide(file_token, offered, env_token=""):
+    def decide(file_token, offered, env_token="", seen=False):
         script = (
             'warn() { echo "WARN: $*"; }\n'
             'check_token() { case "$1" in good*) return 0 ;; down*) return 3 ;; *) return 2 ;; esac; }\n'
@@ -550,6 +550,8 @@ def test_install_sh_takes_an_offered_token_only_when_telegram_accepts_it():
         env = {"PATH": os.environ["PATH"], "FILE_TOKEN": file_token, "OFFERED_BOT_TOKEN": offered}
         if env_token:
             env["BOT_TOKEN"] = env_token
+        if seen:  # the secret is the one the last deploy already offered
+            env["OFFERED_BOT_TOKEN_SEEN"] = "yes"
         out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True).stdout
         return out.splitlines()[-1].removeprefix("USE="), "WARN" in out
 
@@ -560,6 +562,9 @@ def test_install_sh_takes_an_offered_token_only_when_telegram_accepts_it():
     assert decide("", "revoked") == ("revoked", False)  # nothing else: the check rejects it
     assert decide("good-old", "good-old") == ("good-old", False)  # same: nothing to do
     assert decide("good-old", "good-new", env_token="good-typed") == ("good-typed", False)
+    # An unchanged secret doesn't undo a token changed on the server, while that one works.
+    assert decide("good-server", "good-secret", seen=True) == ("good-server", True)
+    assert decide("revoked-server", "good-secret", seen=True) == ("good-secret", False)
 
 
 def test_the_workflow_deploys_only_the_servers_branch_one_at_a_time():
@@ -569,8 +574,9 @@ def test_the_workflow_deploys_only_the_servers_branch_one_at_a_time():
     assert "claude/telegram-bot-vphwhx" in triggers["push"]["branches"]
     assert {"shopbot/**", "deploy/**", "bot.py", "requirements.txt"} <= set(triggers["push"]["paths"])
     assert flow["permissions"] == {"contents": "read"}
-    assert flow["concurrency"]["cancel-in-progress"] is False
     job = flow["jobs"]["deploy"]
+    # On the job: a skipped run (another branch) must not cancel a deploy that waits.
+    assert "concurrency" not in flow and job["concurrency"]["cancel-in-progress"] is False
     assert "vars.DEPLOY_BRANCH" in job["if"] and "claude/telegram-bot-vphwhx" in job["if"]
     steps = {step.get("id"): step for step in job["steps"]}
     checkout = job["steps"][0]
@@ -594,7 +600,8 @@ def test_the_server_side_deploy_never_deletes_the_shops_data():
     code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
     assert not [line for line in code if "git clean" in line]  # -x would delete data/
     removals = [line for line in code if re.search(r"\brm\b", line)]
-    assert removals and all("$here" in line for line in removals)  # only its own upload
+    # Only its own upload folder, or old leftover uploads with that exact name.
+    assert removals and all('"$here/' in line or "'.shopbot-deploy.*'" in line for line in removals)
 
 
 def test_backups_are_made_every_6_hours_and_a_week_of_them_is_kept():
@@ -602,3 +609,27 @@ def test_backups_are_made_every_6_hours_and_a_week_of_them_is_kept():
     assert "OnCalendar=*-*-* 00/6:17:00" in text  # 00:17, 06:17, 12:17, 18:17
     assert "Persistent=true" in text  # missed while the server was off: made at boot
     assert backup.DEFAULT_KEEP == 28 == 7 * 24 // 6
+
+
+def test_the_server_script_only_runs_from_its_own_upload_folder_and_deletes_nothing(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    script = (ROOT / "deploy" / "ci-remote.sh").read_text()
+    for place in (home, tmp_path / "elsewhere", home / "Telegram-Claude" / "deploy"):
+        place.mkdir(parents=True, exist_ok=True)
+        (place / "remote.sh").write_text(script)
+        (place / "code.bundle").write_text("x")
+        (place / "keep.txt").write_text("shop data")
+        done = subprocess.run(["bash", str(place / "remote.sh"), "branch"], capture_output=True,
+                              text=True, env={**os.environ, "HOME": str(home)})
+        assert done.returncode == 1 and "started by deploy/ci-deploy.sh only" in done.stderr, place
+        assert sorted(p.name for p in place.iterdir()) == ["code.bundle", "keep.txt", "remote.sh"]
+
+
+@needs_ssh
+def test_a_pinned_server_key_that_does_not_match_is_refused(tmp_path):
+    # A local sshd isn't needed: with deploy/server-fingerprint pinning a key, an address
+    # that answers nothing is "can't reach", never "accepted".
+    done = run_ci_deploy(tmp_path, VPS_HOST="127.0.0.1", VPS_PORT="1", VPS_PASSWORD="pw")
+    assert done.returncode == 1 and "Can't reach the server at VPS_HOST on port 1" in done.stderr
+    assert "Checking the server's identity against deploy/server-fingerprint" in done.stdout

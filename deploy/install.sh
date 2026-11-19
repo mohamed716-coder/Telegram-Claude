@@ -147,6 +147,9 @@ PY
 )
 
 ask_token() {
+    if [ -n "${SHOPBOT_VIA_CI:-}" ]; then  # installed by GitHub (deploy/ci-remote.sh)
+        die "The server has no working bot token: put the current token from @BotFather in the BOT_TOKEN secret, then run the deploy again."
+    fi
     ( exec </dev/tty ) 2>/dev/null \
         || die "Put the bot token in $ENV_FILE as BOT_TOKEN=..., then run this again."
     printf 'Paste the bot token from @BotFather (looks like 123456789:AAH...) and press Enter:\n> ' >/dev/tty
@@ -161,12 +164,20 @@ where=""
 [ -n "${BOT_TOKEN:-}" ] || where=" in .env"
 # A deploy from GitHub (deploy/ci-deploy.sh) offers the token from its BOT_TOKEN secret: take
 # it if Telegram accepts it, but an outdated one (e.g. after /revoke) must never replace a
-# token in .env that still works.
+# token in .env that still works. If the secret hasn't changed since the last deploy
+# (OFFERED_BOT_TOKEN_SEEN), a token changed here on the server stays while it works.
 offered="${OFFERED_BOT_TOKEN:-}"
 if [ -z "${BOT_TOKEN:-}" ] && [ -n "$offered" ] && [ "$offered" != "$file_token" ]; then
     rc=0
     check_token "$offered" >/dev/null || rc=$?
-    if [ "$rc" -eq 0 ] || [ -z "$file_token" ]; then
+    file_rc=2
+    if [ -n "$file_token" ] && [ "${OFFERED_BOT_TOKEN_SEEN:-}" = yes ]; then
+        file_rc=0
+        check_token "$file_token" >/dev/null || file_rc=$?
+    fi
+    if [ "$file_rc" -ne 2 ]; then
+        warn "The token in .env was changed on the server and is not the one in the BOT_TOKEN secret, so the token in .env stays. Put it in the BOT_TOKEN secret too."
+    elif [ "$rc" -eq 0 ] || [ -z "$file_token" ]; then
         token="$offered"
         where=" (the BOT_TOKEN secret)"
     elif [ "$rc" -eq 2 ]; then
@@ -239,7 +250,7 @@ if [ -f "$DB_FILE" ]; then  # a safety copy before changing anything (own folder
     backup="$(cd "$APP_DIR" && as_user "$VENV/bin/python" -m shopbot.backup \
         --dir "$DATA_DIR/backups/before-update" --keep 5)" \
         && say "Backed up the database first: $backup" \
-        || warn "Couldn't back up the database first (see above). Continuing."
+        || die "Couldn't back up the database first (see above), so the bot was not updated or restarted. Free some disk space (df -h shows how much is left), then run this again."
 fi
 
 # -------------------------------------------------------------- services
@@ -349,12 +360,14 @@ for _ in $(seq 1 45); do
     systemctl is-active --quiet "$SERVICE.service" || break
 done
 
+update="git pull && ${S}bash deploy/install.sh"
+[ -z "${SHOPBOT_VIA_CI:-}" ] || update="installed by GitHub when the bot's code changes"
 help_text() {
     cat <<EOF
 
   See what it's doing:    ${S}journalctl -u $SERVICE -f        (Ctrl+C to stop watching)
   Stop / start / restart: ${S}systemctl stop|start|restart $SERVICE
-  Update to new code:     git pull && ${S}bash deploy/install.sh
+  Update to new code:     $update
   Backups:                $DATA_DIR/backups (made every 6 hours)
 
 EOF
@@ -381,5 +394,5 @@ elif systemctl is-active --quiet "$SERVICE.service"; then
 else
     warn "The bot did not start. Its last messages:"
     journalctl -u "$SERVICE.service" --since "@$started_at" -n 25 --no-pager -o cat >&2 || true
-    exit 1
+    exit 3  # deploy/ci-remote.sh then starts the code the server had before
 fi
