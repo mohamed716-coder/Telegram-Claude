@@ -22,7 +22,10 @@ Choose one:
 ## A. Linux server (Ubuntu 22.04+ or Debian 12+)
 
 You need: the server's **IP address** and **root password** (or a user that can use `sudo`),
-and the **bot token** from [@BotFather](https://t.me/BotFather).
+and the **bot token** from [@BotFather](https://t.me/BotFather). The commands below are for
+root; logged in as a normal user, put `sudo` in front of `apt-get`, `systemctl`,
+`journalctl` and `bash deploy/install.sh` (never in front of `git` or `.venv/bin/python`),
+and use your user name instead of `root` in `scp`.
 
 ### 1. Log in to the server
 
@@ -92,13 +95,11 @@ You can now close the window.
 
 ### Everyday commands
 
-Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`). Not root? Put
-`sudo` in front of the `systemctl`, `journalctl` and `bash deploy/install.sh` commands only,
-never in front of `git` or `.venv/bin/python`.
+Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`).
 
 | What | Command |
 |---|---|
-| Is it running? (look for *active (running)*) | `systemctl status shopbot --no-pager` |
+| Is it running? (look for *active (running)*) | `systemctl status shopbot --no-pager -l` |
 | The last messages, e.g. why it doesn't answer | `journalctl -u shopbot -n 30 --no-pager` |
 | Watch what it's doing (Ctrl+C to stop watching) | `journalctl -u shopbot -f` |
 | Restart / stop / start | `systemctl restart shopbot` (or `stop`, `start`) |
@@ -126,15 +127,20 @@ scp "root@YOUR_SERVER_IP:Telegram-Claude/data/backups/*.db" .
 It asks for the server password. The files arrive in the folder the window is in (on
 Windows usually `C:\Users\YOUR-NAME`). On a phone, use your SSH app's SFTP feature.
 
-**Restore a backup** (on the server, in the bot folder):
+**Restore a backup** (on the server):
 
 ```bash
-systemctl stop shopbot
-.venv/bin/python -m shopbot.backup --restore data/backups/shop-2026-11-19_03-17-02_123456.db
-systemctl start shopbot
+cd ~/Telegram-Claude && .venv/bin/python -m shopbot.backup --list
 ```
 
-Use the real file name from `--list`. The database you had before is kept as a backup too.
+Then, with one of the listed file names (tip: type `data/backups/shop-` and press Tab):
+
+```bash
+systemctl stop shopbot; .venv/bin/python -m shopbot.backup --restore data/backups/shop-2026-11-19_03-17-02_123456.db; systemctl start shopbot
+```
+
+The bot starts again even if the restore fails, and the database you had before is kept
+as a backup too.
 
 ### Moving an existing shop to the server
 
@@ -144,8 +150,8 @@ Do this right after step 4, if the bot already ran on your PC:
    `python -m shopbot.backup`. It prints the backup file's name.
 2. Copy that file to the server, from the PC (keep the `:` at the end):
    `scp data/backups/shop-....db root@YOUR_SERVER_IP:`
-3. On the server: `cd ~/Telegram-Claude && systemctl stop shopbot`, then
-   `.venv/bin/python -m shopbot.backup --restore ~/shop-....db`, then `systemctl start shopbot`.
+3. On the server, with the file's real name:
+   `cd ~/Telegram-Claude && systemctl stop shopbot; .venv/bin/python -m shopbot.backup --restore ~/shop-....db; systemctl start shopbot`
 
 ### Keep the server safe
 
@@ -166,6 +172,7 @@ Do this right after step 4, if the bot already ran on your PC:
 | `Another copy of the bot is already running` | You started `python bot.py` by hand while the service runs. Use `systemctl restart shopbot` instead. |
 | `Still trying to reach Telegram` / `Can't reach Telegram` | The server has no internet right now. The bot keeps trying by itself. |
 | `Could not get lock` | The server is installing its own updates. Wait 5 minutes, then run the command again. |
+| `destination path 'Telegram-Claude' already exists` | The bot is already downloaded: `cd ~/Telegram-Claude && git pull`, then go on with step 4. |
 | The bot doesn't answer | `journalctl -u shopbot -n 30 --no-pager` shows why. |
 
 ---

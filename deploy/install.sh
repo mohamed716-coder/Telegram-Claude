@@ -20,7 +20,7 @@ say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==> %s\033[0m\n' "$*" >&2; }
 die() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 VENV="$APP_DIR/.venv"
 ENV_FILE="$APP_DIR/.env"
 S=""  # "sudo " in the commands we print, for someone who used sudo
@@ -193,6 +193,16 @@ DATA_DIR="$(dirname "$DB_FILE")"
 case "$DATA_DIR" in
     *[!A-Za-z0-9._/-]*) die "DB_PATH must not contain spaces or special characters (now: $DB_FILE)." ;;
 esac
+case "$DATA_DIR" in
+    "$APP_DIR"/?*) ;;
+    *) die "Keep the database inside the bot folder (the default DB_PATH=data/shop.db). Now: $DB_FILE" ;;
+esac
+# Already installed from another copy of the code? Its data must not be left behind.
+old_dir="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/$SERVICE.service" 2>/dev/null || true)"
+if [ -n "$old_dir" ] && [ "$old_dir" != "$APP_DIR" ] && [ -d "$old_dir" ] \
+        && ls "$old_dir"/data/*.db >/dev/null 2>&1; then
+    die "The bot is already installed from $old_dir, with its data there. Update that copy instead (cd $old_dir && git pull && ${S}bash deploy/install.sh). To switch to this copy, first run '${S}bash deploy/install.sh --uninstall' in $old_dir, then bring the data over with a backup and --restore."
+fi
 if [ -d "$DATA_DIR" ]; then  # it gets chown'ed and made writable: it must be the bot's own
     for entry in "$DATA_DIR"/* "$DATA_DIR"/.[!.]*; do
         [ -e "$entry" ] || continue
@@ -223,7 +233,7 @@ PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=$DATA_DIR
-InaccessiblePaths=-/root/.ssh -/etc/shadow -/etc/gshadow
+InaccessiblePaths=-/root/.ssh -/etc/ssh -/etc/shadow -/etc/gshadow
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -322,7 +332,19 @@ help_text() {
 
 EOF
 }
-if [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service"; then
+conflict() {  # another copy elsewhere takes the messages (Telegram: Conflict)
+    for _ in $(seq 1 15); do  # Telegram reports it within one long-poll (~10 s)
+        sleep 1
+        journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null \
+            | grep -q "(Conflict)" && return 0
+    done
+    return 1
+}
+if [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service" && conflict; then
+    warn "The bot runs here, but another copy of it is running somewhere else (your PC, another"
+    warn "server, Docker...). Stop that copy, or customers' messages go to the wrong one."
+    help_text
+elif [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service"; then
     say "The bot ${bot_name:+$bot_name }is running. Open it in Telegram and send /start."
     help_text
 elif systemctl is-active --quiet "$SERVICE.service"; then
