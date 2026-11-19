@@ -80,6 +80,9 @@ async def render_labels(
     lines = [note, ""] if note else []
     lines.append("🏷 <b>Add Label</b>")
     lines.append(f"📂 {esc(db.path_text(label_id))}" if label else "📂 Top level (shown in 🛍 Shop)")
+    hidden = _visibility(db, label) if label is not None else ""
+    if hidden:
+        lines.append(hidden)
     if is_product:
         price = money(label["price"]) if label["price"] is not None else "⚠️ not set"
         lines.append(f"💵 Price: <b>{price}</b>")
@@ -105,26 +108,86 @@ async def render_labels(
     chunk = children[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
     categories, products = [], []
     for child in chunk:
+        off = "🚫 " if child["disabled"] else ""
         if db.has_children(child["id"]):
-            categories.append(btn(f"📂 {child['name']}", f"lb:{child['id']}:0"))
+            categories.append(btn(f"{off}📂 {child['name']}", f"lb:{child['id']}:0"))
         else:
             price = money(child["price"]) if child["price"] is not None else "no price"
-            products.append(btn(f"{child['name']} · {price}", f"lb:{child['id']}:0"))
+            products.append(btn(f"{off}{child['name']} · {price}", f"lb:{child['id']}:0"))
+    if any(child["disabled"] for child in children):
+        lines.append("🚫 = disabled: customers don't see it or anything inside it.")
     rows: list[list[Any]] = grid(categories, 2) + grid(products, 2)
     rows.append(pager(f"lb:{label_id}:", page, pages))
     if not (is_product and stock):
         where = f" inside {short(label['name'], 20)}" if label else ""
         rows.append([btn(f"➕ New label{where}", f"ln:{label_id}", GREEN)])
     if label is not None:
-        actions = []
+        edits = []
         if is_product:
-            actions.append(btn("💲 Set price", f"lp:{label_id}", BLUE))
-        actions.append(btn("✏️ Rename", f"lr:{label_id}", BLUE))
-        actions.append(btn("🗑 Delete", f"ld:{label_id}", RED))
-        rows.append(actions)
+            edits.append(btn("💲 Set price", f"lp:{label_id}", BLUE))
+        edits.append(btn("✏️ Rename", f"lr:{label_id}", BLUE))
+        rows.append(edits)
+        toggle = (btn("✅ Enable", f"lx:{label_id}:0", GREEN) if label["disabled"]
+                  else btn("🚫 Disable", f"lx:{label_id}:1", RED))
+        rows.append([toggle, btn("🗑 Delete", f"ld:{label_id}", RED)])
     back = f"lb:{label['parent_id'] or 0}:0" if label is not None else "menu"
     rows.append([btn("⬅️ Back", back), menu_btn()])
     await show(update, context, "\n".join(lines), markup(rows), new=new)
+
+
+def _visibility(db: Any, label: Any) -> str:
+    """Why customers don't see ``label`` because of a disabled label, or "" if that
+    isn't the case."""
+    off = db.disabled_on_path(label["id"])
+    if not off:
+        return ""
+    if label["disabled"]:
+        return "🚫 <b>Disabled</b>: customers don't see it or anything inside it."
+    names = " and ".join(f"“{esc(row['name'])}”" for row in off)
+    return f"🚫 Customers don't see it: {names} {'is' if len(off) == 1 else 'are'} disabled."
+
+
+# ------------------------------------------------------------- disable / enable
+async def cb_disable(update: Update, context: Ctx) -> None:
+    """lx:<label>:<1 = disable, 0 = enable>. The wanted state is in the button, so an
+    old button pressed again can't switch it back by mistake."""
+    query = update.callback_query
+    try:
+        label_id, flag = callback_ints(query.data, 2)
+    except ValueError:
+        await stale_button(update)
+        return
+    if flag not in (0, 1):
+        await stale_button(update)
+        return
+    if not await _owner_only(update, context):
+        return
+    db = db_of(context)
+    try:
+        label = db.set_label_disabled(label_id, bool(flag))
+    except ShopError as exc:
+        await answer(query, str(exc), show_alert=True)
+        return
+    inside = len(db.subtree_ids(label_id)) - 1
+    name = f"<b>{esc(label['name'])}</b>"
+    if flag:
+        await answer(query, "🚫 Disabled")
+        extra = f" and the {inside} label(s) inside it" if inside else ""
+        note = (f"🚫 Disabled {name}{extra}. Customers don't see {'them' if inside else 'it'} "
+                "now and can't buy anything there. Press ✅ Enable to show it again.")
+    else:
+        await answer(query, "✅ Enabled")
+        above = db.disabled_on_path(label_id)
+        if above:
+            names = " and ".join(f"“{esc(row['name'])}”" for row in above)
+            note = (f"✅ Enabled {name}, but customers still don't see it: {names} "
+                    f"{'is' if len(above) == 1 else 'are'} disabled.")
+        else:
+            note = f"✅ Enabled {name}: customers see it again."
+        still = db.count_disabled_inside(label_id)
+        if still:
+            note += f" {still} label(s) inside it stay disabled (marked 🚫)."
+    await render_labels(update, context, label_id, note=note)
 
 
 # ------------------------------------------------------------------- new label

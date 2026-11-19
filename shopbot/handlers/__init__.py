@@ -36,7 +36,7 @@ COMMANDS = [
 # (regex on callback_data, handler). Callback data formats:
 #   sh:<label>:<page>  shop       sb:<label>:<qty>  quantity      sq:<label>  other qty
 #   sc:<label>:<qty>:<nonce>  confirm purchase      mo:<page> / mov:<order>  my orders
-#   lb/ln/lp/lr/ld/ldy  labels    ap/apd/apc  add product
+#   lb/ln/lp/lr/ld/ldy/lx  labels (lx = disable/enable)   ap/apd/apc  add product
 #   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dno  deposits
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
 #   menu/cancel/noop  general
@@ -56,6 +56,7 @@ CALLBACKS = [
     (r"^lr:", labels.cb_rename),
     (r"^ld:", labels.cb_delete),
     (r"^ldy:", labels.cb_delete_yes),
+    (r"^lx:", labels.cb_disable),
     (r"^ap:", stock.cb_add_browse),
     (r"^apd$", stock.cb_add_done),
     (r"^apc$", stock.cb_add_cancel),

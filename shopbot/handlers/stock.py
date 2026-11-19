@@ -136,11 +136,12 @@ async def render_add(update: Update, context: Ctx, label_id: int, page: int = 0)
     page = min(page, pages - 1)
     categories, products = [], []
     for child in children[page * BROWSE_PAGE_SIZE : (page + 1) * BROWSE_PAGE_SIZE]:
+        off = "🚫 " if child["disabled"] else ""  # disabled: customers don't see it
         if db.has_children(child["id"]):
-            categories.append(btn(f"📂 {child['name']}", f"ap:{child['id']}:0"))
+            categories.append(btn(f"{off}📂 {child['name']}", f"ap:{child['id']}:0"))
         else:
             info = f"{db.count_items(child['id'])} in stock" if child["price"] is not None else "no price"
-            products.append([btn(f"🛒 {child['name']} · {info}", f"ap:{child['id']}:0")])
+            products.append([btn(f"{off}🛒 {child['name']} · {info}", f"ap:{child['id']}:0")])
     rows: list[list[Any]] = grid(categories, 2) + products
     rows.append(pager(f"ap:{label_id}:", page, pages))
     back = f"ap:{label['parent_id'] or 0}:0" if label is not None else "menu"
@@ -179,6 +180,11 @@ async def begin_add(
         status_msg_id=None,
     )
     text = ADD_PROMPT.format(path=esc(db.path_text(label["id"])), price=money(label["price"]))
+    if db.disabled_on_path(label["id"]):
+        text = (
+            "🚫 <i>This product is disabled, so customers don't see it. You can still add "
+            "stock: it goes on sale when the owner enables it again.</i>\n\n" + text
+        )
     if note:
         text = f"{note}\n\n{text}"
     await show(update, context, text, done_cancel_kb(), new=new)
@@ -441,10 +447,11 @@ async def render_mine(update: Update, context: Ctx, label_id: int, page: int = 0
     categories, products = [], []
     for child in children[page * BROWSE_PAGE_SIZE : (page + 1) * BROWSE_PAGE_SIZE]:
         count = db.count_subtree_items(child["id"], owner_filter)
+        off = "🚫 " if child["disabled"] else ""  # disabled: customers don't see it
         if db.has_children(child["id"]):
-            categories.append(btn(f"📂 {child['name']} · {count}", f"mp:{child['id']}:0"))
+            categories.append(btn(f"{off}📂 {child['name']} · {count}", f"mp:{child['id']}:0"))
         else:
-            products.append(btn(f"{child['name']} · {count}", f"mp:{child['id']}:0"))
+            products.append(btn(f"{off}{child['name']} · {count}", f"mp:{child['id']}:0"))
     rows: list[list[Any]] = grid(categories, 2) + grid(products, 2)
     rows.append(pager(f"mp:{label_id}:", page, pages))
     if label is None:

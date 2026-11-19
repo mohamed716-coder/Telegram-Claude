@@ -77,6 +77,10 @@ Esim
 - Open a label and press **➕ New label inside …**, then send the name. Send several names
   at once, one per line (e.g. `5GB` `10GB` `20GB` on separate lines).
 - Open a product label to **💲 Set price**, **✏️ Rename** or **🗑 Delete** it.
+- **🚫 Disable** a label to hide it, and every label and product inside it, from
+  customers (nothing is deleted; stock can still be added). **✅ Enable** shows it
+  again, except labels inside it that you disabled on their own. Disabled labels are
+  marked 🚫 for you.
 - Products without a price are hidden from customers.
 
 ### 2. Adding products (➕ Add Product)

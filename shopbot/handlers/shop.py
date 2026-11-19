@@ -54,6 +54,7 @@ QUICK_QUANTITIES = (1, 2, 3, 5, 10)
 MAX_QUANTITY = 200
 ORDERS_PAGE_SIZE = 8
 CLOSED_TEXT = "🔒 <b>The shop is closed right now.</b>\nPlease check back later."
+UNAVAILABLE_TEXT = "⚠️ This isn't available right now."
 
 # Telegram allows about one message per second in a chat, with short bursts. Products
 # are sent in the background: the first few at once, then one every DELIVERY_INTERVAL
@@ -81,14 +82,34 @@ def unit_price_for(context: Ctx, user_id: int, price: int) -> int:
     return price
 
 
+def hidden_for(context: Ctx, user_id: int, label_id: int) -> bool:
+    """True if this customer must not see the label: it, or a label above it, is
+    disabled. The owner sees everything (marked as disabled)."""
+    return not is_owner(context, user_id) and bool(db_of(context).disabled_on_path(label_id))
+
+
+def disabled_note(context: Ctx, label_id: int) -> str:
+    """For the owner: why customers don't see this, or "" if they do."""
+    off = db_of(context).disabled_on_path(label_id)
+    if not off:
+        return ""
+    if off[-1]["id"] == label_id:
+        return "🚫 <i>Disabled: customers don't see it (🏷 Add Label to enable it).</i>"
+    names = " and ".join(f"“{esc(row['name'])}”" for row in off)
+    return f"🚫 <i>Customers don't see it: {names} {'is' if len(off) == 1 else 'are'} disabled.</i>"
+
+
 def visible_children(context: Ctx, parent_id: Optional[int], user_id: int) -> list[Any]:
-    """Labels shown in the shop. Customers don't see products without a price."""
+    """Labels shown in the shop. Customers don't see disabled labels (nor anything
+    inside them), nor products without a price."""
     db = db_of(context)
     children = db.children(parent_id)
     if is_owner(context, user_id):
         return children
     visible = []
     for child in children:
+        if child["disabled"]:
+            continue
         if db.has_children(child["id"]):
             if db.has_priced_product(child["id"]):
                 visible.append(child)
@@ -129,6 +150,10 @@ async def render_shop(
                 new=new,
             )
             return
+        if hidden_for(context, user_id, label_id):
+            await show(update, context, UNAVAILABLE_TEXT,
+                       markup([[btn("🛍 Shop", "sh:0:0", GREEN), menu_btn()]]), new=new)
+            return
         if not db.has_children(label_id):
             await render_product(update, context, label_id, new=new, note=note)
             return
@@ -144,6 +169,8 @@ async def render_shop(
         lines.append(f"📂 {esc(db.path_text(label_id))}")
     if is_owner(context, user_id) and not db.shop_is_open():
         lines.append("🔒 <i>The shop is closed for customers (/open to open it).</i>")
+    if label is not None and is_owner(context, user_id) and (note_off := disabled_note(context, label_id)):
+        lines.append(note_off)
     lines.append("")
     if not children:
         lines.append("Nothing here yet." if label else "The shop is empty right now. Check back soon!")
@@ -152,15 +179,16 @@ async def render_shop(
 
     categories, products = [], []
     for child in chunk:
+        off = "🚫 " if child["disabled"] else ""  # only the owner sees disabled labels
         if db.has_children(child["id"]):
-            categories.append(btn(f"📂 {child['name']}", f"sh:{child['id']}:0"))
+            categories.append(btn(f"{off}📂 {child['name']}", f"sh:{child['id']}:0"))
         elif child["price"] is None:
-            products.append([btn(f"{child['name']} · ⚠️ no price", f"sh:{child['id']}:0")])
+            products.append([btn(f"{off}{child['name']} · ⚠️ no price", f"sh:{child['id']}:0")])
         else:
             unit = unit_price_for(context, user_id, child["price"])
             sold_out = "" if db.count_items(child["id"]) else " · sold out"
             products.append(
-                [btn(f"🛒 {child['name']} · {money(unit)}{sold_out}", f"sh:{child['id']}:0")]
+                [btn(f"{off}🛒 {child['name']} · {money(unit)}{sold_out}", f"sh:{child['id']}:0")]
             )
     rows = grid(categories, 2) + products
     rows.append(pager(f"sh:{label_id}:", page, pages))
@@ -179,10 +207,17 @@ async def render_product(
         await show(update, context, "⚠️ This product no longer exists.",
                    markup([[btn("🛍 Shop", "sh:0:0", GREEN), menu_btn()]]), new=new)
         return
+    if hidden_for(context, user_id, label_id):
+        await show(update, context, UNAVAILABLE_TEXT,
+                   markup([[btn("🛍 Shop", "sh:0:0", GREEN), menu_btn()]]), new=new)
+        return
     back = btn("⬅️ Back", f"sh:{label['parent_id'] or 0}:0")
     lines = [note, ""] if note else []
     lines += [f"🛒 <b>{esc(label['name'])}</b>", f"📂 {esc(db.path_text(label_id))}", ""]
     rows: list[list[Any]] = []
+    off = disabled_note(context, label_id)  # only the owner gets this far when disabled
+    if off:
+        lines += [off, ""]
     if label["price"] is None:
         lines.append("⚠️ This product has no price yet, so it can't be bought.")
     else:
@@ -198,7 +233,9 @@ async def render_product(
         balance = db.get_user(user_id)["balance"]  # type: ignore[index]
         lines.append(f"💰 Your balance: <b>{money(balance)}</b>")
         lines.append("")
-        if stock:
+        if off:
+            lines.append("It can't be bought until it is enabled again.")
+        elif stock:
             lines.append("How many do you want to buy?")
             quick = [
                 btn(str(n), f"sb:{label_id}:{n}", GREEN) for n in QUICK_QUANTITIES if n <= stock
@@ -240,7 +277,8 @@ async def cb_custom_quantity(update: Update, context: Ctx) -> None:
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]))
         return
     label = db.get_label(label_id)
-    if label is None or db.has_children(label_id) or label["price"] is None:
+    if (label is None or db.has_children(label_id) or label["price"] is None
+            or db.disabled_on_path(label_id)):
         await answer(query, "This product isn't available.", show_alert=True)
         return
     stock = db.count_items(label_id)
@@ -298,7 +336,8 @@ async def render_confirm(
         await show(update, context, CLOSED_TEXT, markup([[menu_btn()]]), new=new)
         return
     label = db.get_label(label_id)
-    if label is None or db.has_children(label_id) or label["price"] is None:
+    if (label is None or db.has_children(label_id) or label["price"] is None
+            or db.disabled_on_path(label_id)):
         await show(update, context, "⚠️ This product isn't available.",
                    markup([[btn("🛍 Shop", "sh:0:0", GREEN), menu_btn()]]), new=new)
         return

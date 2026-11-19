@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS labels (
     name        TEXT    NOT NULL,
     price       INTEGER,                          -- cents; used by the last label (the product)
     deleted     INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT    NOT NULL
+    created_at  TEXT    NOT NULL,
+    disabled    INTEGER NOT NULL DEFAULT 0        -- 1 = customers don't see it or anything inside
 );
 CREATE INDEX IF NOT EXISTS idx_labels_parent ON labels(parent_id, deleted);
 
@@ -132,6 +133,16 @@ WITH RECURSIVE sub(id) AS (
 )
 """
 
+# The same, but what customers can see: it stops at a disabled label.
+VISIBLE_SUBTREE_CTE = """
+WITH RECURSIVE sub(id) AS (
+    SELECT id FROM labels WHERE id = ? AND deleted = 0 AND disabled = 0
+    UNION ALL
+    SELECT l.id FROM labels l JOIN sub s ON l.parent_id = s.id
+    WHERE l.deleted = 0 AND l.disabled = 0
+)
+"""
+
 
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -206,7 +217,14 @@ class Database:
                 # reads the file at the same time (e.g. a DB browser) can make writes fail.
                 log.warning("SQLite WAL mode is not available here (journal mode: %s).", mode)
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.ensure_user(owner_id)
+
+    def _migrate(self) -> None:
+        """Add what newer versions need to a database made by an older version."""
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(labels)")}
+        if "disabled" not in columns:
+            self.conn.execute("ALTER TABLE labels ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         self.conn.close()
@@ -422,17 +440,45 @@ class Database:
         return [r[0] for r in self._all(SUBTREE_CTE + "SELECT id FROM sub", (label_id,))]
 
     def has_priced_product(self, label_id: int) -> bool:
-        """True if ``label_id`` or a label below it is a product with a price."""
+        """True if ``label_id`` or a label below it is a product with a price that
+        customers can see (not inside a disabled label)."""
         return bool(
             self._scalar(
-                SUBTREE_CTE
+                VISIBLE_SUBTREE_CTE
                 + """
                 SELECT 1 FROM labels x JOIN sub ON x.id = sub.id
-                WHERE x.deleted = 0 AND x.price IS NOT NULL
+                WHERE x.price IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM labels c WHERE c.parent_id = x.id AND c.deleted = 0)
                 LIMIT 1
                 """,
                 (label_id,),
+            )
+        )
+
+    def disabled_on_path(self, label_id: int) -> list[sqlite3.Row]:
+        """The disabled labels from the top level down to ``label_id`` (itself included).
+        Empty if customers can see it."""
+        return [row for row in self.label_path(label_id) if row["disabled"]]
+
+    def set_label_disabled(self, label_id: int, disabled: bool) -> sqlite3.Row:
+        """Disable a label (customers no longer see it or anything inside it) or
+        enable it again. Labels inside keep their own setting."""
+        with self.tx():
+            if self.get_label(label_id) is None:
+                raise ShopError("That label no longer exists.")
+            self.conn.execute(
+                "UPDATE labels SET disabled = ? WHERE id = ?", (1 if disabled else 0, label_id)
+            )
+        return self.get_label(label_id)  # type: ignore[return-value]
+
+    def count_disabled_inside(self, label_id: int) -> int:
+        """Labels below ``label_id`` (not itself) that are disabled on their own."""
+        return int(
+            self._scalar(
+                SUBTREE_CTE
+                + "SELECT COUNT(*) FROM labels WHERE id IN (SELECT id FROM sub)"
+                " AND id != ? AND disabled = 1",
+                (label_id, label_id),
             )
         )
 
@@ -648,6 +694,8 @@ class Database:
                 raise ShopError("This is a category, not a product.")
             if label["price"] is None:
                 raise ShopError("This product isn't for sale yet.")
+            if self.disabled_on_path(label_id):
+                raise ShopError("This product isn't available right now.")
             buyer = self.ensure_user(buyer_id)
             unit = label["price"]
             if buyer["is_seller"]:
