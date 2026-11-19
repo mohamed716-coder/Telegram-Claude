@@ -227,7 +227,7 @@ def test_shell_scripts_parse_and_use_unix_line_endings(script, shell):
 
 @pytest.mark.skipif(sys.platform == "win32" or os.geteuid() != 0, reason="needs root on Linux/macOS")
 def test_backups_and_restores_made_as_root_belong_to_the_bot_user(tmp_path):
-    """With sudo, files must still belong to the user the bot runs as, or the nightly
+    """With sudo, files must still belong to the user the bot runs as, or the automatic
     backup can't prune them and the bot can't write the restored database."""
     data = tmp_path / "data"
     data.mkdir()
@@ -595,3 +595,10 @@ def test_the_server_side_deploy_never_deletes_the_shops_data():
     assert not [line for line in code if "git clean" in line]  # -x would delete data/
     removals = [line for line in code if re.search(r"\brm\b", line)]
     assert removals and all("$here" in line for line in removals)  # only its own upload
+
+
+def test_backups_are_made_every_6_hours_and_a_week_of_them_is_kept():
+    text = (ROOT / "deploy" / "install.sh").read_text()
+    assert "OnCalendar=*-*-* 00/6:17:00" in text  # 00:17, 06:17, 12:17, 18:17
+    assert "Persistent=true" in text  # missed while the server was off: made at boot
+    assert backup.DEFAULT_KEEP == 28 == 7 * 24 // 6

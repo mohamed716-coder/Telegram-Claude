@@ -7,7 +7,7 @@
 #   bash deploy/install.sh --uninstall   remove the service (keeps your data)
 #
 # The bot then starts by itself when the server boots and restarts if it crashes.
-# A backup of the database is made every night (data/backups, the newest 14 are kept).
+# A backup of the database is made every 6 hours (data/backups; the newest 28, a week, are kept).
 # Running this again is safe: it never deletes data/shop.db.
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"  # started with "sh install.sh"
 set -euo pipefail
@@ -311,10 +311,10 @@ EOF
 
 cat >"$UNIT_DIR/$SERVICE-backup.timer" <<EOF
 [Unit]
-Description=Daily backup of the Telegram shop bot database
+Description=Back up the Telegram shop bot database every 6 hours
 
 [Timer]
-OnCalendar=*-*-* 03:17:00
+OnCalendar=*-*-* 00/6:17:00
 RandomizedDelaySec=15min
 Persistent=true
 
@@ -355,7 +355,7 @@ help_text() {
   See what it's doing:    ${S}journalctl -u $SERVICE -f        (Ctrl+C to stop watching)
   Stop / start / restart: ${S}systemctl stop|start|restart $SERVICE
   Update to new code:     git pull && ${S}bash deploy/install.sh
-  Backups:                $DATA_DIR/backups (made every night)
+  Backups:                $DATA_DIR/backups (made every 6 hours)
 
 EOF
 }

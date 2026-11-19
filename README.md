@@ -37,7 +37,7 @@ Written in Python with [python-telegram-bot](https://python-telegram-bot.org) 22
    Open your bot in Telegram and press **Start**. The bot answers only while this program
    runs. To run it 24/7 on a server, see **[DEPLOY.md](DEPLOY.md)**: GitHub can install
    it on your server for you (you add three secrets), or one command does it on the
-   server. Either way it runs as a service, with nightly backups.
+   server. Either way it runs as a service, with a backup every 6 hours.
 
 On first run the bot sets its own description ("Press /start to start the shop") and the
 command list shown by the **Menu** button. The owner and admins see their extra commands
@@ -175,7 +175,7 @@ message in ➕ Add Product before you press Done (see above).
 Back up regularly: `data/shop.db` holds all products, balances and orders. Use
 `python -m shopbot.backup` (safe while the bot runs; `--list` and `--restore FILE` too)
 rather than copying the file by hand. On a server set up with `deploy/install.sh` this
-happens every night.
+happens every 6 hours (the newest 28 are kept).
 
 ## Tests
 

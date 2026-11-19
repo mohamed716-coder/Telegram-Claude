@@ -1,6 +1,6 @@
 """Back up or restore the shop database.
 
-    python -m shopbot.backup                 make a backup now (keeps the newest 14)
+    python -m shopbot.backup                 make a backup now (keeps the newest 28)
     python -m shopbot.backup --list          show the backups
     python -m shopbot.backup --restore FILE  put a backup back (stop the bot first)
 
@@ -25,7 +25,7 @@ from typing import Optional
 from . import lock
 from .config import ConfigError, Settings
 
-DEFAULT_KEEP = 14
+DEFAULT_KEEP = 28  # a week of backups made every 6 hours (deploy/install.sh)
 PREFIX = "shop-"
 SIDECARS = ("-wal", "-shm")
 SPARE_SPACE = 10 * 1024 * 1024  # bytes to leave free besides the copy itself

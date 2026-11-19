@@ -87,8 +87,8 @@ say "On the server now:"
 printf '  %-16s %s\n' \
     "Code:" "$(git log -1 --format='%h %s')" \
     "Bot service:" "$(systemctl is-active shopbot.service), starts at boot: $(systemctl is-enabled shopbot.service)" \
-    "Nightly backup:" "$(systemctl is-active shopbot-backup.timer), next: $(systemctl show -P NextElapseUSecRealtime shopbot-backup.timer)" \
-    "Backups kept:" "$backups (in $app/data/backups)" \
+    "Backups:" "every 6 hours ($(systemctl is-active shopbot-backup.timer)), next: $(systemctl show -P NextElapseUSecRealtime shopbot-backup.timer)" \
+    "Backups kept:" "$backups of the last 28 (in $app/data/backups)" \
     "Free disk space:" "$(df -h --output=avail "$app" | tail -1 | tr -d ' ')" \
     "Updates:" "installed by GitHub when the bot's code changes (a backup is made first)"
 if [ -f /var/run/reboot-required ]; then

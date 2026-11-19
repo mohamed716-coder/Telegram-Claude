@@ -138,7 +138,7 @@ Logged in as a normal user instead of root? Use `sudo bash deploy/install.sh`.
 It installs what's needed, asks for the bot token (paste it, press Enter), checks it with
 Telegram, and starts the bot as a service: it keeps running when you log out, starts
 again when the server reboots, and restarts by itself if it ever crashes. It also makes a
-backup of the database every night. (As root it says the bot runs as root: that's expected.)
+backup of the database every 6 hours. (As root it says the bot runs as root: that's expected.)
 
 When it says **"The bot @yourbot is running"**, open the bot in Telegram and send `/start`.
 You can now close the window.
@@ -164,8 +164,10 @@ If the screen shows `(END)` or `lines 1-23`, press `q` to get back.
 
 ### Backups
 
-A backup is made every night between 03:17 and 03:32 **server time** (most servers use UTC:
-that's 06:17 in Istanbul, for example) in `data/backups/`; the newest 14 are kept. The
+A backup is made every 6 hours, at about 00:17, 06:17, 12:17 and 18:17 **server time** (most
+servers use UTC: in Istanbul that's 03:17, 09:17, 15:17 and 21:17), in `data/backups/`; the
+newest 28 (one week) are kept. If the server was off at that time, the backup is made as
+soon as it is on again. The
 installer also keeps a safety copy from before each run in `data/backups/before-update/`.
 Backups are on the same server, so now and then copy them to your own computer. On **your
 computer** (not the server), in PowerShell or Terminal:
@@ -267,11 +269,11 @@ The data is in the Docker volume `shopbot_shop-data`, so it survives restarts an
 | Backup now | `docker compose exec -u bot bot python -m shopbot.backup` |
 | Copy the backups out | `docker compose cp bot:/app/data/backups/. ./backups/` (then fetch `Telegram-Claude/backups/*.db` with `scp`, as in part A) |
 
-Docker makes **no automatic backups**. For one every night, run `crontab -e` and add this
+Docker makes **no automatic backups**. For one every 6 hours, run `crontab -e` and add this
 line (with your folder):
 
 ```
-17 3 * * * cd /root/Telegram-Claude && docker compose exec -T -u bot bot python -m shopbot.backup >/dev/null
+17 */6 * * * cd /root/Telegram-Claude && docker compose exec -T -u bot bot python -m shopbot.backup >/dev/null
 ```
 
 Restore: `docker compose stop`, then
