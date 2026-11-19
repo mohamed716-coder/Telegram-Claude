@@ -159,6 +159,20 @@ file_token="$(token_in_env_file || true)"
 token="${BOT_TOKEN:-$file_token}"
 where=""
 [ -n "${BOT_TOKEN:-}" ] || where=" in .env"
+# A deploy from GitHub (deploy/ci-deploy.sh) offers the token from its BOT_TOKEN secret: take
+# it if Telegram accepts it, but an outdated one (e.g. after /revoke) must never replace a
+# token in .env that still works.
+offered="${OFFERED_BOT_TOKEN:-}"
+if [ -z "${BOT_TOKEN:-}" ] && [ -n "$offered" ] && [ "$offered" != "$file_token" ]; then
+    rc=0
+    check_token "$offered" >/dev/null || rc=$?
+    if [ "$rc" -eq 0 ] || [ -z "$file_token" ]; then
+        token="$offered"
+        where=" (the BOT_TOKEN secret)"
+    elif [ "$rc" -eq 2 ]; then
+        warn "Telegram rejected the BOT_TOKEN secret, so the token already in .env stays. Put the current token in the secret."
+    fi  # 3 = Telegram can't be reached right now: keep the token in .env
+fi
 bot_name=""
 while :; do
     if ! [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then

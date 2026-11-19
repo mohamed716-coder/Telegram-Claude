@@ -35,8 +35,9 @@ Written in Python with [python-telegram-bot](https://python-telegram-bot.org) 22
    ```
 
    Open your bot in Telegram and press **Start**. The bot answers only while this program
-   runs. To run it 24/7 on a server, see **[DEPLOY.md](DEPLOY.md)**: one command
-   installs it as a service, with nightly backups.
+   runs. To run it 24/7 on a server, see **[DEPLOY.md](DEPLOY.md)**: GitHub can install
+   it on your server for you (you add three secrets), or one command does it on the
+   server. Either way it runs as a service, with nightly backups.
 
 On first run the bot sets its own description ("Press /start to start the shop") and the
 command list shown by the **Menu** button. The owner and admins see their extra commands

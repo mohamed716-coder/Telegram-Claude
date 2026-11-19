@@ -1,0 +1,66 @@
+# Installs the bot on your server (VPS) whenever the bot's code changes on its branch, and
+# when you start it again (open a run in the Actions tab -> "Re-run all jobs"). It needs the
+# repository secrets VPS_HOST, VPS_PASSWORD and BOT_TOKEN: see DEPLOY.md, "Let GitHub install it".
+# To stop it: Actions -> "Deploy to the server" -> "..." -> Disable workflow.
+name: Deploy to the server
+
+on:
+  push:
+    branches: [main, claude/telegram-bot-vphwhx]
+    paths:
+      - bot.py
+      - requirements.txt
+      - "shopbot/**"
+      - "deploy/**"
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:  # one deploy at a time, and never cut one off halfway
+  group: deploy-to-server
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Only the branch the server runs. To deploy another one (e.g. main after merging), set
+    # the repository variable DEPLOY_BRANCH (Settings -> Secrets and variables -> Variables).
+    if: github.ref_name == (vars.DEPLOY_BRANCH || 'claude/telegram-bot-vphwhx')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the server gets the history too, so "git log" works there
+          persist-credentials: false
+
+      - name: Name the memory of the server's identity
+        id: server
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: echo "key=server-ssh-key-$(printf '%s' "$VPS_HOST" | tr -d '[:space:]' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Recall the server's identity from the first deploy
+        id: known
+        uses: actions/cache/restore@v6
+        with:
+          path: .deploy-known-hosts
+          key: ${{ steps.server.outputs.key }}
+
+      - name: Install the bot on the server
+        id: deploy
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DEPLOY_BRANCH: ${{ github.ref_name }}
+        run: bash deploy/ci-deploy.sh
+
+      - name: Remember the server's identity for the next deploys
+        if: always() && steps.deploy.outputs.remember-server == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .deploy-known-hosts
+          key: ${{ steps.server.outputs.key }}

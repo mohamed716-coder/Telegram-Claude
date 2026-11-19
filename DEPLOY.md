@@ -34,6 +34,49 @@ and use your user name instead of `root` in `scp`.
 > step 4. Right after logging in (step 1), type `passwd` and set a new long password
 > (20+ random characters, kept in a password manager).
 
+### The easy way: GitHub installs it for you
+
+No typing on the server: GitHub's computers log in to it and install the bot, and later
+they install every change to the bot's code by themselves (with a backup first). You only
+add three secrets, once.
+
+1. Open <https://github.com/mohamed716-coder/Telegram-Claude/settings/secrets/actions/new>
+   (the repository's **Settings** → **Secrets and variables** → **Actions** → **New
+   repository secret**). Add these three, one at a time: type the **Name**, paste the value
+   under **Secret**, click **Add secret**.
+
+   | Name | Value |
+   |---|---|
+   | `VPS_HOST` | the server's IP address, e.g. `203.0.113.25` |
+   | `VPS_PASSWORD` | root's password |
+   | `BOT_TOKEN` | the bot token from @BotFather |
+
+   If the server's SSH port isn't 22, also add `VPS_PORT` with the port number.
+2. Open the repository's **Actions** tab → **Deploy to the server** → the newest run →
+   **Re-run all jobs**. (A run starts by itself when the code changes; the very first one
+   may have started before your secrets were there.)
+3. After about 3 minutes it shows a green check. Click the run → **deploy** → **Install the
+   bot on the server**: near the end it says *The bot @yourbot is running*. Open the bot in
+   Telegram and send `/start`.
+
+GitHub keeps the secrets encrypted and hides them in the logs. If something goes wrong:
+
+| You see | What to do |
+|---|---|
+| A red cross | The first red line says what's wrong (a missing secret, a wrong password...). Fix it, then **Re-run all jobs**. |
+| `The server refused the password` | Check `VPS_PASSWORD`. If it's right, the server doesn't let root log in with a password: set it up by hand instead (below). |
+| `Telegram rejected the BOT_TOKEN secret` (a yellow warning) | The bot still runs with the token it had. Put the current token in the `BOT_TOKEN` secret. |
+| `The server's SSH key is not the one seen at the first deploy` | Did you reinstall the server? Then delete the cache whose name starts with `server-ssh-key` (Actions tab → **Caches**, under *Management*) and re-run. If you didn't, stop: someone may be intercepting the connection. |
+
+- **Changed the root password or the bot token?** Update that secret too (the same
+  Secrets page → the pencil next to it).
+- **To stop the automatic updates:** Actions tab → **Deploy to the server** → **...** →
+  **Disable workflow**.
+- Everything further down (everyday commands, backups, restore) works the same once you log
+  in to the server: the bot is in `/root/Telegram-Claude`.
+
+**Or set it up by hand**, step by step:
+
 ### 1. Log in to the server
 
 - **Windows 10/11:** press the Windows key, type `PowerShell`, press Enter. Then type
@@ -110,7 +153,7 @@ Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`).
 | The last messages, e.g. why it doesn't answer | `journalctl -u shopbot -n 30 --no-pager` |
 | Watch what it's doing (Ctrl+C to stop watching) | `journalctl -u shopbot -f` |
 | Restart / stop / start | `systemctl restart shopbot` (or `stop`, `start`) |
-| Update to the newest code | `git pull && bash deploy/install.sh` |
+| Update to the newest code | `git pull && bash deploy/install.sh` (if GitHub installs it for you: automatic) |
 | Make a backup now | `systemctl start shopbot-backup` |
 | List the backups | `.venv/bin/python -m shopbot.backup --list` |
 | New token (after `/revoke` in @BotFather) | `bash deploy/install.sh`: it sees the old one is revoked and asks for the new one |
@@ -196,7 +239,7 @@ Do this right after step 4, if the bot already ran on your PC:
 | `destination path 'Telegram-Claude' already exists` | The bot is already downloaded: `cd ~/Telegram-Claude && git pull`, then go on with step 4. |
 | `Can't open the database` | The database file is damaged. Restore the newest backup (see *Restore a backup*). |
 | `Can't use the database` / `Can't use the data folder` | The disk may be full: `df -h /` shows it (delete files you don't need, or get a bigger disk). Or the files belong to another user: run `bash deploy/install.sh` again. |
-| `git pull`: `Permission denied (publickey)` | The server's key was removed on GitHub. Do step 2 again (it shows the same key), add it on GitHub, then `git pull`. |
+| `git pull`: `Permission denied (publickey)` | The server has no key for GitHub (never added, or removed). Do step 2 again (it shows the same key), add it on GitHub, then `git pull`. If GitHub installs the bot for you, you don't need `git pull` at all. |
 | `git pull`: `would be overwritten` | A code file was changed on the server. `git stash && git pull` puts that change aside. The shop itself (`data`, `.env`) is never touched by `git`. |
 | `git pull`: `no such ref was fetched` | The code moved to the `main` branch: `git checkout main && git pull`. |
 | The bot doesn't answer | `journalctl -u shopbot -n 30 --no-pager` shows why. |

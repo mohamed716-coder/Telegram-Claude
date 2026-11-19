@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -215,6 +216,8 @@ def test_a_second_copy_exits_with_75(clean_env, monkeypatch, caplog):
 
 # ============================================================== shell scripts
 @pytest.mark.parametrize("script, shell", [("deploy/install.sh", "bash"),
+                                           ("deploy/ci-deploy.sh", "bash"),
+                                           ("deploy/ci-remote.sh", "bash"),
                                            ("deploy/docker-entrypoint.sh", "sh")])
 def test_shell_scripts_parse_and_use_unix_line_endings(script, shell):
     path = ROOT / script
@@ -456,10 +459,11 @@ def test_a_data_folder_problem_at_start_exits_the_right_way(clean_env, monkeypat
     assert "Can't use the data folder" in caplog.text and expected in caplog.text
 
 
-def test_the_installer_never_stops_reading_a_pipe_early():
+@pytest.mark.parametrize("script", ["install.sh", "ci-deploy.sh", "ci-remote.sh"])
+def test_the_deploy_scripts_never_stop_reading_a_pipe_early(script):
     # Under "set -o pipefail", "producer | grep -q" fails when grep exits on the first
     # match and the producer gets SIGPIPE: the check then says "not found" by mistake.
-    text = (ROOT / "deploy" / "install.sh").read_text()
+    text = (ROOT / "deploy" / script).read_text()
     assert "pipefail" in text
     code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
     assert not [line for line in code if re.search(r"\|\s*grep\s+(-\w*q|--quiet)", line)]
@@ -469,3 +473,125 @@ def test_a_later_line_in_dotenv_wins_like_in_a_shell(clean_env, monkeypatch):
     (clean_env / ".env").write_text("BOT_TOKEN=x\nSUPPORT_CONTACT=\nSUPPORT_CONTACT=@my_support\n")
     monkeypatch.delenv("DB_PATH", raising=False)
     assert config.Settings.from_env().support_contact == "@my_support"
+
+
+# ================================================== deploying from GitHub Actions
+WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
+needs_ssh = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("ssh"),
+                               reason="needs bash and an ssh client")
+
+
+def run_ci_deploy(tmp_path, **env):
+    """deploy/ci-deploy.sh with only these settings (and not in GitHub's log format)."""
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("VPS_", "GITHUB_"))
+            and k not in ("BOT_TOKEN", "DEPLOY_BRANCH", "KNOWN_HOSTS")}
+    base.update(KNOWN_HOSTS=str(tmp_path / "known_hosts"), DEPLOY_BRANCH="test-branch")
+    base.update(env)
+    return subprocess.run(["bash", str(ROOT / "deploy" / "ci-deploy.sh")], env=base,
+                          capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
+def test_the_deploy_job_says_which_secrets_are_missing(tmp_path):
+    done = run_ci_deploy(tmp_path)
+    assert done.returncode == 1
+    assert "Add the secret(s) VPS_HOST VPS_PASSWORD" in done.stderr
+    done = run_ci_deploy(tmp_path, VPS_HOST="203.0.113.25")
+    assert "Add the secret(s) VPS_PASSWORD:" in done.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
+def test_the_deploy_job_wants_just_an_address(tmp_path):
+    done = run_ci_deploy(tmp_path, VPS_HOST="http://my server", VPS_PASSWORD="pw")
+    assert done.returncode == 1
+    assert "VPS_HOST must be just the server's IP address" in done.stderr
+
+
+@needs_ssh
+def test_the_deploy_job_understands_root_at_address_colon_port(tmp_path):
+    # Port 1 refuses at once: the job must have read the port out of VPS_HOST.
+    done = run_ci_deploy(tmp_path, VPS_HOST=" root@127.0.0.1:1 ", VPS_PASSWORD="pw")
+    assert done.returncode == 1
+    assert "Can't reach the server at VPS_HOST on port 1." in done.stderr
+    assert not (tmp_path / "known_hosts").exists()
+
+
+@needs_ssh
+def test_a_malformed_token_secret_is_not_used_but_does_not_stop_the_deploy(tmp_path):
+    done = run_ci_deploy(tmp_path, VPS_HOST="127.0.0.1", VPS_PORT="1", VPS_PASSWORD="pw",
+                         BOT_TOKEN="hello")
+    assert "doesn't look like a bot token" in done.stderr and "so it is not used" in done.stderr
+    assert "Can't reach the server" in done.stderr  # it went on to log in
+
+
+@needs_ssh
+def test_on_github_errors_are_annotations_and_edited_secrets_stay_hidden(tmp_path):
+    done = run_ci_deploy(tmp_path, GITHUB_ACTIONS="true", VPS_HOST=" 127.0.0.1 ",
+                         VPS_PORT="1", VPS_PASSWORD="pw-with-newline\n", BOT_TOKEN=f" {GOOD_TOKEN}\n")
+    masks = {line.split("::", 2)[2] for line in done.stdout.splitlines()
+             if line.startswith("::add-mask::")}
+    assert {"127.0.0.1", "pw-with-newline", GOOD_TOKEN} <= masks  # trimmed copies too
+    assert done.stderr.splitlines()[-1].startswith("::error::Can't reach the server")
+
+
+def test_install_sh_takes_an_offered_token_only_when_telegram_accepts_it():
+    # The block in install.sh that decides, run with a stand-in for Telegram:
+    # tokens starting with "good" work, "down" means Telegram can't be reached.
+    text = (ROOT / "deploy" / "install.sh").read_text()
+    block = text[text.index('offered="${OFFERED_BOT_TOKEN:-}"'):text.index('bot_name=""')]
+
+    def decide(file_token, offered, env_token=""):
+        script = (
+            'warn() { echo "WARN: $*"; }\n'
+            'check_token() { case "$1" in good*) return 0 ;; down*) return 3 ;; *) return 2 ;; esac; }\n'
+            'file_token="$FILE_TOKEN"; token="${BOT_TOKEN:-$file_token}"; where=""\n'
+            + block + 'echo "USE=$token"\n'
+        )
+        env = {"PATH": os.environ["PATH"], "FILE_TOKEN": file_token, "OFFERED_BOT_TOKEN": offered}
+        if env_token:
+            env["BOT_TOKEN"] = env_token
+        out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True).stdout
+        return out.splitlines()[-1].removeprefix("USE="), "WARN" in out
+
+    assert decide("", "good-new") == ("good-new", False)  # first install
+    assert decide("good-old", "good-new") == ("good-new", False)  # updated secret wins
+    assert decide("good-old", "revoked") == ("good-old", True)  # outdated secret: keep, warn
+    assert decide("good-old", "down-new") == ("good-old", False)  # can't tell: keep
+    assert decide("", "revoked") == ("revoked", False)  # nothing else: the check rejects it
+    assert decide("good-old", "good-old") == ("good-old", False)  # same: nothing to do
+    assert decide("good-old", "good-new", env_token="good-typed") == ("good-typed", False)
+
+
+def test_the_workflow_deploys_only_the_servers_branch_one_at_a_time():
+    yaml = pytest.importorskip("yaml")
+    flow = yaml.safe_load(WORKFLOW.read_text())
+    triggers = flow.get("on", flow.get(True))  # YAML 1.1 reads a bare "on" as true
+    assert "claude/telegram-bot-vphwhx" in triggers["push"]["branches"]
+    assert {"shopbot/**", "deploy/**", "bot.py", "requirements.txt"} <= set(triggers["push"]["paths"])
+    assert flow["permissions"] == {"contents": "read"}
+    assert flow["concurrency"]["cancel-in-progress"] is False
+    job = flow["jobs"]["deploy"]
+    assert "vars.DEPLOY_BRANCH" in job["if"] and "claude/telegram-bot-vphwhx" in job["if"]
+    steps = {step.get("id"): step for step in job["steps"]}
+    checkout = job["steps"][0]
+    assert checkout["uses"].startswith("actions/checkout@") and checkout["with"]["fetch-depth"] == 0
+    deploy = steps["deploy"]
+    assert deploy["run"] == "bash deploy/ci-deploy.sh"
+    for name in ("VPS_HOST", "VPS_PASSWORD", "BOT_TOKEN"):
+        assert deploy["env"][name] == "${{ secrets.%s }}" % name
+    remember = job["steps"][-1]
+    assert remember["uses"].startswith("actions/cache/save@")
+    assert "steps.deploy.outputs.remember-server == 'true'" in remember["if"]
+    # The remembered server key is a file the deploy script uses and git never commits.
+    path = remember["with"]["path"]
+    assert path == steps["known"]["with"]["path"]
+    assert f'KNOWN_HOSTS:-{path}' in (ROOT / "deploy" / "ci-deploy.sh").read_text()
+    assert path in (ROOT / ".gitignore").read_text().splitlines()
+
+
+def test_the_server_side_deploy_never_deletes_the_shops_data():
+    text = (ROOT / "deploy" / "ci-remote.sh").read_text()
+    code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert not [line for line in code if "git clean" in line]  # -x would delete data/
+    removals = [line for line in code if re.search(r"\brm\b", line)]
+    assert removals and all("$here" in line for line in removals)  # only its own upload
