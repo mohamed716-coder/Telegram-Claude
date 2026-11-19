@@ -33,6 +33,7 @@ from .common import (
     esc,
     get_state,
     grid,
+    hidden_note,
     is_owner,
     is_staff,
     markup,
@@ -180,11 +181,10 @@ async def begin_add(
         status_msg_id=None,
     )
     text = ADD_PROMPT.format(path=esc(db.path_text(label["id"])), price=money(label["price"]))
-    if db.disabled_on_path(label["id"]):
-        text = (
-            "🚫 <i>This product is disabled, so customers don't see it. You can still add "
-            "stock: it goes on sale when the owner enables it again.</i>\n\n" + text
-        )
+    hidden = hidden_note(db, label["id"])
+    if hidden:
+        text = (f"{hidden}\n<i>You can still add stock: it goes on sale once that is "
+                "enabled again.</i>\n\n" + text)
     if note:
         text = f"{note}\n\n{text}"
     await show(update, context, text, done_cancel_kb(), new=new)
@@ -438,6 +438,8 @@ async def render_mine(update: Update, context: Ctx, label_id: int, page: int = 0
     lines = ["📦 <b>My Products</b>"]
     if label is not None:
         lines.append(f"📂 {esc(db.path_text(label_id))}")
+        if hidden := hidden_note(db, label_id):
+            lines.append(hidden)
         lines.append(f"In stock here: <b>{db.count_subtree_items(label_id, owner_filter)}</b>")
     elif owner_filter is None:
         total = db.count_all_items()
@@ -507,6 +509,8 @@ async def render_items(
         f"📂 {esc(db.path_text(label_id))}",
         f"💵 Price: <b>{price}</b>",
     ]
+    if hidden := hidden_note(db, label_id):
+        lines.append(hidden)
     if owner_filter is None:
         mine = db.count_items(label_id, user_id)
         lines.append(f"📦 In stock: <b>{total}</b> (yours: {mine}, admins: {total - mine})")

@@ -181,6 +181,26 @@ def user_html(row: Any) -> str:
     return " · ".join(parts)
 
 
+def off_names(rows: list[Any]) -> str:
+    """'“A” is' or '“A” and “B” are': for messages about disabled labels."""
+    names = " and ".join(f"“{esc(row['name'])}”" for row in rows)
+    return f"{names} {'is' if len(rows) == 1 else 'are'}"
+
+
+def hidden_note(db: Database, label_id: int) -> str:
+    """For the owner and admins: why customers don't see this label because of a
+    disabled label (itself, or one above it), or "" if that isn't the case."""
+    off = db.disabled_on_path(label_id)
+    if not off:
+        return ""
+    above = [row for row in off if row["id"] != label_id]
+    if len(above) == len(off):
+        return f"🚫 <i>Customers don't see it: {off_names(above)} disabled.</i>"
+    if above:
+        return f"🚫 <i>Disabled, and {off_names(above)} disabled too: customers don't see it.</i>"
+    return "🚫 <i>Disabled: customers don't see it.</i>"
+
+
 def short(text: str, limit: int = 28) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 

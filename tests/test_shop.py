@@ -1016,7 +1016,7 @@ def test_label_deleted_between_confirmation_and_confirm_is_not_charged(tmp_path)
 
         calls = await t.press(ALICE, confirm)
         assert "no longer exists" in t.alert(calls)
-        assert "no longer exists" in t.last_text(calls, ALICE["id"])
+        assert "isn't available right now" in t.last_text(calls, ALICE["id"])  # same as for a disabled one
         assert orders_of(t, ALICE) == [] and balance(t, ALICE) == 5000
         assert not [x for x in t.texts(calls, ALICE["id"]) if x == "ONLY"]
         # Old buttons pointing at the deleted product don't break anything.

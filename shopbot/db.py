@@ -473,15 +473,13 @@ class Database:
             )
         return self.get_label(label_id)  # type: ignore[return-value]
 
-    def count_disabled_inside(self, label_id: int) -> int:
+    def disabled_inside(self, label_id: int) -> list[sqlite3.Row]:
         """Labels below ``label_id`` (not itself) that are disabled on their own."""
-        return int(
-            self._scalar(
-                SUBTREE_CTE
-                + "SELECT COUNT(*) FROM labels WHERE id IN (SELECT id FROM sub)"
-                " AND id != ? AND disabled = 1",
-                (label_id, label_id),
-            )
+        return self._all(
+            SUBTREE_CTE
+            + "SELECT * FROM labels WHERE id IN (SELECT id FROM sub)"
+            " AND id != ? AND disabled = 1 ORDER BY id",
+            (label_id, label_id),
         )
 
     def add_labels(
@@ -1056,6 +1054,8 @@ class Database:
             path = self.path_text(r["label_id"], sep=" > ")
             if label is not None and label["deleted"]:
                 path += " (deleted)"
+            elif label is not None and self.disabled_on_path(label["id"]):
+                path += " (disabled)"
             rows.append(
                 {
                     "label_id": r["label_id"],

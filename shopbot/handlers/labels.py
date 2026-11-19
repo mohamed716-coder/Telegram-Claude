@@ -28,6 +28,7 @@ from .common import (
     menu_btn,
     money,
     need_text,
+    off_names,
     page_count,
     pager,
     parse_amount,
@@ -114,7 +115,7 @@ async def render_labels(
         else:
             price = money(child["price"]) if child["price"] is not None else "no price"
             products.append(btn(f"{off}{child['name']} · {price}", f"lb:{child['id']}:0"))
-    if any(child["disabled"] for child in children):
+    if any(child["disabled"] for child in chunk):  # only when a button here is marked
         lines.append("🚫 = disabled: customers don't see it or anything inside it.")
     rows: list[list[Any]] = grid(categories, 2) + grid(products, 2)
     rows.append(pager(f"lb:{label_id}:", page, pages))
@@ -141,10 +142,23 @@ def _visibility(db: Any, label: Any) -> str:
     off = db.disabled_on_path(label["id"])
     if not off:
         return ""
+    above = [row for row in off if row["id"] != label["id"]]
     if label["disabled"]:
-        return "🚫 <b>Disabled</b>: customers don't see it or anything inside it."
-    names = " and ".join(f"“{esc(row['name'])}”" for row in off)
-    return f"🚫 Customers don't see it: {names} {'is' if len(off) == 1 else 'are'} disabled."
+        text = "🚫 <b>Disabled</b>: customers don't see it or anything inside it."
+        return text + (f" ({off_names(above)} disabled too.)" if above else "")
+    return f"🚫 Customers don't see it: {off_names(above)} disabled."
+
+
+def _inside_paths(db: Any, label_id: int, rows: list[Any], limit: int = 5) -> str:
+    """'Oman › 5GB, UAE': where these labels are, seen from ``label_id``."""
+    paths = []
+    for row in rows[:limit]:
+        path = db.label_path(row["id"])
+        ids = [r["id"] for r in path]
+        start = ids.index(label_id) + 1 if label_id in ids else 0
+        paths.append(esc(" › ".join(r["name"] for r in path[start:])))
+    more = f" and {len(rows) - limit} more" if len(rows) > limit else ""
+    return ", ".join(paths) + more
 
 
 # ------------------------------------------------------------- disable / enable
@@ -170,23 +184,32 @@ async def cb_disable(update: Update, context: Ctx) -> None:
         return
     inside = len(db.subtree_ids(label_id)) - 1
     name = f"<b>{esc(label['name'])}</b>"
+    above = [row for row in db.disabled_on_path(label_id) if row["id"] != label_id]
     if flag:
         await answer(query, "🚫 Disabled")
-        extra = f" and the {inside} label(s) inside it" if inside else ""
-        note = (f"🚫 Disabled {name}{extra}. Customers don't see {'them' if inside else 'it'} "
-                "now and can't buy anything there. Press ✅ Enable to show it again.")
+        if above:
+            note = (f"🚫 Disabled {name}. Customers already didn't see it, because "
+                    f"{off_names(above)} disabled; now it also stays hidden when "
+                    f"{'that is' if len(above) == 1 else 'those are'} enabled, until you press "
+                    "✅ Enable here.")
+        else:
+            extra = f" and the {inside} label(s) inside it" if inside else ""
+            note = (f"🚫 Disabled {name}{extra}. Customers don't see {'them' if inside else 'it'} "
+                    "now and can't buy anything there. Press ✅ Enable to show it again.")
     else:
         await answer(query, "✅ Enabled")
-        above = db.disabled_on_path(label_id)
         if above:
-            names = " and ".join(f"“{esc(row['name'])}”" for row in above)
-            note = (f"✅ Enabled {name}, but customers still don't see it: {names} "
-                    f"{'is' if len(above) == 1 else 'are'} disabled.")
-        else:
+            note = f"✅ Enabled {name}, but customers still don't see it: {off_names(above)} disabled."
+        elif db.has_priced_product(label_id):
             note = f"✅ Enabled {name}: customers see it again."
-        still = db.count_disabled_inside(label_id)
+        elif not db.has_children(label_id):
+            note = f"✅ Enabled {name}, but customers still don't see it: it has no price yet (💲 Set price)."
+        else:
+            note = (f"✅ Enabled {name}, but customers still don't see it: nothing inside it "
+                    "can be bought (every product in it is disabled or has no price).")
+        still = db.disabled_inside(label_id)
         if still:
-            note += f" {still} label(s) inside it stay disabled (marked 🚫)."
+            note += f" Still disabled inside it: {_inside_paths(db, label_id, still)}."
     await render_labels(update, context, label_id, note=note)
 
 

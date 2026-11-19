@@ -73,7 +73,7 @@ def test_owner_disables_a_category_and_customers_see_nothing_inside_it(tmp_path)
         assert "“Esim” is disabled" in t.last_text(calls)
         calls = await t.press(OWNER, f"sh:{five}:0")
         assert "Price: <b>9.50$</b>" in t.last_text(calls)
-        assert "can't be bought until it is enabled again" in t.last_text(calls)
+        assert "can't be bought until “Esim” is enabled again" in t.last_text(calls)
         assert buy_buttons(calls) == []
 
     run(tmp_path, scenario)
@@ -134,7 +134,7 @@ def test_enable_shows_everything_again_except_labels_disabled_on_their_own(tmp_p
         calls = await enable(t, esim)
         text = t.last_text(calls)
         assert "Enabled <b>Esim</b>: customers see it again" in text, text
-        assert "1 label(s) inside it stay disabled" in text
+        assert "Still disabled inside it: UAE." in text
         calls = await t.press(ALICE, f"sh:{esim}:0")
         assert "📂 Oman" in names(calls)
         assert not any("UAE" in n for n in names(calls)), names(calls)
@@ -215,7 +215,8 @@ def test_admins_can_still_stock_a_disabled_product_and_see_it_marked(tmp_path):
         assert "🚫 📂 Oman" in names(calls)
         calls = await t.press(ADMIN, t.button(calls, "Oman"))
         calls = await t.press(ADMIN, t.button(calls, "5GB"))
-        assert "This product is disabled, so customers don't see it" in t.last_text(calls)
+        assert "Customers don't see it: “Oman” is disabled" in t.last_text(calls)
+        assert "You can still add stock" in t.last_text(calls)
         await t.send(ADMIN, "code-123")
         calls = await t.press(ADMIN, t.button(calls, "Done"))
         assert "Saved 1 product(s)" in t.last_text(calls, ADMIN["id"])
@@ -272,5 +273,90 @@ def test_a_database_from_the_previous_version_gets_the_new_setting(tmp_path):
         await disable(t, netflix)
         calls = await t.press(ALICE, "sh:0:0")
         assert "The shop is empty right now" in t.last_text(calls)
+
+    run(tmp_path, scenario)
+
+
+def test_a_typed_quantity_never_reveals_the_stock_of_a_disabled_product(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/Oman/5GB", 950)
+        add_stock(t, five, *[f"c{i}" for i in range(7)])
+        set_balance(t, ALICE, 100_000)
+        await t.press(ALICE, f"sq:{five}")
+        t.db.set_label_disabled(make_label(t, "Esim"), True)
+        calls = await t.send(ALICE, "999")
+        assert UNAVAILABLE in t.last_text(calls) and "at most" not in t.last_text(calls)
+        calls = await t.send(ALICE, "999")  # the question ended
+        assert "Send /start" in t.last_text(calls)
+
+    run(tmp_path, scenario)
+
+
+def test_enable_notes_say_when_customers_still_see_nothing(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        one = make_label(t, "Netflix/1 Month", 1200)
+        add_stock(t, one, "n")
+        netflix = make_label(t, "Netflix")
+        await disable(t, one)
+        await disable(t, netflix)
+        text = t.last_text(await enable(t, netflix))
+        assert "customers still don't see it: nothing inside it can be bought" in text, text
+        assert "Still disabled inside it: 1 Month." in text
+
+        soon = make_label(t, "Soon")  # a product without a price
+        await disable(t, soon)
+        text = t.last_text(await enable(t, soon))
+        assert "customers still don't see it: it has no price yet" in text, text
+
+    run(tmp_path, scenario)
+
+
+def test_disabling_inside_a_disabled_label_says_it_was_already_hidden(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        esim, uae = make_label(t, "Esim"), make_label(t, "Esim/UAE/1GB", 300) and make_label(t, "Esim/UAE")
+        await disable(t, esim)
+        text = t.last_text(await disable(t, uae))
+        assert "Customers already didn't see it, because “Esim” is disabled" in text, text
+        calls = await t.press(OWNER, f"lb:{uae}:0")
+        assert "(“Esim” is disabled too.)" in t.last_text(calls)
+
+    run(tmp_path, scenario)
+
+
+def test_the_legend_shows_only_on_pages_with_a_disabled_button(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        cat = make_label(t, "Cat")
+        ids = [make_label(t, f"Cat/P{i:02d}", 100) for i in range(32)]
+        t.db.set_label_disabled(ids[0], True)
+        assert "🚫 = disabled" in t.last_text(await t.press(OWNER, f"lb:{cat}:0"))
+        assert "🚫 = disabled" not in t.last_text(await t.press(OWNER, f"lb:{cat}:1"))
+
+    run(tmp_path, scenario)
+
+
+def test_my_products_and_the_sales_file_show_what_is_disabled(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/Oman/5GB", 950)
+        add_stock(t, five, "a")
+        t.db.set_label_disabled(make_label(t, "Esim"), True)
+        calls = await t.press(OWNER, f"mi:{five}:0")
+        assert "Customers don't see it: “Esim” is disabled" in t.last_text(calls)
+        calls = await t.press(OWNER, f"mp:{make_label(t, 'Esim/Oman')}:0")
+        assert "“Esim” is disabled" in t.last_text(calls)
+        rows = t.db.sales_analysis()
+        assert rows[0]["product"] == "Esim > Oman > 5GB (disabled)"
+
+    run(tmp_path, scenario)
+
+
+def test_customers_get_the_same_answer_for_disabled_and_deleted_labels(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        hidden = make_label(t, "Hidden/Item", 100) and make_label(t, "Hidden")
+        gone = make_label(t, "Gone/Item", 100) and make_label(t, "Gone")
+        t.db.set_label_disabled(hidden, True)
+        t.db.delete_label(gone)
+        a = t.last_text(await t.press(ALICE, f"sh:{hidden}:0"))
+        b = t.last_text(await t.press(ALICE, f"sh:{gone}:0"))
+        assert a == b and UNAVAILABLE in a
 
     run(tmp_path, scenario)

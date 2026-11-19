@@ -693,7 +693,9 @@ def test_deleted_label_hidden_from_shop_tree_and_stock_screens(tmp_path):
             calls = await t.press(user, f"sh:{ids['oman']}:0")
             assert t.has_button(calls, "Vodafone") and not t.has_button(calls, "Omantel")
             calls = await t.press(user, f"sh:{ids['five']}:0")
-            assert "no longer exists" in t.last_text(calls)
+            # The owner is told it's gone; customers get the same answer as for a disabled one.
+            expected = "no longer exists" if user is OWNER else "isn't available right now"
+            assert expected in t.last_text(calls)
             assert not any(d.startswith("sb:") for d in datas(calls))
         # Add Product and My Products.
         calls = await t.press(OWNER, f"ap:{ids['oman']}:0")
