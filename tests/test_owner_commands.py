@@ -671,8 +671,7 @@ def test_addadmin_gives_the_admin_panel_and_command_menu(tmp_path):
         assert "Balance: <b>0.00$</b>" in panel.text and "Earnings: <b>0.00$</b>" in panel.text
         assert_panel_buttons(panel, {
             "Shop": "success", "My Products": "primary", "Add Product": "success",
-            "Earnings": "primary", "Add Balance": "success",
-        })
+            "Earnings": "primary", "Add Balance": "success", "My ID": None})
         assert not t.has_button(calls, "Add Label") and not t.has_button(calls, "My Orders")
 
         # the admin sections open; label management stays owner-only
@@ -745,7 +744,7 @@ def test_removeadmin_turns_the_admin_back_into_a_user(tmp_path):
         assert "Welcome Bob" in panel.text and "Welcome Admin" not in panel.text
         assert "Earnings" not in panel.text
         assert_panel_buttons(panel, {"Shop": "success", "Add Balance": "success",
-                                     "My Orders": "primary"})
+                                     "My Orders": "primary", "My ID": None})
         for data in ("mp:0:0", "ap:0:0"):
             calls = await t.press(BOB, data)
             assert "for the owner and admins" in t.alert(calls), data
@@ -1282,7 +1281,7 @@ def test_help_owner_sees_every_section(tmp_path):
         calls = await t.send(OWNER, "/help")
         text = t.last_text(calls)
         assert "Owner panel" in text and "Admin panel" in text and "Everyone" in text
-        assert help_commands(text) == OWNER_COMMAND_NAMES | {"withdraw", "start", "help", "cancel"}
+        assert help_commands(text) == OWNER_COMMAND_NAMES | {"withdraw", "start", "help", "cancel", "id"}
         assert "Add Label" in text
         assert utf16_len(text) <= 4096
 
@@ -1296,7 +1295,7 @@ def test_help_admin_sees_admin_and_everyone_sections(tmp_path):
         text = t.last_text(calls)
         assert "Admin panel" in text and "Everyone" in text
         assert "Owner panel" not in text and "Add Label" not in text
-        assert help_commands(text) == {"withdraw", "start", "help", "cancel"}
+        assert help_commands(text) == {"withdraw", "start", "help", "cancel", "id"}
 
     run(tmp_path, scenario)
 
@@ -1307,7 +1306,7 @@ def test_help_user_sees_only_the_everyone_section(tmp_path):
         text = t.last_text(calls)
         assert "Everyone" in text
         assert "Owner panel" not in text and "Admin panel" not in text
-        assert help_commands(text) == {"start", "help", "cancel"}
+        assert help_commands(text) == {"start", "help", "cancel", "id"}
         assert "withdraw" not in text.lower()
 
     run(tmp_path, scenario)
@@ -1317,13 +1316,13 @@ def test_help_follows_role_changes(tmp_path):
     async def scenario(t: ShopTest) -> None:
         register(t, BOB)
         calls = await t.send(BOB, "/help")
-        assert help_commands(t.last_text(calls)) == {"start", "help", "cancel"}
+        assert help_commands(t.last_text(calls)) == {"start", "help", "cancel", "id"}
         await t.send(OWNER, "/addadmin 1002")
         calls = await t.send(BOB, "/help")
         assert "withdraw" in help_commands(t.last_text(calls))
         await t.send(OWNER, "/removeadmin 1002")
         calls = await t.send(BOB, "/help")
-        assert help_commands(t.last_text(calls)) == {"start", "help", "cancel"}
+        assert help_commands(t.last_text(calls)) == {"start", "help", "cancel", "id"}
 
     run(tmp_path, scenario)
 
@@ -1338,11 +1337,10 @@ def test_start_owner_panel(tmp_path):
         assert "Shop: 🟢 Open" in panel.text
         assert_panel_buttons(panel, {
             "Shop": "success", "My Products": "primary", "Add Product": "success",
-            "Add Label": "success", "Earnings": "primary", "Add Balance": "success",
-        })
+            "Add Label": "success", "Earnings": "primary", "Add Balance": "success", "My ID": None})
         menu = scoped_commands(calls, OWNER_ID)
         assert menu is not None and set(menu) == OWNER_COMMAND_NAMES | {
-            "start", "help", "withdraw", "cancel"}
+            "start", "help", "withdraw", "cancel", "id"}
 
     run(tmp_path, scenario)
 
@@ -1356,9 +1354,8 @@ def test_start_admin_panel(tmp_path):
         assert "Balance: <b>0.00$</b>" in panel.text
         assert_panel_buttons(panel, {
             "Shop": "success", "My Products": "primary", "Add Product": "success",
-            "Earnings": "primary", "Add Balance": "success",
-        })
-        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "help", "cancel"]
+            "Earnings": "primary", "Add Balance": "success", "My ID": None})
+        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "id", "help", "cancel"]
 
     run(tmp_path, scenario)
 
@@ -1371,7 +1368,7 @@ def test_start_user_panel(tmp_path):
         assert "Welcome Alice" in panel.text and "Balance: <b>0.00$</b>" in panel.text
         assert "Earnings" not in panel.text and "Shop: " not in panel.text
         assert_panel_buttons(panel, {"Shop": "success", "Add Balance": "success",
-                                     "My Orders": "primary"})
+                                     "My Orders": "primary", "My ID": None})
         assert not [c for c in calls if c.method in ("setMyCommands", "deleteMyCommands")]
 
     run(tmp_path, scenario)
@@ -1455,7 +1452,7 @@ def test_bot_profile_description_and_command_menus(tmp_path):
         owner_menu = scoped_commands(calls, OWNER_ID)
         assert owner_menu is not None and OWNER_COMMAND_NAMES <= set(owner_menu)
         assert "start" in owner_menu
-        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "help", "cancel"]
+        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "id", "help", "cancel"]
         for c in calls:
             if c.method == "setMyCommands":
                 for cmd in c.params["commands"]:

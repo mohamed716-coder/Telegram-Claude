@@ -212,6 +212,64 @@ too (as `before-restore-....db`). **A restore turns the shop back to that moment
 orders and products added since then are gone, and products sold since then are for sale
 again. So pick the newest good backup.
 
+### Automatic deposits with Binance Pay
+
+Normally the owner checks a receipt for every deposit. With a **read-only Binance API
+key**, the bot checks the payments itself:
+
+1. The customer picks an amount (💳 Add Balance), sends **exactly** that much USDT with
+   Binance Pay to your Binance ID, and sends the payment's **Order ID** to the bot.
+2. The bot finds the payment in your Binance Pay history. When the coin and the amount
+   match, the balance is added at once and you get a message about it.
+3. When they don't (another amount or coin, an Order ID it can't find, or one that was
+   already used), you get a ⚠️ message and the customer is asked for the Order ID again.
+   When the second try fails too, the deposit comes to you with **Approve** / **Reject**,
+   like a receipt (`/pending` shows it again).
+
+Set it up once:
+
+1. **Check your Binance ID.** In the Binance app, tap your profile picture (top left): the
+   number after *UID* is your Binance ID. It must be the one customers pay to, `850940840`
+   (`BINANCE_PAY_ID`). The bot warns you if the key belongs to another account.
+2. **Create the key** at <https://www.binance.com/en/my/settings/api-management> (on a
+   computer): **Create API** → **System generated** → name it `shop bot` → confirm. Then
+   **Edit restrictions**: keep only **Enable Reading** ticked (never trading, transfers or
+   withdrawals), choose **Restrict access to trusted IPs only** and add your server's IP
+   address, then **Save**. Copy the **API Key** and the **Secret Key** (Binance shows the
+   secret only once).
+3. **Add two secrets** on the same GitHub page as the others
+   (<https://github.com/mohamed716-coder/Telegram-Claude/settings/secrets/actions/new>):
+   `BINANCE_API_KEY` (the API Key) and `BINANCE_API_SECRET` (the Secret Key). Never send
+   them in a chat.
+4. **Re-run the deploy:** Actions tab → **Deploy to the server** → the newest run →
+   **Re-run jobs** → **Re-run all jobs**. Near the end of the log it says
+   `Binance check: Binance: the key works from this server`. If something is wrong, a
+   yellow warning at the top of the run says what.
+5. **Test it with 1$:** from another Binance account (a friend's), 💳 Add Balance →
+   ✏️ Custom amount → `1`, pay exactly 1 USDT to your Binance ID, then send the Order ID:
+   the balance goes up by 1$. Binance has no test mode, so this is the real check.
+
+| You see | What to do |
+|---|---|
+| `Binance refused the API key` | Copy both keys into the secrets again, check that *Enable Reading* is ticked and the server's IP address is in the key's list, then re-run. |
+| `this key belongs to Binance ID ...` | The key is from another Binance account than the one customers pay to: create the key on that account. |
+| `Binance doesn't serve this server's location` | Binance doesn't allow its API from the server's country, so automatic deposits can't work from this server. Deposits come to you to approve. |
+| `this key can do more than read` | Delete that key in API Management and create one with only *Enable Reading*. |
+
+- While Binance refuses the key, the bot tells you once and every deposit comes to you to
+  approve: customers can still deposit.
+- Only payments made after the key was added, and in the last 48 hours, are found. Only
+  USDT counts by default (1 USDT = 1$); to take USDC too, add `BINANCE_COINS=USDT,USDC` to
+  `~/Telegram-Claude/.env` on the server.
+- **To turn it off:** set the `BINANCE_API_KEY` secret to `off` and re-run: deposits use
+  receipts again. Delete the key on Binance too.
+- Without GitHub: put `BINANCE_API_KEY=...` and `BINANCE_API_SECRET=...` in
+  `~/Telegram-Claude/.env` and run `systemctl restart shopbot`;
+  `cd ~/Telegram-Claude && .venv/bin/python -m shopbot.binance --check` tests the key.
+- The server is in Türkiye, where paying for goods and services with crypto assets has been
+  banned since April 2021 (a regulation of the Central Bank of the Republic of Türkiye).
+  Make sure taking Binance payments is allowed where you and your customers are.
+
 ### Moving an existing shop to the server
 
 Do this right after step 4, if the bot already ran on your PC:

@@ -12,12 +12,13 @@ from telegram.ext import (
     filters,
 )
 
-from . import common, labels, money, owner, shop, stock
+from . import autopay, common, labels, money, owner, shop, stock
 from . import broadcast  # after stock: it uses stock's checks
 
 COMMANDS = [
     ("start", common.cmd_start),
     ("help", common.cmd_help),
+    ("id", common.cmd_id),
     ("cancel", common.cmd_cancel),
     ("withdraw", money.cmd_withdraw),
     ("addbal", owner.cmd_addbal),
@@ -40,13 +41,15 @@ COMMANDS = [
 #   sc:<label>:<qty>:<nonce>  confirm purchase      mo:<page> / mov:<order>  my orders
 #   lb/ln/lp/lr/ld/ldy/lx  labels (lx = disable/enable)   ap/apd/apc  add product
 #   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dno  deposits
+#   dck  check a Binance Order ID again (autopay.py)
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
 #   an:<nonce> / anc[:<nonce>] / ans:<job>  send / cancel / stop an announcement (owner)
-#   menu/cancel/noop  general
+#   menu/cancel/noop/myid  general (myid: show your Telegram ID)
 CALLBACKS = [
     (r"^menu$", common.cb_menu),
     (r"^cancel$", common.cb_cancel),
     (r"^noop$", common.cb_noop),
+    (r"^myid$", common.cb_my_id),
     (r"^sh:", shop.cb_shop),
     (r"^sb:", shop.cb_quantity),
     (r"^sq:", shop.cb_custom_quantity),
@@ -74,6 +77,7 @@ CALLBACKS = [
     (r"^da:", money.cb_deposit_amount),
     (r"^dc$", money.cb_deposit_custom),
     (r"^dsend$", money.cb_deposit_send),
+    (r"^dck$", autopay.cb_check_again),
     (r"^(dok|dno):", money.cb_deposit_decide),
     (r"^ea$", money.cb_earnings),
     (r"^ew$", money.cb_withdraw),

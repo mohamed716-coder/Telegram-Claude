@@ -71,6 +71,18 @@ class Settings:
     # Shown to customers who need help ("@username" or a link). Empty: the owner's
     # @username. "none": don't show any contact.
     support_contact: str = ""
+    # A read-only Binance API key: deposits are then checked automatically by the Order
+    # ID the customer sends (shopbot/binance.py). Empty: the owner checks receipts by hand.
+    binance_api_key: str = ""
+    binance_api_secret: str = ""
+    # Coins credited 1:1 in $ when received with Binance Pay (others go to the owner).
+    binance_coins: tuple[str, ...] = ("USDT",)
+    # Payments older than this (hours) aren't credited automatically.
+    binance_max_age_hours: int = 48
+
+    @property
+    def binance_auto(self) -> bool:
+        return bool(self.binance_api_key and self.binance_api_secret)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +98,15 @@ class Settings:
         discount = _env_int("SELLER_DISCOUNT_PERCENT", 10)
         if not 0 <= discount <= 100:
             raise ConfigError("SELLER_DISCOUNT_PERCENT must be between 0 and 100")
+        key = os.environ.get("BINANCE_API_KEY", "").strip()
+        secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+        for name, value in (("BINANCE_API_KEY", key), ("BINANCE_API_SECRET", secret)):
+            if value and (len(value) < 16 or not value.isalnum()):
+                raise ConfigError(f"{name} doesn't look like a Binance API key or secret")
+        if bool(key) != bool(secret):
+            raise ConfigError("Set both BINANCE_API_KEY and BINANCE_API_SECRET, or neither")
+        coins = tuple(c.strip().upper() for c in os.environ.get("BINANCE_COINS", "").split(",")
+                      if c.strip()) or ("USDT",)
         return cls(
             bot_token=token,
             owner_id=_env_int("OWNER_ID", DEFAULT_OWNER_ID),
@@ -95,4 +116,8 @@ class Settings:
             seller_discount_percent=discount,
             seller_auto_threshold=_env_int("SELLER_AUTO_THRESHOLD", 1000),
             support_contact=os.environ.get("SUPPORT_CONTACT", "").strip(),
+            binance_api_key=key,
+            binance_api_secret=secret,
+            binance_coins=coins,
+            binance_max_age_hours=_env_int("BINANCE_MAX_AGE_HOURS", 48),
         )

@@ -146,6 +146,41 @@ with open(path, "w", encoding="utf-8") as fh:
 PY
 )
 
+save_binance_key() (  # BINANCE_API_KEY/SECRET into .env ("off" removes them); prints what changed
+    umask 077
+    [ -f "$ENV_FILE" ] || cp "$APP_DIR/.env.example" "$ENV_FILE"
+    ENV_FILE="$ENV_FILE" KEY="$1" SECRET="$2" PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - <<'PY'
+import os, re
+path, key, secret = os.environ["ENV_FILE"], os.environ["KEY"], os.environ["SECRET"]
+off = key.lower() == "off"
+if not off and not (re.fullmatch(r"[A-Za-z0-9]{16,}", key) and re.fullmatch(r"[A-Za-z0-9]{16,}", secret)):
+    print("The Binance API key or its secret doesn't look right, so it was not saved.")
+    raise SystemExit(0)
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+pattern = re.compile(r"^\s*(export\s+)?(BINANCE_API_KEY|BINANCE_API_SECRET)\s*=(.*)$")
+old, out = {}, []
+for line in lines:
+    found = pattern.match(line)
+    if found:  # every copy goes (the last one would win): written once below
+        old[found.group(2)] = found.group(3).strip().strip("\"'")
+        continue
+    out.append(line)
+if off:
+    if not any(old.values()):
+        raise SystemExit(0)
+    message = "Took the Binance API key out of .env: deposits are checked by hand again."
+else:
+    if old.get("BINANCE_API_KEY") == key and old.get("BINANCE_API_SECRET") == secret:
+        raise SystemExit(0)
+    out += ["BINANCE_API_KEY=" + key, "BINANCE_API_SECRET=" + secret]
+    message = "Saved the Binance API key in .env: deposits are checked automatically."
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(out) + "\n")
+print(message)
+PY
+)
+
 ask_token() {
     if [ -n "${SHOPBOT_VIA_CI:-}" ]; then  # installed by GitHub (deploy/ci-remote.sh)
         die "The server has no working bot token: put the current token from @BotFather in the BOT_TOKEN secret, then run the deploy again."
@@ -205,6 +240,12 @@ while :; do
     fi
 done
 [ "$token" = "$file_token" ] || { save_token "$token"; say "Saved the token in $ENV_FILE"; }
+# The Binance API key for automatic deposits (shopbot/binance.py), from a deploy's
+# BINANCE_API_KEY and BINANCE_API_SECRET secrets.
+if [ -n "${OFFERED_BINANCE_API_KEY:-}" ]; then
+    changed="$(save_binance_key "$OFFERED_BINANCE_API_KEY" "${OFFERED_BINANCE_API_SECRET:-}")"
+    [ -z "$changed" ] || say "$changed"
+fi
 chown "$RUN_USER:$RUN_GROUP" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 

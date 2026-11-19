@@ -38,7 +38,7 @@ OWNER, ADMIN, USER = "owner", "admin", "user"
 MAX_DB_INT = 2**63 - 1
 
 # Callback prefixes that must NOT end the action in progress (see pre_handler).
-KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "wall", "dok", "dno", "wok", "wno", "noop"}
+KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "dck", "wall", "dok", "dno", "wok", "wno", "noop"}
 
 BOT_DESCRIPTION = "🛍 Welcome to the shop!\n\nPress /start to start the shop."
 BOT_SHORT_DESCRIPTION = "🛍 Send /start to start the shop."
@@ -46,12 +46,14 @@ EDIT_HINT = "✏️ Edited messages are ignored. Please send a new message inste
 
 USER_COMMANDS = [
     ("start", "Start the shop"),
+    ("id", "Show your Telegram ID"),
     ("help", "Show all commands"),
     ("cancel", "Cancel the current action"),
 ]
 ADMIN_COMMANDS = [
     ("start", "Open the admin panel"),
     ("withdraw", "Withdraw your earnings"),
+    ("id", "Show your Telegram ID"),
     ("help", "Show all commands"),
     ("cancel", "Cancel the current action"),
 ]
@@ -72,6 +74,7 @@ OWNER_COMMANDS = [
     ("status", "All users, balances and deposits"),
     ("pending", "Deposits and withdrawals to review"),
     ("announce", "Send a message to all users"),
+    ("id", "Your ID, or /id @user for theirs"),
     ("cancel", "Cancel the current action"),
 ]
 
@@ -446,11 +449,13 @@ def panel_text(context: Ctx, user_id: int) -> str:
 def panel_keyboard(role: str, *, earnings: int = 0, pending: int = 0) -> InlineKeyboardMarkup:
     shop = btn("🛍 Shop", "sh:0:0", GREEN)
     add_balance = btn("💳 Add Balance", "dp", GREEN)
+    my_id = btn("🆔 My ID", "myid")
     if role == OWNER:
         rows = [
             [shop, btn("📦 My Products", "mp:0:0", BLUE)],
             [btn("➕ Add Product", "ap:0:0", GREEN), btn("🏷 Add Label", "lb:0:0", GREEN)],
             [btn("📊 Earnings", "ea", BLUE), add_balance],
+            [my_id],
         ]
         if pending:
             rows.append([btn(f"📥 Pending requests ({pending})", "pq", BLUE)])
@@ -458,10 +463,10 @@ def panel_keyboard(role: str, *, earnings: int = 0, pending: int = 0) -> InlineK
         rows = [
             [shop, btn("📦 My Products", "mp:0:0", BLUE)],
             [btn("➕ Add Product", "ap:0:0", GREEN), btn("📊 Earnings", "ea", BLUE)],
-            [add_balance],
+            [add_balance, my_id],
         ]
     else:
-        rows = [[shop, add_balance], [btn("🧾 My Orders", "mo:0", BLUE)]]
+        rows = [[shop, add_balance], [btn("🧾 My Orders", "mo:0", BLUE), my_id]]
         if earnings > 0:  # e.g. a removed admin who still has money to withdraw
             rows[1].append(btn("📊 Earnings", "ea", BLUE))
     return markup(rows)
@@ -502,6 +507,7 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
             "/status — all users with ID, name, balance and deposits",
             "/pending — deposits and withdrawals waiting for your answer",
             "/announce — send a message to all users (or <code>/announce your text</code>)",
+            "/id <code>@username</code> — find a user's ID (someone who has started the bot)",
             "",
             "Buttons: 🛍 Shop · 📦 My Products · ➕ Add Product · 🏷 Add Label · "
             "📊 Earnings · 💳 Add Balance",
@@ -521,6 +527,7 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
         "",
         "👤 <b>Everyone</b>",
         "/start — open the shop menu",
+        "/id — show your Telegram ID",
         "/help — show this list",
         "/cancel — cancel the current action",
     ]
@@ -686,6 +693,41 @@ async def cmd_help(update: Update, context: Ctx) -> None:
         support=support_contact(context),
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+
+
+def _id_text(user_id: int) -> str:
+    return f"🆔 Your Telegram ID: <code>{user_id}</code>\n(Tap it to copy.)"
+
+
+async def cmd_id(update: Update, context: Ctx) -> None:
+    """/id: your own Telegram ID. The owner: /id @username for someone else's."""
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    message = update.effective_message
+    wanted = (message.text or "").split()[1:2]  # type: ignore[union-attr]
+    if wanted and is_owner(context, user_id):
+        name = wanted[0].lstrip("@")
+        row = db_of(context).find_user_by_username(name)
+        if row is None:
+            text = (f"🔎 Nobody with the username @{esc(name)} has used this bot. (A bot only "
+                    "knows people who have started it.)")
+        else:
+            text = f"🆔 {user_html(row)}\nID: <code>{row['id']}</code>"
+            if row["is_banned"]:
+                text += "\n🚫 Banned"
+    elif wanted:
+        text = _id_text(user_id) + "\nOnly the owner can look up other people's IDs."
+    else:
+        text = _id_text(user_id)
+    await message.reply_text(text, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+
+
+async def cb_my_id(update: Update, context: Ctx) -> None:
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    await answer(update.callback_query)
+    text = _id_text(user_id)
+    if is_owner(context, user_id):
+        text += "\n\nSomeone else's ID: <code>/id @username</code>"
+    await show(update, context, text, markup([[btn("⬅️ Back", "menu"), menu_btn()]]))
 
 
 async def cmd_cancel(update: Update, context: Ctx) -> None:

@@ -53,20 +53,26 @@ MAX_ADMINS_LISTED = 25
 
 # ================================================================ deposits
 async def cb_deposit_menu(update: Update, context: Ctx) -> None:
-    query = update.callback_query
-    await answer(query)
+    await answer(update.callback_query)
+    await show_deposit_menu(update, context)
+
+
+async def show_deposit_menu(update: Update, context: Ctx, *, new: bool = False) -> None:
+    """Choose an amount, then pay it (see ask_payment)."""
     cfg = cfg_of(context)
+    clear_state(context)
     buttons = [btn(f"{amount}$", f"da:{amount}", GREEN) for amount in cfg.deposit_presets]
     rows = grid(buttons, 3)
     rows.append([btn("✏️ Custom amount", "dc", BLUE)])
     rows.append([btn("❌ Cancel", "menu", RED)])
-    balance = db_of(context).get_user(query.from_user.id)["balance"]  # type: ignore[index]
+    balance = db_of(context).get_user(update.effective_user.id)["balance"]  # type: ignore[index, union-attr]
     await show(
         update,
         context,
         f"💳 <b>Add Balance</b>\n\n💰 Current balance: <b>{money(balance)}</b>\n\n"
         "Choose how much you want to add:",
         markup(rows),
+        new=new,
     )
 
 
@@ -81,7 +87,7 @@ async def cb_deposit_amount(update: Update, context: Ctx) -> None:
         await stale_button(update)
         return
     await answer(query)
-    await ask_receipt(update, context, amount)
+    await ask_payment(update, context, amount)
 
 
 async def cb_deposit_custom(update: Update, context: Ctx) -> None:
@@ -110,7 +116,18 @@ async def on_deposit_amount(update: Update, context: Ctx, state: dict) -> None:
     if not 1 <= amount <= limit:
         await update.effective_message.reply_text(f"✏️ The amount must be between 1 and {limit}.")  # type: ignore[union-attr]
         return
-    await ask_receipt(update, context, amount, new=True)
+    await ask_payment(update, context, amount, new=True)
+
+
+async def ask_payment(update: Update, context: Ctx, amount: int, *, new: bool = False) -> None:
+    """How to pay the chosen amount: with a Binance API key the customer sends the Order
+    ID and the bot checks it (autopay.py); otherwise a receipt for the owner."""
+    if context.bot_data.get("binance") is not None:
+        from .autopay import ask_order_id  # local import: autopay imports this module
+
+        await ask_order_id(update, context, amount, new=new)
+        return
+    await ask_receipt(update, context, amount, new=new)
 
 
 async def ask_receipt(update: Update, context: Ctx, amount: int, *, new: bool = False) -> None:
@@ -120,7 +137,7 @@ async def ask_receipt(update: Update, context: Ctx, amount: int, *, new: bool = 
         update,
         context,
         f"💳 <b>Add {amount}$ to your balance</b>\n\n"
-        f"1️⃣ Send <b>{amount}$</b> with Binance Pay to ID: <code>{binance_id}</code>\n"
+        f"1️⃣ Send <b>{amount}$</b> with Binance Pay to Binance ID: <code>{binance_id}</code>\n"
         "2️⃣ Send a <b>photo of the payment receipt</b> here.\n"
         "3️⃣ Press <b>Confirm</b> to send your request to the owner.\n\n"
         "Your balance is added as soon as the owner approves the payment.",
@@ -154,11 +171,21 @@ async def on_deposit_receipt(update: Update, context: Ctx, state: dict) -> None:
 def deposit_caption(context: Ctx, deposit: Any) -> str:
     db = db_of(context)
     user = db.get_user(deposit["user_id"])
+    order = deposit["order_id"]
+    found = "".join(
+        f"🔎 Binance has: <b>{esc(p['raw_amount'])} {esc(p['currency'])}</b>, Order ID "
+        f"<code>{esc(p['order_id'])}</code>, paid {esc(p['paid_at'])} UTC\n"
+        for p in db.deposit_payments(deposit["id"]) if p["currency"]
+    )
+    notes = "".join(f"• {esc(line)}\n" for line in (deposit["note"] or "").splitlines() if line)
     return (
         f"💳 <b>Deposit request #{deposit['id']}</b>\n"
         f"👤 {user_html(user)}\n"
         f"💵 Amount: <b>{money(deposit['amount'])}</b>\n"
-        f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
+        + (f"🧾 Binance Order ID: <code>{esc(order)}</code>\n" if order else "")
+        + found
+        + (f"⚠️ Not added automatically:\n{notes}" if notes else "")
+        + f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
         f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
         f"🕒 {deposit['created_at']} UTC"
     )
@@ -216,6 +243,8 @@ async def send_deposit_to_owner(context: Ctx, deposit: Any) -> bool:
             return True
         except TelegramError as exc:
             log.warning("Could not send deposit #%s to the owner: %s", deposit["id"], exc)
+    if not file_id and (deposit["order_id"] or deposit["note"]):  # checked with Binance: no receipt
+        return await notify(context, cfg.owner_id, caption, keyboard)
     return await notify(
         context, cfg.owner_id, caption + "\n\n⚠️ The receipt couldn't be attached.", keyboard
     )

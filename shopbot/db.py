@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS ledger (
     created_at     TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS binance_payments (     -- Binance Pay transfers already used
+    order_id        TEXT    NOT NULL UNIQUE,      -- the Order ID the payer sees
+    transaction_id  TEXT    UNIQUE,               -- Binance's other id for the same transfer
+    user_id         INTEGER NOT NULL,             -- who claimed it
+    amount          INTEGER NOT NULL,             -- cents credited (0: left to the owner)
+    raw_amount      TEXT    NOT NULL,             -- as Binance sent it, e.g. 25.00000000
+    currency        TEXT    NOT NULL,
+    paid_at         TEXT,
+    status          TEXT    NOT NULL,             -- credited | owner (left to the owner)
+    deposit_id      INTEGER REFERENCES deposits(id),
+    created_at      TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -170,6 +183,14 @@ class PriceChanged(ShopError):
     def __init__(self, unit: int) -> None:
         super().__init__("The price changed. Please check the new total and confirm again.")
         self.unit = unit
+
+
+class PaymentUsed(ShopError):
+    """This Binance payment (Order ID) was already used."""
+
+    def __init__(self, row: sqlite3.Row) -> None:
+        super().__init__("This payment was already used.")
+        self.row = row
 
 
 class BalanceChanged(ShopError):
@@ -229,6 +250,11 @@ class Database:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(labels)")}
         if "disabled" not in columns:
             self.conn.execute("ALTER TABLE labels ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(deposits)")}
+        if "order_id" not in columns:  # the Binance Order ID of the payment, if known
+            self.conn.execute("ALTER TABLE deposits ADD COLUMN order_id TEXT")
+        if "note" not in columns:  # why it wasn't added automatically, one line per check
+            self.conn.execute("ALTER TABLE deposits ADD COLUMN note TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -324,6 +350,18 @@ class Database:
 
     def get_user(self, user_id: int) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM users WHERE id = ?", (user_id,))
+
+    def find_user_by_username(self, username: str) -> Optional[sqlite3.Row]:
+        """Someone who has used the bot with this @username (most recently seen first:
+        a username can pass from one person to another)."""
+        name = username.strip().lstrip("@")
+        if not name:
+            return None
+        return self._one(
+            "SELECT * FROM users WHERE lower(username) = lower(?)"
+            " ORDER BY last_seen IS NULL, last_seen DESC, id DESC LIMIT 1",
+            (name,),
+        )
 
     def list_users(self) -> list[sqlite3.Row]:
         return self._all("SELECT * FROM users ORDER BY total_deposits DESC, created_at, id")
@@ -792,6 +830,25 @@ class Database:
             if dep["status"] != "pending":
                 raise ShopError(f"This request was already {dep['status']}.")
             became_seller = False
+            order_id = dep["order_id"] if "order_id" in dep.keys() else None
+            if approve and order_id:  # the receipt names a Binance payment: use it only once
+                used = self.binance_payment(order_id)
+                if used is not None and used["status"] == "credited":
+                    raise ShopError("This payment (Order ID) was already added to a balance. "
+                                    "Reject this request.")
+                if used is None:
+                    self.conn.execute(
+                        "INSERT INTO binance_payments (order_id, user_id, amount, raw_amount,"
+                        " currency, status, deposit_id, created_at)"
+                        " VALUES (?, ?, ?, '', '', 'credited', ?, ?)",
+                        (order_id, dep["user_id"], dep["amount"], dep["id"], now()),
+                    )
+                else:  # kept for this request when it came to the owner: now it's added
+                    self.conn.execute(
+                        "UPDATE binance_payments SET status = 'credited', amount = ?,"
+                        " deposit_id = ? WHERE order_id = ?",
+                        (dep["amount"], dep["id"], used["order_id"]),
+                    )
             if approve:
                 self.ensure_user(dep["user_id"])
                 self.conn.execute(
@@ -850,6 +907,100 @@ class Database:
             )
             self._log_balance(user_id, new_balance - old, "balance set by owner")
         return old, new_balance
+
+    # --------------------------------------------------------- binance payments
+    def binance_payment(self, *ids: str) -> Optional[sqlite3.Row]:
+        """The already used payment with one of these Order IDs or transaction IDs."""
+        for value in ids:
+            if value:
+                row = self._one(
+                    "SELECT * FROM binance_payments WHERE order_id = ? OR transaction_id = ?",
+                    (value, value),
+                )
+                if row is not None:
+                    return row
+        return None
+
+    def binance_auto_since(self) -> int:
+        """When automatic checking started (ms since 1970): it never credits an older
+        payment (it may have been added by hand before)."""
+        value = self.get_setting("binance_auto_since")
+        if value is None:
+            value = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+            self.set_setting("binance_auto_since", value)
+        return int(value)
+
+    def _record_payment(self, user_id: int, payment: Any, cents: int, status: str,
+                        deposit_id: Optional[int]) -> None:
+        paid = datetime.fromtimestamp(payment.time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO binance_payments (order_id, transaction_id, user_id, amount, raw_amount,"
+            " currency, paid_at, status, deposit_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (payment.order_id or payment.transaction_id, payment.transaction_id or None,
+             user_id, cents, format(payment.amount.normalize(), "f"), payment.currency, paid, status,
+             deposit_id, now()),
+        )
+
+    def credit_binance_payment(
+        self, user_id: int, payment: Any, cents: int, seller_threshold: int
+    ) -> DepositDecision:
+        """Add a received Binance Pay transfer to the balance, once: its Order ID (and
+        transaction ID) can never be used again, not even by two people at the same time."""
+        if cents <= 0:
+            raise ShopError("The amount is too small to add.")
+        with self.tx():
+            used = self.binance_payment(payment.order_id, payment.transaction_id)
+            if used is not None:
+                raise PaymentUsed(used)
+            self.ensure_user(user_id)
+            ts = now()
+            cur = self.conn.execute(
+                "INSERT INTO deposits (user_id, amount, method, status, created_at, decided_at,"
+                " order_id) VALUES (?, ?, 'binance_auto', 'approved', ?, ?, ?)",
+                (user_id, cents, ts, ts, payment.order_id or payment.transaction_id),
+            )
+            deposit_id = int(cur.lastrowid)
+            self._record_payment(user_id, payment, cents, "credited", deposit_id)
+            self.conn.execute(
+                "UPDATE users SET balance = balance + ?, total_deposits = total_deposits + ?"
+                " WHERE id = ?",
+                (cents, cents, user_id),
+            )
+            self._log_balance(user_id, cents, "binance deposit", f"deposit#{deposit_id}")
+            became_seller = self._maybe_auto_seller(user_id, seller_threshold)
+            deposit = self.get_deposit(deposit_id)
+            user = self.get_user(user_id)
+        return DepositDecision(deposit, user, became_seller)  # type: ignore[arg-type]
+
+    def create_review_request(
+        self, user_id: int, amount: int, order_id: Optional[str], note: str, payments: list[Any]
+    ) -> sqlite3.Row:
+        """A deposit the bot couldn't add (its checks failed): a request the owner approves
+        or rejects. The received ``payments`` Binance found meanwhile are kept for it, so
+        nobody can claim them while the owner decides; ``order_id`` is the one an approval
+        marks as added (left out if it's used already)."""
+        if amount <= 0:
+            raise ShopError("The amount must be more than 0.")
+        with self.tx():
+            if order_id and self.binance_payment(order_id) is not None:
+                order_id = None
+            self.ensure_user(user_id)
+            cur = self.conn.execute(
+                "INSERT INTO deposits (user_id, amount, method, status, created_at, order_id, note)"
+                " VALUES (?, ?, 'binance', 'pending', ?, ?, ?)",
+                (user_id, amount, now(), order_id, note or None),
+            )
+            deposit_id = int(cur.lastrowid)
+            for payment in payments:
+                if self.binance_payment(payment.order_id, payment.transaction_id) is None:
+                    self._record_payment(user_id, payment, 0, "owner", deposit_id)
+            return self.get_deposit(deposit_id)  # type: ignore[return-value]
+
+    def deposit_payments(self, deposit_id: int) -> list[sqlite3.Row]:
+        """The Binance payments a deposit request was checked against."""
+        return self._all("SELECT * FROM binance_payments WHERE deposit_id = ? ORDER BY rowid",
+                         (deposit_id,))
 
     # -------------------------------------------------------------- withdrawals
     def create_withdrawal(

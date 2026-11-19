@@ -269,7 +269,7 @@ def test_preset_amount_asks_for_binance_payment_and_receipt(tmp_path, amount):
         calls = await t.press(ALICE, exact_button(calls, f"{amount}$"))
         text = t.last_text(calls)
         assert f"Add {amount}$ to your balance" in text
-        assert f"Send <b>{amount}$</b> with Binance Pay to ID: <code>{BINANCE_ID}</code>" in text
+        assert f"Send <b>{amount}$</b> with Binance Pay to Binance ID: <code>{BINANCE_ID}</code>" in text
         assert "photo of the payment receipt" in text
         assert not t.has_button(calls, "Confirm")  # nothing to confirm before a receipt
         calls = await t.send_photo(ALICE, f"receipt-{amount}")

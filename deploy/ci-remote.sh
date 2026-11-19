@@ -22,9 +22,11 @@ case "$here" in
 esac
 [ -n "$src" ] && [ -n "$home" ] && [ -f "$here/code.bundle" ] \
     || die "This is started by deploy/ci-deploy.sh only. Nothing was changed."
-trap 'rm -f "$here/code.bundle" "$here/remote.sh" "$here/token"; rmdir "$here" 2>/dev/null || true' EXIT
+trap 'rm -f "$here/code.bundle" "$here/remote.sh" "$here/token" "$here/binance"; rmdir "$here" 2>/dev/null || true' EXIT
 token="$(cat "$here/token" 2>/dev/null || true)"
-rm -f "$here/token"
+binance_key="$(sed -n 1p "$here/binance" 2>/dev/null || true)"
+binance_secret="$(sed -n 2p "$here/binance" 2>/dev/null || true)"
+rm -f "$here/token" "$here/binance"
 
 branch="${1:?usage: ci-remote.sh BRANCH [OWNER/REPO]}"
 repo="${2:-}"
@@ -112,6 +114,9 @@ if [ -n "$token" ]; then
     sum="$(printf '%s' "$token" | sha256sum | cut -c1-64)"
     if [ "$(cat "$seen" 2>/dev/null || true)" = "$sum" ]; then export OFFERED_BOT_TOKEN_SEEN=yes; fi
 fi
+if [ -n "$binance_key" ]; then  # the BINANCE_API_KEY/SECRET secrets: saved in .env ("off": removed)
+    export OFFERED_BINANCE_API_KEY="$binance_key" OFFERED_BINANCE_API_SECRET="$binance_secret"
+fi
 export SHOPBOT_VIA_CI=1  # the installer's messages then talk about secrets, not .env
 rc=0
 bash deploy/install.sh || rc=$?
@@ -144,6 +149,11 @@ printf '  %-16s %s\n' \
 if [ -f /var/run/reboot-required ]; then
     warn "The server needs a restart to finish its security updates: log in and type reboot (the bot starts again by itself)."
 fi
+echo
+say "Automatic deposits: the server asks Binance with the key in .env ..."
+report="$(timeout 60 env PYTHONDONTWRITEBYTECODE=1 "$app/.venv/bin/python" -m shopbot.binance --check 2>&1)"
+[ "$?" -ne 124 ] || report="Binance: no answer within 60 seconds, so the key couldn't be checked."
+printf '%s\n' "$report" | sed 's/^/  Binance check: /'
 echo
 say "The bot's last messages:"
 journalctl -u shopbot.service -n 8 --no-pager -o cat

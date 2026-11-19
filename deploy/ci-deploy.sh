@@ -17,6 +17,9 @@
 #   VPS_PASSWORD  root's password                                            required
 #   BOT_TOKEN     the bot token: needed the first time; later only a changed one is used
 #                 (and never one Telegram rejects instead of a token that still works)
+#   BINANCE_API_KEY, BINANCE_API_SECRET
+#                 a read-only Binance API key: deposits are then checked automatically
+#                 (optional; the key "off" takes it off the server again)
 #   VPS_PORT      the SSH port, if not 22
 #   KNOWN_HOSTS   where the server's identity is remembered when deploy/server-fingerprint
 #                 doesn't pin it (default .deploy-known-hosts)
@@ -35,6 +38,7 @@ hide() {  # never show this value in GitHub's log (secrets are hidden, but not e
     if on_github && [ -n "$1" ]; then printf '::add-mask::%s\n' "$1"; fi
 }
 GUIDE="DEPLOY.md, \"The easy way: GitHub installs it for you\""
+BINANCE_GUIDE="DEPLOY.md, \"Automatic deposits with Binance Pay\""
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [ -f bot.py ] && [ -f deploy/install.sh ] && [ -f deploy/ci-remote.sh ] \
@@ -59,6 +63,9 @@ password="${password%$'\n'}"  # pasted with the line ending
 password="${password%$'\r'}"
 token="$(printf '%s' "$token" | tr -d "[:space:]\"'")"
 hide "$host"; hide "$password"; hide "$token"
+binance_key="$(printf '%s' "${BINANCE_API_KEY:-}" | tr -d "[:space:]\"'")"
+binance_secret="$(printf '%s' "${BINANCE_API_SECRET:-}" | tr -d "[:space:]\"'")"
+hide "$binance_key"; hide "$binance_secret"
 
 missing=""
 [ -n "$host" ] || missing="$missing VPS_HOST"
@@ -90,6 +97,20 @@ if [ -n "$token" ] && ! [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
     note "The BOT_TOKEN secret doesn't look like a bot token (like 123456789:AAH...), so it is not used. Copy it again from @BotFather (/mybots -> your bot -> API Token)."
     token=""
 fi
+
+case "$(printf '%s' "$binance_key" | tr '[:upper:]' '[:lower:]')" in
+    "")
+        if [ -n "$binance_secret" ]; then
+            note "The BINANCE_API_SECRET secret is set but BINANCE_API_KEY isn't, so neither is used. Add both ($BINANCE_GUIDE)."
+            binance_secret=""
+        fi ;;
+    off | none) binance_key=off; binance_secret="" ;;  # automatic deposits off again
+    *)
+        if ! [[ "$binance_key" =~ ^[A-Za-z0-9]{16,}$ && "$binance_secret" =~ ^[A-Za-z0-9]{16,}$ ]]; then
+            note "The BINANCE_API_KEY and BINANCE_API_SECRET secrets don't look like a Binance API key and its secret key (long codes of letters and digits), so they are not used. Copy both again from Binance (Account -> API Management)."
+            binance_key=""; binance_secret=""
+        fi ;;
+esac
 
 branch="${DEPLOY_BRANCH:-${GITHUB_REF_NAME:-}}"
 [ -n "$branch" ] || branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -188,14 +209,14 @@ commit="$(git rev-parse --short HEAD)"
 say "Packing the code: $branch at $commit ($(git log -1 --format=%s HEAD))"
 git bundle create --quiet "$work/code.bundle" HEAD
 git show HEAD:deploy/ci-remote.sh >"$work/remote.sh"  # the one that matches the code
-(umask 077 && printf '%s' "$token" >"$work/token")
+(umask 077 && printf '%s' "$token" >"$work/token" && printf '%s\n%s\n' "$binance_key" "$binance_secret" >"$work/binance")
 
 say "Uploading it to the server ..."
 rc=0
-upload="$(tar -C "$work" -cf - code.bundle remote.sh token | ssh "${ssh_opts[@]}" -T "$target" \
+upload="$(tar -C "$work" -cf - code.bundle remote.sh token binance | ssh "${ssh_opts[@]}" -T "$target" \
     'umask 077 && d="$(mktemp -d "$HOME/.shopbot-deploy.XXXXXXXX")" && tar -C "$d" --no-same-owner -xf - && printf "%s\n" "$d"')" \
     || rc=$?
-rm -f "$work/token"
+rm -f "$work/token" "$work/binance"
 [ "$rc" -ne 255 ] || fail "Lost the connection to the server while uploading (no answer for 2 minutes, or it restarted). Check that the server is on, then Re-run all jobs."
 [ "$rc" -eq 0 ] || fail "Uploading the code to the server failed (see the message above). Is its disk full?"
 case "$upload" in
@@ -242,5 +263,15 @@ if [ "$rc" -ne 0 ]; then
             fail "Installing on the server failed: the messages above say why (lines starting with Error)." ;;
     esac
 fi
+# Automatic deposits: what the server's own check of the Binance key said (ci-remote.sh).
+check="$(sed -n 's/^  Binance check: //p' "$work/install.log")"
+first="${check%%$'\n'*}"
+case "$first" in
+    "" | "Binance: the key works"* | "Binance: no API key"*) ;;
+    *) note "Automatic deposits don't work: ${first#Binance: } Until it's fixed, every deposit comes to you to approve ($BINANCE_GUIDE)." ;;
+esac
+while IFS= read -r line; do
+    case "$line" in "WARNING: "*) note "Binance key: ${line#WARNING: }" ;; esac
+done <<<"$check"
 running="$(sed -n 's/^==> Code on the server: //p' "$work/install.log" | tail -1)"
 say "Done. The server runs: ${running:-$commit}"

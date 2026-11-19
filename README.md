@@ -1,8 +1,9 @@
 # Telegram Shop Bot
 
 A Telegram bot that sells digital products (eSIMs, codes, files…) from a tree of labels,
-with an owner panel, admin panels, customer balances topped up through Binance, and
-earnings/withdrawals for sellers.
+with an owner panel, admin panels, customer balances topped up through Binance Pay
+(checked automatically with a read-only Binance API key, or by the owner from a receipt),
+and earnings/withdrawals for sellers.
 
 Written in Python with [python-telegram-bot](https://python-telegram-bot.org) 22.8 and SQLite
 (a single file, `data/shop.db`), so it runs on any small server or PC.
@@ -50,9 +51,10 @@ in that list.
 | 🛍 Shop | 🛍 Shop | 🛍 Shop |
 | 📦 My Products | 📦 My Products (own products) | 💳 Add Balance |
 | ➕ Add Product | ➕ Add Product | 🧾 My Orders |
-| 🏷 Add Label | 📊 Earnings (own) | |
+| 🏷 Add Label | 📊 Earnings (own) | 🆔 My ID |
 | 📊 Earnings (everyone) | 💳 Add Balance | |
-| 💳 Add Balance | | |
+| 💳 Add Balance | 🆔 My ID | |
+| 🆔 My ID | | |
 
 `/start` greets with **Welcome Owner**, **Welcome Admin**, or **Welcome _first name_**, and
 shows the balance. When deposits or withdrawals are waiting for the owner, the owner panel
@@ -126,10 +128,19 @@ whoever added each product (owner or admin).
 
 ### 5. Adding balance (💳 Add Balance)
 
-Pick 10 / 20 / 30 / 50 / 100 $ or **Custom** (whole numbers only), send the money to
-Binance Pay ID **850940840**, send a **photo of the receipt**, and press **Confirm**. The
-owner gets the receipt with **Approve** / **Reject** buttons; on approval the balance is
-added. If that message ever doesn't reach the owner (or gets deleted), `/pending` sends
+Pick 10 / 20 / 30 / 50 / 100 $ or **Custom** (whole numbers only) and send the money with
+Binance Pay to Binance ID **850940840**. Then:
+
+- **With a Binance API key** (automatic, see DEPLOY.md, *Automatic deposits with Binance
+  Pay*): send **exactly** that much USDT and send the payment's **Order ID** to the bot.
+  When Binance shows a payment with that Order ID, coin and amount, the balance is added at
+  once. If not, the owner gets a ⚠️ message and the bot asks for the Order ID again; if the
+  second try fails too, the deposit goes to the owner to **Approve** / **Reject**. An Order
+  ID can only ever be used once.
+- **Without a key:** send a **photo of the receipt** and press **Confirm**. The owner gets
+  the receipt with **Approve** / **Reject** buttons; on approval the balance is added.
+
+If a request ever doesn't reach the owner (or the message gets deleted), `/pending` sends
 every waiting request again with its buttons.
 
 **Sellers** get **10% off** every product. Anyone whose total deposits reach **1000$**
@@ -150,6 +161,7 @@ earned: they still see 📊 Earnings and can use `/withdraw`.
 |---|---|---|
 | `/start` | everyone | Open the menu |
 | `/help` | everyone | List the commands for your panel |
+| `/id` | everyone | Show your Telegram ID (also the 🆔 My ID button). The owner can send `/id @username` to get someone's ID (they must have used the bot) |
 | `/cancel` | everyone | Cancel what you're doing |
 | `/withdraw` | owner, admins | Withdraw earnings to Binance |
 | `/addbal ID AMOUNT` | owner | Add balance to a user (counts as a deposit) |
@@ -180,6 +192,9 @@ message in ➕ Add Product before you press Done (see above).
 | `SELLER_DISCOUNT_PERCENT` | `10` | Seller discount |
 | `SELLER_AUTO_THRESHOLD` | `1000` | Total deposits ($) that make someone a seller |
 | `SUPPORT_CONTACT` | owner's @username | Who customers are told to contact (`@name`, a link, or `none`) |
+| `BINANCE_API_KEY`, `BINANCE_API_SECRET` | — | A read-only Binance API key of the `BINANCE_PAY_ID` account: deposits are then checked automatically by Order ID |
+| `BINANCE_COINS` | `USDT` | Coins added 1:1 in $ by automatic deposits (comma-separated, e.g. `USDT,USDC`) |
+| `BINANCE_MAX_AGE_HOURS` | `48` | How far back automatic deposits look for a payment |
 
 Back up regularly: `data/shop.db` holds all products, balances and orders. Use
 `python -m shopbot.backup` (safe while the bot runs; `--list` and `--restore FILE` too)

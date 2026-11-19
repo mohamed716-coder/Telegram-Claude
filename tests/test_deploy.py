@@ -567,6 +567,92 @@ def test_install_sh_takes_an_offered_token_only_when_telegram_accepts_it():
     assert decide("revoked-server", "good-secret", seen=True) == ("good-secret", False)
 
 
+@needs_ssh
+def test_the_binance_secrets_are_hidden_checked_and_never_stop_the_deploy(tmp_path):
+    key, secret = "K" * 64, "S" * 64
+    done = run_ci_deploy(tmp_path, GITHUB_ACTIONS="true", VPS_HOST="127.0.0.1", VPS_PORT="1",
+                         VPS_PASSWORD="pw", BINANCE_API_KEY=f" {key}\n", BINANCE_API_SECRET=f"'{secret}'")
+    masks = {line.split("::", 2)[2] for line in done.stdout.splitlines()
+             if line.startswith("::add-mask::")}
+    assert {key, secret} <= masks  # the trimmed copies are hidden too
+    assert "Binance" not in done.stderr and "Can't reach the server" in done.stderr
+    done = run_ci_deploy(tmp_path, VPS_HOST="127.0.0.1", VPS_PORT="1", VPS_PASSWORD="pw",
+                         BINANCE_API_KEY="my key", BINANCE_API_SECRET=secret)
+    assert "don't look like a Binance API key" in done.stderr and "Can't reach the server" in done.stderr
+    done = run_ci_deploy(tmp_path, VPS_HOST="127.0.0.1", VPS_PORT="1", VPS_PASSWORD="pw",
+                         BINANCE_API_SECRET=secret)
+    assert "BINANCE_API_KEY isn't, so neither is used" in done.stderr
+    done = run_ci_deploy(tmp_path, VPS_HOST="127.0.0.1", VPS_PORT="1", VPS_PASSWORD="pw",
+                         BINANCE_API_KEY="OFF")
+    assert "Binance" not in done.stderr  # "off" is a valid choice: automatic deposits off
+
+
+def test_the_binance_key_travels_to_dotenv_on_the_server():
+    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
+    assert "BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}" in workflow
+    assert "BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}" in workflow
+    upload = (ROOT / "deploy" / "ci-deploy.sh").read_text()
+    assert "code.bundle remote.sh token binance |" in upload and 'rm -f "$work/token" "$work/binance"' in upload
+    remote = (ROOT / "deploy" / "ci-remote.sh").read_text()
+    assert '"$here/token" "$here/binance"; rmdir' in remote  # removed however it ends
+    assert remote.index('rm -f "$here/token" "$here/binance"') < remote.index("git init")  # at once
+    assert 'export OFFERED_BINANCE_API_KEY="$binance_key"' in remote
+    assert "-m shopbot.binance --check" in remote
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
+def test_install_sh_saves_the_offered_binance_key_in_dotenv(tmp_path):
+    text = (ROOT / "deploy" / "install.sh").read_text()
+    function = text[text.index("save_binance_key() ("):text.index("ask_token() {")]
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable)
+    env_file = tmp_path / ".env"
+    key, secret = "A" * 64, "B" * 64
+
+    def save(offered_key, offered_secret=""):
+        script = function + 'save_binance_key "$1" "$2"\n'
+        env = {"PATH": os.environ["PATH"], "ENV_FILE": str(env_file), "VENV": str(tmp_path / "venv"),
+               "APP_DIR": str(ROOT)}
+        done = subprocess.run(["bash", "-c", script, "save", offered_key, offered_secret], env=env,
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip()
+
+    env_file.write_text("BOT_TOKEN=123:abc\nBINANCE_API_KEY=old\nOWNER_ID=1\nexport BINANCE_API_KEY=older\n")
+    assert "Saved the Binance API key" in save(key, secret)
+    lines = env_file.read_text().splitlines()
+    assert lines == ["BOT_TOKEN=123:abc", "OWNER_ID=1", f"BINANCE_API_KEY={key}", f"BINANCE_API_SECRET={secret}"]
+    assert save(key, secret) == ""  # the same key again: nothing to do
+    assert "doesn't look right" in save("short", secret)
+    assert env_file.read_text().splitlines()[-2:] == [f"BINANCE_API_KEY={key}", f"BINANCE_API_SECRET={secret}"]
+    assert "Took the Binance API key out" in save("off")
+    assert env_file.read_text().splitlines() == ["BOT_TOKEN=123:abc", "OWNER_ID=1"]
+    assert save("off") == ""  # already off
+
+
+def test_the_deploy_log_turns_the_servers_binance_check_into_warnings(tmp_path):
+    text = (ROOT / "deploy" / "ci-deploy.sh").read_text()
+    block = text[text.index("check=\"$(sed -n"):text.index("running=\"$(sed -n")]
+
+    def warnings(*lines):
+        (tmp_path / "install.log").write_text("".join(f"{line}\n" for line in lines))
+        script = ('note() { echo "NOTE: $*"; }\nBINANCE_GUIDE=guide\nwork="$WORK"\n' + block)
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env={"PATH": os.environ["PATH"], "WORK": str(tmp_path)})
+        return [line[6:] for line in done.stdout.splitlines() if line.startswith("NOTE: ")]
+
+    assert warnings("==> On the server now:", "  Binance check: Binance: the key works from this server; 2 Pay payment(s) received in the last 7 days are visible.") == []
+    assert warnings("  Binance check: Binance: no API key set (BINANCE_API_KEY and BINANCE_API_SECRET), so deposits are checked by hand.") == []
+    assert warnings() == []  # an older server script: no check at all
+    (refused,) = warnings("  Binance check: Binance: Binance refused the API key (Invalid API-key).")
+    assert refused.startswith("Automatic deposits don't work: Binance refused the API key (Invalid API-key).")
+    assert refused.endswith("every deposit comes to you to approve (guide).")
+    assert warnings("  Binance check: Binance: the key works from this server; 0 Pay payment(s).",
+                    "  Binance check: WARNING: this key belongs to Binance ID 1, but ...") == [
+        "Binance key: this key belongs to Binance ID 1, but ..."]
+
+
 def test_the_workflow_deploys_only_the_servers_branch_one_at_a_time():
     yaml = pytest.importorskip("yaml")
     flow = yaml.safe_load(WORKFLOW.read_text())

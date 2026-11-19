@@ -20,6 +20,8 @@ from . import lock
 from .config import ConfigError, Settings
 from .db import Database
 from .handlers import register_handlers
+from .binance import BinancePay
+from .handlers.autopay import check_at_start
 from .handlers.broadcast import resume_broadcasts
 from .handlers.common import setup_bot_profile
 from .ratelimit import ShopRateLimiter
@@ -57,6 +59,9 @@ async def _post_stop(app: Application) -> None:
     task = app.bot_data.pop("token_watch", None)
     if task is not None:
         task.cancel()
+    client = app.bot_data.get("binance")
+    if client is not None:
+        await client.close()
     # Broadcasts notice the stop within a second and save how far they got.
     busy = [t for t in app.bot_data.get("broadcast_tasks", ()) if not t.done()]
     if busy:
@@ -75,6 +80,8 @@ async def _post_init(app: Application) -> None:
     await setup_bot_profile(app)
     app.bot_data["token_watch"] = asyncio.create_task(_watch_token(app))
     resume_broadcasts(app)  # a broadcast (or noted new stock) that a restart interrupted
+    if app.bot_data.get("binance") is not None:  # tell the owner if the key doesn't work
+        app.bot_data["binance_check"] = asyncio.create_task(check_at_start(app), name="binance-check")
     log.info("Bot @%s is running. Owner ID: %s", app.bot.username, app.bot_data["settings"].owner_id)
 
 
@@ -96,6 +103,11 @@ def build_application(
     app = builder.build()
     app.bot_data["db"] = Database(settings.db_path, settings.owner_id)
     app.bot_data["settings"] = settings
+    # Deposits are checked automatically with a read-only Binance key, if there is one.
+    app.bot_data["binance"] = (
+        BinancePay(settings.binance_api_key, settings.binance_api_secret)
+        if settings.binance_auto else None
+    )
     register_handlers(app)
     return app
 
@@ -110,14 +122,19 @@ def _report_while_offline() -> None:
 
 
 class _HideToken(logging.Formatter):
-    """Keep the bot token out of the logs (Telegram's error messages can contain it)."""
+    """Keep the bot token (and the Binance key) out of the logs: Telegram's error messages
+    can contain the token."""
 
-    def __init__(self, fmt: str, token: str) -> None:
+    def __init__(self, fmt: str, token: str, *others: str) -> None:
         super().__init__(fmt)
-        self.token = token
+        self.secrets = [(token, "<BOT_TOKEN>")] + [(s, "<SECRET>") for s in others if s]
 
     def format(self, record: logging.LogRecord) -> str:
-        return super().format(record).replace(self.token, "<BOT_TOKEN>")
+        text = super().format(record)
+        for secret, mask in self.secrets:
+            if secret:
+                text = text.replace(secret, mask)
+        return text
 
 
 def _fail(code: int, message: str) -> NoReturn:
@@ -142,7 +159,8 @@ def main() -> None:
             ".env file (BOT_TOKEN=123456:ABC...) or in the BOT_TOKEN environment variable.",
         )
     for handler in logging.getLogger().handlers:
-        handler.setFormatter(_HideToken(LOG_FORMAT, settings.bot_token))
+        handler.setFormatter(_HideToken(LOG_FORMAT, settings.bot_token,
+                                        settings.binance_api_key, settings.binance_api_secret))
     if not TOKEN_RE.fullmatch(settings.bot_token):
         _fail(
             EXIT_CONFIG,
