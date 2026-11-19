@@ -1,0 +1,4 @@
+# Shell scripts must keep Unix line endings, even when cloned on Windows,
+# or they fail inside Linux servers and containers.
+*.sh text eol=lf
+Dockerfile text eol=lf

@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Install (or update) the Telegram shop bot as a service on an Ubuntu or Debian server.
+#
+#   cd Telegram-Claude
+#   sudo bash deploy/install.sh              install, or update after "git pull"
+#   sudo bash deploy/install.sh --uninstall  remove the service (keeps your data)
+#
+# The bot then starts by itself when the server boots and restarts if it crashes.
+# A backup of the database is made every night (data/backups, the newest 14 are kept).
+# Running this again is safe: it never deletes data/shop.db.
+set -euo pipefail
+
+SERVICE=shopbot
+UNIT_DIR=/etc/systemd/system
+
+say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m==> %s\033[0m\n' "$*" >&2; }
+die() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV="$APP_DIR/.venv"
+ENV_FILE="$APP_DIR/.env"
+
+[ "$(id -u)" -eq 0 ] || die "Run this with sudo:  sudo bash deploy/install.sh"
+[ -f "$APP_DIR/bot.py" ] && [ -f "$APP_DIR/requirements.txt" ] \
+    || die "Run deploy/install.sh from inside the bot's folder."
+
+if [ "${1:-}" = "--uninstall" ]; then
+    systemctl disable --now "$SERVICE.service" "$SERVICE-backup.timer" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$SERVICE.service" "$UNIT_DIR/$SERVICE-backup.service" \
+        "$UNIT_DIR/$SERVICE-backup.timer"
+    systemctl daemon-reload
+    say "The service was removed. Your data is still in $APP_DIR/data."
+    exit 0
+fi
+[ $# -eq 0 ] || die "Unknown option: $1 (use --uninstall, or nothing)"
+
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null \
+    || die "This needs a Linux server that runs systemd (Ubuntu or Debian)."
+case "$APP_DIR" in
+    *[!A-Za-z0-9._/-]*) die "Move the bot to a folder whose path has no spaces or special characters (now: $APP_DIR)." ;;
+esac
+
+# The bot runs as the user who owns the folder (the one who downloaded it).
+RUN_USER="$(stat -c %U "$APP_DIR")"
+RUN_GROUP="$(id -gn "$RUN_USER")"
+as_user() {
+    if [ "$RUN_USER" = root ]; then "$@"; else runuser -u "$RUN_USER" -- "$@"; fi
+}
+if [ "$RUN_USER" = root ]; then
+    warn "The folder belongs to root, so the bot will run as root. That works; a normal user is safer."
+fi
+
+apt_install() {
+    command -v apt-get >/dev/null || die "Please install $* yourself, then run this again."
+    say "Installing $* ..."
+    # A mirror hiccup in "update" shouldn't stop us if the package can still be installed.
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        || warn "apt-get update reported problems; trying to install anyway."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null \
+        || die "Couldn't install $*. Run 'sudo apt-get update', fix what it reports, then run this again."
+}
+
+# ---------------------------------------------------------------- Python
+PY="$(command -v python3 || true)"
+if [ -z "$PY" ]; then
+    apt_install python3 python3-venv
+    PY="$(command -v python3)"
+fi
+"$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
+    || die "Python 3.10 or newer is needed; this server has $("$PY" -V 2>&1)."
+
+if ! { [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip --version >/dev/null 2>&1; }; then
+    rm -rf "$VENV"
+    if ! as_user "$PY" -m venv "$VENV" >/dev/null 2>&1; then
+        rm -rf "$VENV"
+        apt_install python3-venv
+        as_user "$PY" -m venv "$VENV"
+    fi
+fi
+chown -R "$RUN_USER:$RUN_GROUP" "$VENV"
+say "Installing the bot's Python packages ..."
+(cd "$APP_DIR" && as_user "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
+    -r requirements.txt)
+
+# ----------------------------------------------------------------- token
+token_in_env_file() {  # the token written in .env (not from the environment)
+    env -u BOT_TOKEN -u TELEGRAM_BOT_TOKEN PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - "$APP_DIR" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from shopbot.config import PROJECT_ROOT, load_dotenv
+load_dotenv(PROJECT_ROOT / ".env")
+print((os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip())
+PY
+}
+
+check_token() {  # prints @username; exit 2 = Telegram rejected it, 3 = couldn't ask Telegram
+    TOKEN="$1" PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+url = "https://api.telegram.org/bot%s/getMe" % os.environ["TOKEN"]
+try:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        print("@" + json.load(response)["result"]["username"])
+except urllib.error.HTTPError as exc:
+    sys.exit(2 if exc.code in (401, 404) else 3)
+except Exception:
+    sys.exit(3)
+PY
+}
+
+save_token() {  # write BOT_TOKEN=... into .env, keeping every other line
+    umask 077
+    [ -f "$ENV_FILE" ] || cp "$APP_DIR/.env.example" "$ENV_FILE"
+    ENV_FILE="$ENV_FILE" TOKEN="$1" PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" - <<'PY'
+import os, re
+path, token = os.environ["ENV_FILE"], os.environ["TOKEN"]
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+key = re.compile(r"^\s*(export\s+)?(BOT_TOKEN|TELEGRAM_BOT_TOKEN)\s*=")
+out, done = [], False
+for line in lines:
+    if key.match(line):
+        if not done:
+            out.append("BOT_TOKEN=" + token)
+            done = True
+        continue
+    out.append(line)
+if not done:
+    out.insert(0, "BOT_TOKEN=" + token)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(out) + "\n")
+PY
+}
+
+ask_token() {
+    ( exec </dev/tty ) 2>/dev/null \
+        || die "Put the bot token in $ENV_FILE as BOT_TOKEN=..., then run this again."
+    printf 'Paste the bot token from @BotFather (looks like 123456789:AAH...) and press Enter:\n> ' >/dev/tty
+    IFS= read -r token </dev/tty || die "No token entered."
+    token="$(printf '%s' "$token" | tr -d "[:space:]\"'")"
+}
+
+file_token="$(token_in_env_file || true)"
+token="${BOT_TOKEN:-$file_token}"
+bot_name=""
+while :; do
+    if ! [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+        [ -z "$token" ] || warn "That doesn't look like a bot token."
+        ask_token
+        continue
+    fi
+    rc=0
+    bot_name="$(check_token "$token")" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        say "Token OK: the bot is $bot_name"
+        break
+    elif [ "$rc" -eq 2 ]; then
+        warn "Telegram says this token is wrong. Copy it again from @BotFather (/mybots -> your bot -> API Token)."
+        token=""
+    else
+        warn "Couldn't reach Telegram to check the token (no internet yet?). Using it anyway."
+        break
+    fi
+done
+[ "$token" = "$file_token" ] || { save_token "$token"; say "Saved the token in $ENV_FILE"; }
+chown "$RUN_USER:$RUN_GROUP" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+# ------------------------------------------------------------------ data
+DATA_DIR="$(cd "$APP_DIR" && PYTHONDONTWRITEBYTECODE=1 as_user "$VENV/bin/python" -c \
+    'import os; from shopbot.config import Settings; print(os.path.dirname(Settings.from_env().db_path))')" \
+    || die "The settings in $ENV_FILE are not valid (see the message above)."
+case "$DATA_DIR" in
+    *[!A-Za-z0-9._/-]*) die "DB_PATH must not contain spaces or special characters (now: $DATA_DIR)." ;;
+esac
+mkdir -p "$DATA_DIR"
+chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
+if [ -f "$DATA_DIR/shop.db" ]; then
+    backup="$(cd "$APP_DIR" && as_user "$VENV/bin/python" -m shopbot.backup)" \
+        && say "Backed up the database first: $backup" \
+        || warn "Couldn't back up the database first (see above). Continuing."
+fi
+
+# -------------------------------------------------------------- services
+say "Setting up the $SERVICE service ..."
+# The bot only needs the internet and its data folder: lock everything else away.
+HARDENING="NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=$DATA_DIR
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077"
+cat >"$UNIT_DIR/$SERVICE.service" <<EOF
+[Unit]
+Description=Telegram shop bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV/bin/python $APP_DIR/bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+# 78 = wrong settings (e.g. BOT_TOKEN): restarting would not help.
+RestartPreventExitStatus=78
+# Finishing a big delivery before stopping can take a few minutes.
+TimeoutStopSec=300
+$HARDENING
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >"$UNIT_DIR/$SERVICE-backup.service" <<EOF
+[Unit]
+Description=Back up the Telegram shop bot database
+
+[Service]
+Type=oneshot
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$APP_DIR
+ExecStart=$VENV/bin/python -m shopbot.backup
+$HARDENING
+EOF
+
+cat >"$UNIT_DIR/$SERVICE-backup.timer" <<EOF
+[Unit]
+Description=Daily backup of the Telegram shop bot database
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --quiet "$SERVICE.service" "$SERVICE-backup.timer"
+systemctl restart "$SERVICE.service"
+systemctl start "$SERVICE-backup.timer"
+
+say "Starting ..."
+sleep 8
+if systemctl is-active --quiet "$SERVICE.service" \
+        && [ "$(systemctl show -p NRestarts --value "$SERVICE.service")" = "0" ]; then
+    say "The bot ${bot_name:+$bot_name }is running. Open it in Telegram and send /start."
+    cat <<EOF
+
+  See what it's doing:   sudo journalctl -u $SERVICE -f
+  Stop / start / restart: sudo systemctl stop|start|restart $SERVICE
+  Update to new code:    git pull && sudo bash deploy/install.sh
+  Backups:               $DATA_DIR/backups (made every night)
+
+EOF
+else
+    warn "The bot did not start properly. Its last messages:"
+    journalctl -u "$SERVICE.service" -n 25 --no-pager >&2 || true
+    exit 1
+fi

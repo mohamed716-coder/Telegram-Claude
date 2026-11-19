@@ -1,0 +1,27 @@
+# Run the bot with Docker:
+#
+#   cp .env.example .env        then put your BOT_TOKEN in .env
+#   docker compose up -d --build
+#   docker compose logs -f      see what it's doing
+#
+# The database lives in the "shop-data" volume (/app/data in the container), so it
+# survives restarts, rebuilds and updates. Run only one copy of the bot at a time.
+services:
+  bot:
+    build: .
+    image: telegram-shop-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - shop-data:/app/data
+    init: true
+    # Finishing a big delivery before stopping can take a few minutes.
+    stop_grace_period: 5m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  shop-data:

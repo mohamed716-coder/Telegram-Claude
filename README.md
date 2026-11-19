@@ -34,8 +34,9 @@ Written in Python with [python-telegram-bot](https://python-telegram-bot.org) 22
    python bot.py
    ```
 
-   Open your bot in Telegram and press **Start**. Keep the program running for the bot to
-   answer (on a server, run it with `systemd`, `screen` or `tmux`).
+   Open your bot in Telegram and press **Start**. The bot answers only while this program
+   runs. To run it 24/7 on a server, see **[DEPLOY.md](DEPLOY.md)**: one command
+   installs it as a service, with nightly backups.
 
 On first run the bot sets its own description ("Press /start to start the shop") and the
 command list shown by the **Menu** button. The owner and admins see their extra commands
@@ -170,7 +171,10 @@ message in ➕ Add Product before you press Done (see above).
 | `SELLER_AUTO_THRESHOLD` | `1000` | Total deposits ($) that make someone a seller |
 | `SUPPORT_CONTACT` | owner's @username | Who customers are told to contact (`@name`, a link, or `none`) |
 
-Back up `data/shop.db` regularly: it holds all products, balances and orders.
+Back up regularly: `data/shop.db` holds all products, balances and orders. Use
+`python -m shopbot.backup` (safe while the bot runs; `--list` and `--restore FILE` too)
+rather than copying the file by hand. On a server set up with `deploy/install.sh` this
+happens every night.
 
 ## Tests
 

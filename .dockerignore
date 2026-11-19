@@ -1,0 +1,13 @@
+# Never bake secrets or data into the image.
+.env
+data/
+*.db
+*.db-*
+# Not needed to run the bot.
+.git
+.venv/
+venv/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/

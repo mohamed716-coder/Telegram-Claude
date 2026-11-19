@@ -6,6 +6,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+class ConfigError(Exception):
+    """A setting in .env or the environment is invalid. The message says which."""
+
+
 DEFAULT_OWNER_ID = 6883493877
 DEFAULT_BINANCE_PAY_ID = "850940840"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +42,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError as exc:
-        raise SystemExit(f"{name} must be a whole number, got {raw!r}") from exc
+        raise ConfigError(f"{name} must be a whole number, got {raw!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ class Settings:
             db_path = PROJECT_ROOT / db_path
         discount = _env_int("SELLER_DISCOUNT_PERCENT", 10)
         if not 0 <= discount <= 100:
-            raise SystemExit("SELLER_DISCOUNT_PERCENT must be between 0 and 100")
+            raise ConfigError("SELLER_DISCOUNT_PERCENT must be between 0 and 100")
         return cls(
             bot_token=token,
             owner_id=_env_int("OWNER_ID", DEFAULT_OWNER_ID),
