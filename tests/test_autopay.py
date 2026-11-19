@@ -423,6 +423,41 @@ def test_cancelling_while_binance_is_asked_tells_nobody_and_sends_nothing(tmp_pa
     run(tmp_path, scenario)
 
 
+def test_the_first_deposit_counts_from_when_the_bot_started_with_the_key(tmp_path):
+    # Automatic checking starts when the bot starts with a key, not at the first check: the
+    # very first customer's payment, made before their check, must be found.
+    async def scenario(t: ShopTest) -> None:
+        started = int(t.db.get_setting("binance_auto_since"))
+        assert started <= int(time.time() * 1000)
+        payment = pay(amount="25", minutes_ago=0)  # after the start, before the check
+        assert payment.time_ms >= started
+        await asyncio.sleep(0.05)
+        t.app.bot_data["binance"] = FakeBinance(payment)
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "Payment received!" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2500
+        assert int(t.db.get_setting("binance_auto_since")) == started
+
+    run(tmp_path, scenario, binance_api_key="k" * 64, binance_api_secret="s" * 64)
+
+
+def test_turning_automatic_checking_off_and_on_again_starts_the_count_afresh(tmp_path):
+    from shopbot.db import Database
+
+    db = Database(str(tmp_path / "shop.db"), OWNER["id"])
+    db.start_binance_auto(True)
+    first = db.get_setting("binance_auto_since")
+    db.start_binance_auto(True)  # a restart: same start
+    assert db.get_setting("binance_auto_since") == first
+    db.start_binance_auto(False)  # started without a key: receipts again
+    assert db.get_setting("binance_auto_since") is None
+    time.sleep(0.01)
+    db.start_binance_auto(True)
+    assert int(db.get_setting("binance_auto_since")) > int(first)
+    db.close()
+
+
 def test_without_a_key_deposits_use_a_receipt_as_before(tmp_path):
     async def scenario(t: ShopTest) -> None:
         register(t, ALICE)

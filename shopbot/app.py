@@ -104,6 +104,7 @@ def build_application(
     app.bot_data["db"] = Database(settings.db_path, settings.owner_id)
     app.bot_data["settings"] = settings
     # Deposits are checked automatically with a read-only Binance key, if there is one.
+    app.bot_data["db"].start_binance_auto(settings.binance_auto)  # payments before don't count
     app.bot_data["binance"] = (
         BinancePay(settings.binance_api_key, settings.binance_api_secret)
         if settings.binance_auto else None

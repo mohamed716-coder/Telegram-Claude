@@ -921,6 +921,15 @@ class Database:
                     return row
         return None
 
+    def start_binance_auto(self, on: bool) -> None:
+        """At start-up. With a Binance key, automatic checking counts from when it was first
+        turned on; without one the count is dropped, so turning it on again starts afresh
+        (payments meanwhile were added by hand from receipts, without their Order IDs)."""
+        if on:
+            self.binance_auto_since()
+        else:
+            self.conn.execute("DELETE FROM settings WHERE key = 'binance_auto_since'")
+
     def binance_auto_since(self) -> int:
         """When automatic checking started (ms since 1970): it never credits an older
         payment (it may have been added by hand before)."""
