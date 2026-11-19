@@ -42,7 +42,8 @@ fi
 
 [ -d /run/systemd/system ] && command -v systemctl >/dev/null \
     || die "This needs a Linux server that runs systemd (Ubuntu 22.04+ or Debian 12+)."
-if command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^shopbot-bot'; then
+# (grep without -q reads all of its input, so docker can't fail with SIGPIPE under pipefail.)
+if command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep '^shopbot-bot' >/dev/null; then
     die "The bot already runs here with Docker (its data is in the Docker volume). Update it with 'git pull && docker compose up -d --build' instead; this installer would start a second, empty copy."
 fi
 case "$APP_DIR" in
@@ -316,12 +317,18 @@ systemctl restart "$SERVICE.service"
 systemctl start "$SERVICE-backup.timer"
 
 say "Starting ..."
+logged_since_start() {  # does the bot's log since the restart contain "$1"?
+    # (Read it all first: "journalctl | grep -q" can fail under pipefail when grep stops early.)
+    local log
+    log="$(journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null || true)"
+    case "$log" in *"$1"*) return 0 ;; esac
+    return 1
+}
 # Wait until the bot says it is connected to Telegram (or stops).
 connected=""
 for _ in $(seq 1 45); do
     sleep 1
-    if journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null \
-            | grep -q "is running. Owner ID"; then
+    if logged_since_start "is running. Owner ID"; then
         connected=yes
         break
     fi
@@ -341,8 +348,7 @@ EOF
 conflict() {  # another copy elsewhere takes the messages (Telegram: Conflict)
     for _ in $(seq 1 15); do  # Telegram reports it within one long-poll (~10 s)
         sleep 1
-        journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null \
-            | grep -q "another copy of this bot is running" && return 0
+        logged_since_start "another copy of this bot is running" && return 0
     done
     return 1
 }

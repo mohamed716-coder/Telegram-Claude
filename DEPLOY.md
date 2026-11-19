@@ -114,7 +114,7 @@ Run these on the server, inside the bot folder (`cd ~/Telegram-Claude`).
 | Make a backup now | `systemctl start shopbot-backup` |
 | List the backups | `.venv/bin/python -m shopbot.backup --list` |
 | New token (after `/revoke` in @BotFather) | `bash deploy/install.sh`: it sees the old one is revoked and asks for the new one |
-| Switch to a different bot | `BOT_TOKEN=paste-the-new-token bash deploy/install.sh` |
+| Switch to a different bot | `BOT_TOKEN=paste-the-new-token bash deploy/install.sh` (as a normal user: `sudo BOT_TOKEN=paste-the-new-token bash deploy/install.sh`) |
 | Remove the service (keeps your data) | `bash deploy/install.sh --uninstall` |
 
 If the screen shows `(END)` or `lines 1-23`, press `q` to get back.
@@ -164,6 +164,9 @@ Do this right after step 4, if the bot already ran on your PC:
 
 ### Keep the server and the shop safe
 
+- **The shop lives in `~/Telegram-Claude/data`** (the database and its backups). Never
+  delete the `Telegram-Claude` folder, and don't download the bot again into a new one
+  to update it: `git pull && bash deploy/install.sh` (above) updates it in place.
 - **Root password:** if it was ever shared, type `passwd` on the server and set a long
   random one (kept in a password manager). Never use your provider's *Rebuild* or
   *Reinstall* button to change it: that erases the server.
@@ -192,6 +195,10 @@ Do this right after step 4, if the bot already ran on your PC:
 | `Could not get lock` | The server is installing its own updates. Wait 5 minutes, then run the command again. |
 | `destination path 'Telegram-Claude' already exists` | The bot is already downloaded: `cd ~/Telegram-Claude && git pull`, then go on with step 4. |
 | `Can't open the database` | The database file is damaged. Restore the newest backup (see *Restore a backup*). |
+| `Can't use the database` / `Can't use the data folder` | The disk may be full: `df -h /` shows it (delete files you don't need, or get a bigger disk). Or the files belong to another user: run `bash deploy/install.sh` again. |
+| `git pull`: `Permission denied (publickey)` | The server's key was removed on GitHub. Do step 2 again (it shows the same key), add it on GitHub, then `git pull`. |
+| `git pull`: `would be overwritten` | A code file was changed on the server. `git stash && git pull` puts that change aside. The shop itself (`data`, `.env`) is never touched by `git`. |
+| `git pull`: `no such ref was fetched` | The code moved to the `main` branch: `git checkout main && git pull`. |
 | The bot doesn't answer | `journalctl -u shopbot -n 30 --no-pager` shows why. |
 
 ---

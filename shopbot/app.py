@@ -146,9 +146,12 @@ def main() -> None:
     lock_path = Path(settings.db_path).parent / lock.LOCK_NAME
     try:
         instance = lock.acquire(lock_path)
-    except OSError as exc:
+    except PermissionError as exc:
         _fail(EXIT_CONFIG, f"Can't use the data folder {lock_path.parent}: {exc}. "
                            "Run the bot as the user who owns that folder.")
+    except OSError as exc:  # e.g. a full disk: may go away, so let the service retry
+        _fail(1, f"Can't use the data folder {lock_path.parent}: {exc}. Is the disk full? "
+                 "The bot is started again automatically if it runs as a service.")
     if instance is None:
         pid = lock.holder(lock_path)
         _fail(
@@ -176,10 +179,15 @@ def main() -> None:
             "Telegram rejected BOT_TOKEN. Copy the token again from @BotFather "
             "(/mybots → your bot → API Token) and put it in .env (or your host's variables).",
         )
-    except sqlite3.DatabaseError as exc:
+    except sqlite3.OperationalError as exc:  # can't open or write it (owner, full disk...)
+        _fail(1, f"Can't use the database {settings.db_path} ({exc}). Check that the disk isn't "
+                 "full and that the bot's user owns the data folder (on a server, running "
+                 "deploy/install.sh again fixes the owner). The bot is started again "
+                 "automatically if it runs as a service.")
+    except sqlite3.DatabaseError as exc:  # the file itself is damaged or not a database
         _fail(
             EXIT_CONFIG,
-            f"Can't open the database {settings.db_path} ({exc}). If it is damaged, restore the "
+            f"Can't open the database {settings.db_path} ({exc}). It looks damaged: restore the "
             "newest backup (DEPLOY.md: Restore a backup).",
         )
     except NetworkError as exc:  # only reaches here while starting; polling retries itself

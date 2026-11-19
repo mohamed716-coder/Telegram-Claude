@@ -4,6 +4,7 @@ that tell a service manager (systemd, Docker) whether restarting makes sense."""
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -425,6 +426,43 @@ def test_a_damaged_database_at_start_says_how_to_fix_it_and_is_not_restarted(cle
     (clean_env / "data" / "shop.db").write_bytes(b"\x13garbage" * 1024)
     assert run_main() == 78
     assert "Can't open the database" in caplog.text and "restore the newest backup" in caplog.text
+
+
+@pytest.mark.parametrize("error", ["attempt to write a readonly database",
+                                   "database or disk is full", "unable to open database file"])
+def test_a_database_it_cannot_write_is_retried_not_called_damaged(clean_env, monkeypatch, caplog, error):
+    # A wrong owner or a full disk can be fixed without a restore, and once it is (e.g. by
+    # freeing space) the service must come back by itself: exit 1, not 78.
+    monkeypatch.setenv("BOT_TOKEN", GOOD_TOKEN)
+    monkeypatch.setattr(app_module, "build_application",
+                        lambda s: FakeApp(sqlite3.OperationalError(error)))
+    assert run_main() == 1
+    assert "Can't use the database" in caplog.text and "disk isn't full" in caplog.text
+    assert "restore" not in caplog.text
+
+
+@pytest.mark.parametrize("error, code, expected", [
+    (PermissionError(13, "Permission denied"), 78, "Run the bot as the user who owns"),
+    (OSError(28, "No space left on device"), 1, "Is the disk full?"),
+])
+def test_a_data_folder_problem_at_start_exits_the_right_way(clean_env, monkeypatch, caplog, error, code, expected):
+    monkeypatch.setenv("BOT_TOKEN", GOOD_TOKEN)
+
+    def fail(path):
+        raise error
+
+    monkeypatch.setattr(lock, "acquire", fail)
+    assert run_main() == code
+    assert "Can't use the data folder" in caplog.text and expected in caplog.text
+
+
+def test_the_installer_never_stops_reading_a_pipe_early():
+    # Under "set -o pipefail", "producer | grep -q" fails when grep exits on the first
+    # match and the producer gets SIGPIPE: the check then says "not found" by mistake.
+    text = (ROOT / "deploy" / "install.sh").read_text()
+    assert "pipefail" in text
+    code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert not [line for line in code if re.search(r"\|\s*grep\s+(-\w*q|--quiet)", line)]
 
 
 def test_a_later_line_in_dotenv_wins_like_in_a_shell(clean_env, monkeypatch):
