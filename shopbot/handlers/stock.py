@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -320,12 +321,15 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
     query = update.callback_query
     state = get_state(context)
     if state is None or state.get("name") != "add_items":
-        await answer(
-            query,
-            "There is nothing to save. If you had sent products, they were not saved (Add Product "
-            "was stopped, or the bot restarted): open ➕ Add Product and send them again.",
-            show_alert=True,
-        )
+        saved_at = (context.user_data or {}).get("saved_at", 0.0)
+        if time.monotonic() - saved_at < 600:  # e.g. Done pressed twice
+            text = "There is nothing to save. Your products are already saved."
+        else:
+            text = (
+                "There is nothing to save. If you had sent products, they were not saved (Add "
+                "Product was stopped, or the bot restarted): open ➕ Add Product and send them again."
+            )
+        await answer(query, text, show_alert=True)
         return
     user_id = query.from_user.id
     if not is_staff(context, user_id):
@@ -347,6 +351,7 @@ async def cb_add_done(update: Update, context: Ctx) -> None:
     # Saved. Telegram errors from here on must not look like "nothing was saved".
     clear_state(context)
     _remember_saved(context, state.get("msg_ids") or [], codes)
+    context.user_data["saved_at"] = time.monotonic()  # type: ignore[index]
     await answer(query, f"✅ Saved {len(codes)}")
     await _drop_status_message(update, context, state)
     label = db.get_label(label_id)

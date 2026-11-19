@@ -20,6 +20,7 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
     env_file = Path(path)
     if not env_file.is_file():
         return
+    values: dict[str, str] = {}  # a later line wins, like in a shell
     for raw in env_file.read_text(encoding="utf-8-sig").splitlines():  # -sig: Windows BOM
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -32,7 +33,9 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         if key:
-            os.environ.setdefault(key, value)
+            values[key] = value
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
 
 
 def _default_db_path() -> str:

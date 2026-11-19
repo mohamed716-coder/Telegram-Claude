@@ -2,9 +2,11 @@
 
 The bot has to run on a computer that is always on and online. Two things matter:
 
-- **Keep its files.** Every balance, product and order is in one file, `data/shop.db`.
-  Hosts whose disk is wiped on every restart (for example free "web service" plans) would
-  lose your shop. The options below all keep it.
+- **Keep its files.** Every balance, product and order is in the `data` folder
+  (`data/shop.db`). Hosts whose disk is wiped on every restart (for example free "web
+  service" plans) would lose your shop. The options below all keep it. To copy the shop
+  anywhere, use a backup made by the bot (below), never `shop.db` itself: while the bot
+  runs, its newest changes are in a second file next to it.
 - **Run one copy only.** Two copies with the same token fight over messages
   (Telegram answers *409 Conflict*). If the bot runs on your PC, stop it there before
   starting it on a server.
@@ -27,6 +29,11 @@ root; logged in as a normal user, put `sudo` in front of `apt-get`, `systemctl`,
 `journalctl` and `bash deploy/install.sh` (never in front of `git` or `.venv/bin/python`),
 and use your user name instead of `root` in `scp`.
 
+> **Were your root password or bot token ever sent in a chat, email or message?** Then
+> do this first. In @BotFather send `/revoke`, choose the bot, and keep the new token for
+> step 4. Right after logging in (step 1), type `passwd` and set a new long password
+> (20+ random characters, kept in a password manager).
+
 ### 1. Log in to the server
 
 - **Windows 10/11:** press the Windows key, type `PowerShell`, press Enter. Then type
@@ -47,15 +54,15 @@ The repository is private, so the server needs its own read-only key. Paste this
 command):
 
 ```bash
-apt-get -o DPkg::Lock::Timeout=600 update && \
-apt-get -o DPkg::Lock::Timeout=600 install -y git && \
+{ command -v git >/dev/null || { apt-get update && apt-get -o DPkg::Lock::Timeout=600 install -y git; }; } && \
 mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
 { [ -f ~/.ssh/shopbot_deploy ] || ssh-keygen -t ed25519 -N "" -C "shop-server" -f ~/.ssh/shopbot_deploy; } && \
 cat ~/.ssh/shopbot_deploy.pub
 ```
 
-(On a brand-new server this can wait a few minutes while the server installs its own
-updates.) It ends by printing one line starting with `ssh-ed25519`. Copy that whole line,
+It ends by printing one line starting with `ssh-ed25519`. (If it says `Could not get lock`
+instead, the new server is still installing its own updates: wait 5 minutes and paste it
+again.) Copy that whole line,
 then on GitHub open the repository → **Settings** → **Deploy keys** → **Add deploy key**
 (direct link: <https://github.com/mohamed716-coder/Telegram-Claude/settings/keys/new>).
 Title: `shop server`; Key: paste the line; leave **Allow write access** unticked (the server
@@ -140,7 +147,9 @@ systemctl stop shopbot; .venv/bin/python -m shopbot.backup --restore data/backup
 ```
 
 The bot starts again even if the restore fails, and the database you had before is kept
-as a backup too.
+too (as `before-restore-....db`). **A restore turns the shop back to that moment:** deposits,
+orders and products added since then are gone, and products sold since then are for sale
+again. So pick the newest good backup.
 
 ### Moving an existing shop to the server
 
@@ -153,14 +162,23 @@ Do this right after step 4, if the bot already ran on your PC:
 3. On the server, with the file's real name:
    `cd ~/Telegram-Claude && systemctl stop shopbot; .venv/bin/python -m shopbot.backup --restore ~/shop-....db; systemctl start shopbot`
 
-### Keep the server safe
+### Keep the server and the shop safe
 
-- **Change the root password** if it was ever shared (for example in a chat or email):
-  type `passwd` on the server and choose a long new one.
-- Better still, log in with an SSH key instead of a password; your provider's panel
-  usually lets you add one.
-- If the bot token was ever shared, get a new one: in @BotFather send `/revoke`, choose
-  the bot, then run `bash deploy/install.sh` and paste the new token when it asks.
+- **Root password:** if it was ever shared, type `passwd` on the server and set a long
+  random one (kept in a password manager). Never use your provider's *Rebuild* or
+  *Reinstall* button to change it: that erases the server.
+- **Bot token:** if it was ever shared, in @BotFather send `/revoke`, choose the bot,
+  then run `bash deploy/install.sh` and paste the new token when it asks.
+- **Your Telegram account** controls the shop (owner panel, @BotFather): turn on
+  *Settings → Privacy and Security → Two-Step Verification*.
+- **Backups off the server:** turn on your provider's automatic backups or snapshots
+  in its panel, and now and then copy the backups to your computer (above). They hold
+  your unsold products and customers' data: don't send them to anyone.
+- **Updates:** Ubuntu installs security updates by itself. If you see
+  `*** System restart required ***` when you log in, type `reboot`: the bot starts again
+  by itself within a minute. `git pull && bash deploy/install.sh` also updates the
+  bot's own packages.
+- **Is it alive?** Send `/start` to the bot now and then; if it doesn't answer, see below.
 - If you stop using a server, delete its key on GitHub (repository → Settings → Deploy keys).
 
 ### If something goes wrong
@@ -168,11 +186,12 @@ Do this right after step 4, if the bot already ran on your PC:
 | You see | What to do |
 |---|---|
 | `Telegram rejected BOT_TOKEN` | The token is wrong or was revoked. Run `bash deploy/install.sh` and paste the right token from @BotFather (`/mybots` → your bot → *API Token*). |
-| `another copy of this bot is running (Conflict)` | Another copy runs somewhere (your PC, an old server). Stop that one. |
+| `another copy of this bot is running` | Another copy runs somewhere (your PC, an old server). Stop that one. If none of yours runs anywhere, someone else has your token: `/revoke` it in @BotFather, then `bash deploy/install.sh`. |
 | `Another copy of the bot is already running` | You started `python bot.py` by hand while the service runs. Use `systemctl restart shopbot` instead. |
 | `Still trying to reach Telegram` / `Can't reach Telegram` | The server has no internet right now. The bot keeps trying by itself. |
 | `Could not get lock` | The server is installing its own updates. Wait 5 minutes, then run the command again. |
 | `destination path 'Telegram-Claude' already exists` | The bot is already downloaded: `cd ~/Telegram-Claude && git pull`, then go on with step 4. |
+| `Can't open the database` | The database file is damaged. Restore the newest backup (see *Restore a backup*). |
 | The bot doesn't answer | `journalctl -u shopbot -n 30 --no-pager` shows why. |
 
 ---

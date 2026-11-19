@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -174,6 +175,12 @@ def main() -> None:
             EXIT_CONFIG,
             "Telegram rejected BOT_TOKEN. Copy the token again from @BotFather "
             "(/mybots → your bot → API Token) and put it in .env (or your host's variables).",
+        )
+    except sqlite3.DatabaseError as exc:
+        _fail(
+            EXIT_CONFIG,
+            f"Can't open the database {settings.db_path} ({exc}). If it is damaged, restore the "
+            "newest backup (DEPLOY.md: Restore a backup).",
         )
     except NetworkError as exc:  # only reaches here while starting; polling retries itself
         _fail(1, f"Couldn't reach Telegram ({exc}). Check the internet connection; "

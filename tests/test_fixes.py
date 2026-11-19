@@ -700,3 +700,16 @@ def test_stopping_cuts_a_long_delivery_short_and_leaves_the_rest_for_my_orders(t
         t.db.close()
 
     asyncio.run(main())
+
+
+def test_pressing_done_twice_says_the_products_are_already_saved(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/5GB", 950)
+        await t.press(OWNER, f"ap:{five}:0")
+        await t.send(OWNER, "CODE-1")
+        await t.press(OWNER, "apd")
+        calls = await t.press(OWNER, "apd")
+        assert "already saved" in t.alert(calls) and "not saved" not in t.alert(calls)
+        assert t.db.count_items(five) == 1
+
+    run(tmp_path, scenario)

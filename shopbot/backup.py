@@ -37,6 +37,10 @@ class BackupError(Exception):
     """Something the user can fix; the message says what."""
 
 
+class DiskSpaceError(BackupError):
+    """Not enough free disk space; nothing was changed."""
+
+
 def _stamp() -> str:
     # UTC time with microseconds: names sort in the order the backups were made.
     return f"{datetime.now(timezone.utc):%Y-%m-%d_%H-%M-%S_%f}"
@@ -107,29 +111,36 @@ def _clean_leftovers(backup_dir: Path) -> None:
             pass
 
 
+def _db_size(db_path: Path) -> int:
+    return sum(Path(f"{db_path}{s}").stat().st_size
+               for s in ("", "-wal") if Path(f"{db_path}{s}").exists())
+
+
 def _ensure_space(folder: Path, needed: int) -> None:
     free = shutil.disk_usage(folder).free
     if free < needed + SPARE_SPACE:
-        raise BackupError(
+        raise DiskSpaceError(
             f"Not enough free disk space for a backup in {folder} "
             f"({free // 2**20} MB free, about {(needed + SPARE_SPACE) // 2**20} MB needed). "
             "Free some space first."
         )
 
 
-def make_backup(db_path: Path, backup_dir: Path, keep: int = DEFAULT_KEEP) -> Path:
-    """Copy the database into ``backup_dir`` and drop all but the newest ``keep``."""
+def make_backup(
+    db_path: Path, backup_dir: Path, keep: int = DEFAULT_KEEP, prefix: str = PREFIX
+) -> Path:
+    """Copy the database into ``backup_dir`` and drop all but the newest ``keep``
+    regular backups. A different ``prefix`` makes a copy that is never pruned."""
     if not db_path.is_file():
         raise BackupError(f"There is no database at {db_path} yet.")
     if not backup_dir.is_dir():
         backup_dir.mkdir(parents=True)
         _adopt_owner(backup_dir, db_path.parent)
     _clean_leftovers(backup_dir)
-    wal = Path(f"{db_path}-wal")
-    _ensure_space(backup_dir, db_path.stat().st_size + (wal.stat().st_size if wal.exists() else 0))
-    target = backup_dir / f"{PREFIX}{_stamp()}.db"
+    _ensure_space(backup_dir, _db_size(db_path))
+    target = backup_dir / f"{prefix}{_stamp()}.db"
     while target.exists():  # practically never: same microsecond
-        target = backup_dir / f"{PREFIX}{_stamp()}.db"
+        target = backup_dir / f"{prefix}{_stamp()}.db"
     partial = target.with_name(target.name + ".partial")
     _remove_with_sidecars(partial)
     try:
@@ -137,6 +148,8 @@ def make_backup(db_path: Path, backup_dir: Path, keep: int = DEFAULT_KEEP) -> Pa
     except sqlite3.DatabaseError as exc:
         raise BackupError(f"Couldn't back up {db_path}: {exc}") from exc
     partial.replace(target)
+    if os.name != "nt":
+        os.chmod(target, 0o600)  # customer data: only the bot's user may read it
     _adopt_owner(target, db_path.parent)
     if keep > 0:
         for old in list_backups(backup_dir)[:-keep]:
@@ -185,6 +198,8 @@ def restore(backup_file: Path, db_path: Path, backup_dir: Path) -> Optional[Path
     _adopt_owner(lock_path, db_path.parent)
     partial = db_path.with_name(db_path.name + ".restoring")
     try:
+        # Room for the new copy and for keeping the current database, or change nothing.
+        _ensure_space(db_path.parent, _db_size(backup_file) + (_db_size(db_path) if db_path.exists() else 0))
         # 1. A complete, checked copy of the backup, made from a private copy of it, so
         #    changes still in its -wal file come along and the original isn't touched.
         _remove_with_sidecars(partial)
@@ -202,7 +217,9 @@ def restore(backup_file: Path, db_path: Path, backup_dir: Path) -> Optional[Path
         safety = None
         if db_path.exists():
             try:
-                safety = make_backup(db_path, backup_dir, keep=0)
+                safety = make_backup(db_path, backup_dir, keep=0, prefix="before-restore-")
+            except DiskSpaceError:
+                raise
             except BackupError:  # damaged: that's usually why someone restores
                 safety = _keep_damaged(db_path, backup_dir)
         # 3. Swap the copy in. An old -wal file must not be applied to it.
@@ -242,10 +259,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"{path}  ({path.stat().st_size // 1024} KB)")
             if not backups:
                 print(f"No backups in {backup_dir} yet.")
+            others = sorted(p for p in backup_dir.glob("*.db") if p.is_file() and p not in backups) \
+                if backup_dir.is_dir() else []
+            if others:
+                print("Kept from restores (never deleted automatically):")
+                for path in others:
+                    print(f"  {path}")
             return 0
         if args.restore:
             safety = restore(args.restore, db_path, backup_dir)
             print(f"Restored {args.restore} to {db_path}.")
+            print("Everything after that backup was made is undone: deposits, orders and products "
+                  "added since then are gone, and products sold since then are for sale again.")
             if safety is not None:
                 print(f"The database you had before is saved as {safety}.")
             print("Start the bot again now.")

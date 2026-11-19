@@ -42,6 +42,9 @@ fi
 
 [ -d /run/systemd/system ] && command -v systemctl >/dev/null \
     || die "This needs a Linux server that runs systemd (Ubuntu 22.04+ or Debian 12+)."
+if command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^shopbot-bot'; then
+    die "The bot already runs here with Docker (its data is in the Docker volume). Update it with 'git pull && docker compose up -d --build' instead; this installer would start a second, empty copy."
+fi
 case "$APP_DIR" in
     *[!A-Za-z0-9._/-]*) die "Move the bot to a folder whose path has no spaces or special characters (now: $APP_DIR)." ;;
 esac
@@ -89,8 +92,9 @@ if ! { [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip --version >/dev/nu
 fi
 chown -R "$RUN_USER:$RUN_GROUP" "$VENV"
 say "Installing the bot's Python packages ..."
+# --upgrade: every run (e.g. an update) also brings their security fixes.
 (cd "$APP_DIR" && as_user "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
-    -r requirements.txt)
+    --upgrade --upgrade-strategy eager -r requirements.txt)
 
 # ----------------------------------------------------------------- token
 token_in_env_file() {  # the token written in .env (not from the environment)
@@ -215,6 +219,7 @@ if [ -d "$DATA_DIR" ]; then  # it gets chown'ed and made writable: it must be th
 fi
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
+chmod 700 "$DATA_DIR"  # customer data: only the bot's user may look inside
 if [ -f "$DB_FILE" ]; then  # a safety copy before changing anything (own folder: 5 kept)
     backup="$(cd "$APP_DIR" && as_user "$VENV/bin/python" -m shopbot.backup \
         --dir "$DATA_DIR/backups/before-update" --keep 5)" \
@@ -306,6 +311,7 @@ systemctl daemon-reload
 systemctl enable --quiet "$SERVICE.service" "$SERVICE-backup.timer"
 systemctl reset-failed "$SERVICE.service" 2>/dev/null || true
 started_at="$(date +%s)"
+say "Restarting the bot (if it is sending an order right now, this can take up to 2 minutes) ..."
 systemctl restart "$SERVICE.service"
 systemctl start "$SERVICE-backup.timer"
 
@@ -336,13 +342,14 @@ conflict() {  # another copy elsewhere takes the messages (Telegram: Conflict)
     for _ in $(seq 1 15); do  # Telegram reports it within one long-poll (~10 s)
         sleep 1
         journalctl -u "$SERVICE.service" --since "@$started_at" -o cat --no-pager 2>/dev/null \
-            | grep -q "(Conflict)" && return 0
+            | grep -q "another copy of this bot is running" && return 0
     done
     return 1
 }
 if [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service" && conflict; then
     warn "The bot runs here, but another copy of it is running somewhere else (your PC, another"
-    warn "server, Docker...). Stop that copy, or customers' messages go to the wrong one."
+    warn "server, Docker...). Stop that copy, or customers' messages go to the wrong one. If no"
+    warn "other copy of yours runs anywhere, someone else has your token: /revoke it in @BotFather."
     help_text
 elif [ -n "$connected" ] && systemctl is-active --quiet "$SERVICE.service"; then
     say "The bot ${bot_name:+$bot_name }is running. Open it in Telegram and send /start."

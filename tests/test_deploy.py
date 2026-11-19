@@ -395,3 +395,39 @@ def test_a_dotenv_saved_with_a_windows_byte_order_mark_still_works(clean_env, mo
     monkeypatch.delenv("DB_PATH", raising=False)
     settings = config.Settings.from_env()
     assert (settings.bot_token, settings.owner_id) == ("abc123", 42)
+
+
+def test_restore_with_too_little_disk_space_changes_nothing(tmp_path, monkeypatch):
+    db_path = tmp_path / "shop.db"
+    make_shop(db_path).close()
+    good = backup.make_backup(db_path, tmp_path / "b")
+    before = db_path.read_bytes()
+    monkeypatch.setattr(backup.shutil, "disk_usage", lambda p: type("U", (), {"free": 1024})())
+    with pytest.raises(backup.DiskSpaceError):
+        backup.restore(good, db_path, tmp_path / "b")
+    assert db_path.read_bytes() == before
+    assert [p.name for p in (tmp_path / "b").iterdir()] == [good.name]  # no "damaged" copy
+
+
+def test_copies_kept_by_a_restore_do_not_push_out_regular_backups(tmp_path):
+    db_path = tmp_path / "shop.db"
+    make_shop(db_path).close()
+    regular = [backup.make_backup(db_path, tmp_path / "b", keep=3) for _ in range(3)]
+    for _ in range(3):
+        backup.restore(regular[-1], db_path, tmp_path / "b")
+    assert backup.list_backups(tmp_path / "b") == regular
+    assert len(list((tmp_path / "b").glob("before-restore-*.db"))) == 3
+
+
+def test_a_damaged_database_at_start_says_how_to_fix_it_and_is_not_restarted(clean_env, monkeypatch, caplog):
+    monkeypatch.setenv("BOT_TOKEN", GOOD_TOKEN)
+    (clean_env / "data").mkdir()
+    (clean_env / "data" / "shop.db").write_bytes(b"\x13garbage" * 1024)
+    assert run_main() == 78
+    assert "Can't open the database" in caplog.text and "restore the newest backup" in caplog.text
+
+
+def test_a_later_line_in_dotenv_wins_like_in_a_shell(clean_env, monkeypatch):
+    (clean_env / ".env").write_text("BOT_TOKEN=x\nSUPPORT_CONTACT=\nSUPPORT_CONTACT=@my_support\n")
+    monkeypatch.delenv("DB_PATH", raising=False)
+    assert config.Settings.from_env().support_contact == "@my_support"

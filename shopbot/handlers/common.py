@@ -738,8 +738,10 @@ async def on_edited_message(update: Update, context: Ctx) -> None:
 async def on_error(update: object, context: Ctx) -> None:
     error = context.error
     if update is None and isinstance(error, Conflict):  # from polling, not from a user's action
-        log.warning("Telegram says another copy of this bot is running (Conflict). Only one "
-                    "copy may run: stop the other one (on your PC, another server, Docker...).")
+        log.warning("Telegram says another copy of this bot is running (Telegram: %s). Only one "
+                    "copy may run: stop the other one (on your PC, another server, Docker...). If "
+                    "no other copy of yours runs anywhere, someone else may have your bot token: "
+                    "send /revoke to @BotFather and install the new token.", error.message)
         return
     if update is None and isinstance(error, NetworkError):
         log.warning("Can't reach Telegram right now (%s). The bot keeps trying by itself.", error)
