@@ -26,6 +26,8 @@ CODE_LENGTH = 8
 MAX_LABEL_NAME = 40
 # settings key: stock added since the last "New in the shop" message (see broadcast.py)
 PENDING_STOCK = "pending_stock_alert"
+# settings key: the broadcast going out, with how far it got (resumed after a restart)
+BROADCAST_JOB = "broadcast_job"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -921,55 +923,85 @@ class Database:
         return self.get_withdrawal(withdrawal_id)  # type: ignore[return-value]
 
     # --------------------------------------------------------------- broadcasts
-    def broadcast_recipients(self, exclude: Iterable[int] = ()) -> list[sqlite3.Row]:
-        """Everyone who has started the bot and isn't banned, oldest first, without the
-        owner and without ``exclude``."""
-        skip = {self.owner_id, *exclude}
-        rows = self._all("SELECT * FROM users WHERE started = 1 AND is_banned = 0 ORDER BY id")
-        return [row for row in rows if row["id"] not in skip]
+    _RECIPIENTS = "started = 1 AND is_banned = 0 AND id != ?"
 
-    def _pending_stock(self) -> dict[str, Any]:
-        raw = self.get_setting(PENDING_STOCK)
+    def count_broadcast_recipients(self) -> int:
+        """Everyone who has started the bot and isn't banned, without the owner."""
+        return int(self._scalar(f"SELECT COUNT(*) FROM users WHERE {self._RECIPIENTS}", (self.owner_id,)))
+
+    def broadcast_page(self, after_id: int, limit: int) -> list[sqlite3.Row]:
+        """The next recipients after user id ``after_id``, in id order (see above)."""
+        return self._all(
+            f"SELECT * FROM users WHERE {self._RECIPIENTS} AND id > ? ORDER BY id LIMIT ?",
+            (self.owner_id, after_id, limit),
+        )
+
+    def broadcast_recipients(self, exclude: Iterable[int] = ()) -> list[sqlite3.Row]:
+        skip = set(exclude)
+        return [row for row in self.broadcast_page(-(2**63), 2**31) if row["id"] not in skip]
+
+    def _load_json_setting(self, key: str) -> Any:
+        raw = self.get_setting(key)
         try:
-            data = json.loads(raw) if raw else {}
+            return json.loads(raw) if raw else None
         except ValueError:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
-        adders = data.get("adders") if isinstance(data.get("adders"), list) else []
-        return {"labels": labels, "adders": adders}
+            log.warning("Ignoring a damaged %s setting", key)
+            return None
+
+    def _pending_stock(self) -> dict[str, dict[str, Any]]:
+        """{label id (text): {"count": n, "adders": [user ids]}}. Reads the older format
+        ({"labels": {id: n}, "adders": [...]}) too."""
+        data = self._load_json_setting(PENDING_STOCK)
+        if not isinstance(data, dict) or not isinstance(data.get("labels"), dict):
+            return {}
+        shared = [a for a in data.get("adders", []) if isinstance(a, int)]
+        out: dict[str, dict[str, Any]] = {}
+        for key, value in data["labels"].items():
+            if isinstance(value, dict):
+                count, adders = value.get("count", 0), value.get("adders", [])
+            else:
+                count, adders = value, shared
+            try:
+                out[str(int(key))] = {"count": int(count),
+                                      "adders": [a for a in adders if isinstance(a, int)]}
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def add_pending_stock(self, label_id: int, count: int, adder_id: int) -> None:
         """Note stock that was just added, for the next "New in the shop" message. It
         is kept in the database, so a restart in the meantime doesn't lose it."""
         with self.tx():
-            pending = self._pending_stock()
-            key = str(label_id)
-            pending["labels"][key] = int(pending["labels"].get(key, 0)) + count
-            if adder_id not in pending["adders"]:
-                pending["adders"].append(adder_id)
-            self.set_setting(PENDING_STOCK, json.dumps(pending))
+            labels = self._pending_stock()
+            entry = labels.setdefault(str(label_id), {"count": 0, "adders": []})
+            entry["count"] += count
+            if adder_id not in entry["adders"]:
+                entry["adders"].append(adder_id)
+            self.set_setting(PENDING_STOCK, json.dumps({"labels": labels}))
 
     def has_pending_stock(self) -> bool:
         return self.get_setting(PENDING_STOCK) is not None
 
-    def take_pending_stock(self) -> Optional[dict[str, Any]]:
-        """The noted stock ({label id: count}, adder ids), removed from the database;
-        None if there is none."""
+    def take_pending_stock(self) -> Optional[dict[int, dict[str, Any]]]:
+        """The noted stock ({label id: {"count", "adders"}}), removed from the
+        database; None if there is none."""
         with self.tx():
             if self.get_setting(PENDING_STOCK) is None:
                 return None
-            pending = self._pending_stock()
+            labels = self._pending_stock()
             self.conn.execute("DELETE FROM settings WHERE key = ?", (PENDING_STOCK,))
-        labels: dict[int, int] = {}
-        for key, count in pending["labels"].items():
-            try:
-                labels[int(key)] = int(count)
-            except (TypeError, ValueError):
-                continue
-        adders = [a for a in pending["adders"] if isinstance(a, int)]
-        return {"labels": labels, "adders": adders}
+        return {int(key): value for key, value in labels.items()}
+
+    def get_broadcast_job(self) -> Optional[dict[str, Any]]:
+        """The broadcast that is going out (or was, when the bot stopped), if any."""
+        job = self._load_json_setting(BROADCAST_JOB)
+        return job if isinstance(job, dict) and job.get("kind") in ("announce", "stock") else None
+
+    def save_broadcast_job(self, job: dict[str, Any]) -> None:
+        self.set_setting(BROADCAST_JOB, json.dumps(job, ensure_ascii=False))
+
+    def clear_broadcast_job(self) -> None:
+        self.conn.execute("DELETE FROM settings WHERE key = ?", (BROADCAST_JOB,))
 
     # -------------------------------------------------------------------- stats
     def seller_stats(self, user_id: int) -> dict[str, Any]:

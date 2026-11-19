@@ -20,7 +20,7 @@ from . import lock
 from .config import ConfigError, Settings
 from .db import Database
 from .handlers import register_handlers
-from .handlers.broadcast import resume_new_stock
+from .handlers.broadcast import resume_broadcasts
 from .handlers.common import setup_bot_profile
 from .ratelimit import ShopRateLimiter
 
@@ -57,9 +57,10 @@ async def _post_stop(app: Application) -> None:
     task = app.bot_data.pop("token_watch", None)
     if task is not None:
         task.cancel()
-    alert = app.bot_data.get("new_stock_task")  # notices the stop within a second
-    if alert is not None and not alert.done():
-        await asyncio.wait({alert}, timeout=5)
+    # Broadcasts notice the stop within a second and save how far they got.
+    busy = [t for t in app.bot_data.get("broadcast_tasks", ()) if not t.done()]
+    if busy:
+        await asyncio.wait(busy, timeout=10)
     # A purchase confirmed while stopping starts its delivery after Application.stop()
     # stopped waiting for tasks: wait for those too, or the buyer pays and gets nothing.
     late = [t for t in asyncio.all_tasks()
@@ -73,7 +74,7 @@ async def _post_init(app: Application) -> None:
     _connected.set()  # Telegram answered: the start-up connection works
     await setup_bot_profile(app)
     app.bot_data["token_watch"] = asyncio.create_task(_watch_token(app))
-    resume_new_stock(app)  # a "New in the shop" message that a restart interrupted
+    resume_broadcasts(app)  # a broadcast (or noted new stock) that a restart interrupted
     log.info("Bot @%s is running. Owner ID: %s", app.bot.username, app.bot_data["settings"].owner_id)
 
 

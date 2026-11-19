@@ -41,7 +41,7 @@ COMMANDS = [
 #   lb/ln/lp/lr/ld/ldy/lx  labels (lx = disable/enable)   ap/apd/apc  add product
 #   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dno  deposits
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
-#   an:<nonce>/anc  send / cancel an announcement (owner)
+#   an:<nonce> / anc[:<nonce>] / ans:<job>  send / cancel / stop an announcement (owner)
 #   menu/cancel/noop  general
 CALLBACKS = [
     (r"^menu$", common.cb_menu),
@@ -81,7 +81,8 @@ CALLBACKS = [
     (r"^(wok|wno):", money.cb_withdraw_decide),
     (r"^pq$", money.cb_pending),
     (r"^an:", broadcast.cb_announce_send),
-    (r"^anc$", broadcast.cb_announce_cancel),
+    (r"^anc(:|$)", broadcast.cb_announce_cancel),
+    (r"^ans:", broadcast.cb_announce_stop),
 ]
 
 
