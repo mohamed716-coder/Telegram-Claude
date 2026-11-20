@@ -1239,8 +1239,8 @@ class Database:
         unlinked = self.unlinked_payments(order_id) if payment is None and not rows else []
         if unlinked:
             raise ShopError(
-                f"Binance can't be asked about Order ID {order_id}, and an older version recorded "
-                "payments by their transaction ID only ("
+                f"Binance can't be asked about Order ID {order_id}, and the bot knows some payments "
+                "by Binance's transaction ID only ("
                 + ", ".join(f"{row['order_id']} on {row['created_at']} UTC" for row in unlinked[:3])
                 + (f" and {len(unlinked) - 3} more" if len(unlinked) > 3 else "")
                 + "): it may be one of them. Check in your Binance app: if it isn't, add the balance "
@@ -1326,16 +1326,16 @@ class Database:
         return list(used.values())
 
     def unlinked_payments(self, order_id: str) -> list[sqlite3.Row]:
-        """Payments an older version recorded by Binance's transaction ID alone (its /regbin,
-        or an approved request naming one, when Binance didn't list the payment), recorded
-        after this Order ID was paid (its own time says when): any of them may be this
-        payment, and without Binance that can't be told. Newer versions never record one."""
+        """Payments the bot knows by Binance's transaction ID alone (an older version's /regbin,
+        or approved request naming one, when Binance didn't list it; or one Binance listed
+        without an Order ID), recorded after this Order ID was paid (its own time says when):
+        any of them may be this payment, and without Binance that can't be told."""
         if not order_id.isdigit():
             return []
         paid = order_id_time(order_id)
         since = "" if paid is None else self._before(
             datetime.fromtimestamp(paid / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), binance_clock=True)
-        return self._all("SELECT * FROM binance_payments WHERE transaction_id IS NULL"
+        return self._all("SELECT * FROM binance_payments WHERE (transaction_id IS NULL OR transaction_id = order_id)"
                          " AND order_id GLOB '*[^0-9]*' AND created_at >= ? ORDER BY rowid", (since,))
 
     def request_unlinked(self, deposit_id: int) -> list[tuple[str, list[sqlite3.Row]]]:
@@ -1348,10 +1348,24 @@ class Database:
         found = []
         for value in dict.fromkeys([dep["order_id"] or "", *(dep["unconfirmed"] or "").split()]):
             if value and not self.payment_records(value):
-                rows = self.unlinked_payments(value)
+                # (not one this request holds itself: approving it adds that one, rightly)
+                rows = [row for row in self.unlinked_payments(value) if row["deposit_id"] != deposit_id]
                 if rows:
                     found.append((value, rows))
         return found
+
+    def waiting_request_for(self, *ids: str) -> Optional[sqlite3.Row]:
+        """The (first) waiting Binance request sent with one of these IDs, the one it names or
+        one Binance didn't confirm: an Order ID the bot has no record of a payment for, yet
+        sent before. A payment a request holds has a record (binance_payment) instead."""
+        wanted = {value for value in ids if value}
+        if not wanted:
+            return None
+        for row in self._all("SELECT * FROM deposits WHERE status = 'pending' AND method = 'binance'"
+                             " AND receipt_file_id IS NULL ORDER BY id"):
+            if row["order_id"] in wanted or wanted & set((row["unconfirmed"] or "").split()):
+                return row
+        return None
 
     def binance_payment(self, *ids: str) -> Optional[sqlite3.Row]:
         """The already used payment with one of these Order IDs or transaction IDs."""
@@ -1642,7 +1656,9 @@ class Database:
         if dep is None or dep["status"] != "pending" or self.approval_block(deposit_id):
             return set()
         held, since, elsewhere = self.request_warnings(deposit_id)
-        found: set[tuple[str, Any]] = {("doubt", row["id"]) for _, doubts, _ in held for row in doubts}
+        # A doubt with its state: one waiting when shown and decided since is new again.
+        found: set[tuple[str, Any]] = {("doubt", (row["id"], row["status"])) for _, doubts, _ in held
+                                       for row in doubts}
         found |= {("since", row["id"]) for row in since}
         found |= {("elsewhere", other["id"]) for _, other in elsewhere}
         if any(early for _, _, early in held):  # paid before automatic checking started
@@ -1672,8 +1688,8 @@ class Database:
 
     def held_after_decision(self, row: sqlite3.Row) -> Optional[sqlite3.Row]:
         """The request a payment is kept for, if the owner decided it without adding it
-        (rejected it, e.g. for its amount, or it was closed): nobody got that payment, so
-        whoever claims it next, the owner decides on it again. None otherwise."""
+        (rejected it, e.g. for its amount, or it was closed): nobody got that payment, so when
+        its customer sends it again, the owner decides on it again. None otherwise."""
         if row["status"] != "owner" or row["deposit_id"] is None or row["approved_in"] is not None:
             return None  # (in an approved request: added)
         request = self.get_deposit(row["deposit_id"])
@@ -1736,8 +1752,8 @@ class Database:
     ) -> sqlite3.Row:
         """A deposit the bot couldn't add (its checks failed): a request the owner approves
         or rejects. The received ``payments`` Binance found are kept for it, so nobody can
-        claim them while the owner decides, and so is a payment kept for an earlier request
-        the owner already decided (anyone's: nobody got it). ``order_id`` is the Order ID checked
+        claim them while the owner decides, and so is a payment of this customer's kept for an
+        earlier request the owner already decided. ``order_id`` is the Order ID checked
         last, ``tried`` all the ones the customer sent.
 
         The request names the payment an approval marks as added: the one checked last if
@@ -1761,10 +1777,10 @@ class Database:
                 if row is None and payment is not None:  # found at Binance, used by nobody
                     self._record_payment(user_id, payment, 0, "owner", deposit_id)
                     kept.append(payment.order_id or payment.transaction_id)
-                elif row is not None and self.held_after_decision(row) is not None:  # anyone's
+                elif (row is not None and row["user_id"] == user_id
+                      and self.held_after_decision(row) is not None):
                     self.conn.execute("UPDATE binance_payments SET held_before = deposit_id,"
-                                      " deposit_id = ?, user_id = ? WHERE order_id = ?",
-                                      (deposit_id, user_id, row["order_id"]))
+                                      " deposit_id = ? WHERE order_id = ?", (deposit_id, row["order_id"]))
                     kept.append(row["order_id"])
 
             for payment in payments:
@@ -1779,7 +1795,8 @@ class Database:
                 named = kept[-1]
             else:  # the latest one sent that nobody used (one used already can't be added),
                 # an Order ID before a transaction ID (which can't be approved unconfirmed)
-                free = [value for value in sent if self.binance_payment(value) is None]
+                free = [value for value in sent if (record := self.binance_payment(value)) is None
+                        or not self.used(record)]  # one kept for another request: decided after it
                 named = next((value for value in reversed(free) if value.isdigit()), free[-1] if free else None)
             held = {value for row in self.deposit_payments(deposit_id)
                     for value in (row["order_id"], row["transaction_id"]) if value}

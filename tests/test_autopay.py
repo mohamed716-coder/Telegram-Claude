@@ -288,14 +288,15 @@ def test_an_order_id_adds_money_only_once(tmp_path):
         calls = await t.send(ALICE, ORDER)
         assert "already added to your balance" in texts(calls, ALICE)[-1]
         assert not [x for x in owner_texts(calls) if "failed" in x]  # not a failed try
-        await choose(t, BOB, 25)
-        calls = await t.send(BOB, ORDER)
-        assert "This Order ID was already used" in texts(calls, BOB)[-1]
-        assert "already used by someone else" in owner_texts(calls)[-1]
-        calls = await t.send(BOB, TX)  # Binance's other ID for the same payment
-        assert "Sent to the owner" in texts(calls, BOB)[-1]
-        (deposit,) = t.db.pending_deposits()
-        assert deposit["order_id"] is None  # approving it can't touch Alice's payment
+        for sent in (ORDER, TX):  # someone else, by either of its IDs: refused, deposit cancelled
+            await choose(t, BOB, 25)
+            calls = await t.send(BOB, sent)
+            assert "This Order ID was already used" in texts(calls, BOB)[-1]
+            assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+            assert "which was used already" in owner_texts(calls)[-1]
+            assert "added automatically: <b>25.00$</b> to <b>Alice</b>" in owner_texts(calls)[-1]
+            assert t.app.user_data[BOB["id"]].get("state") is None  # no second try
+        assert t.db.pending_deposits() == []  # never a request for the owner
         assert balance(t, ALICE) == 2500 and balance(t, BOB) == 0
 
     run(tmp_path, scenario)
@@ -1230,8 +1231,12 @@ def test_a_request_naming_a_payment_kept_for_another_customer_waits_for_it(tmp_p
         (alices,) = t.db.pending_deposits()
         fake.payments.append(pay(amount="25"))
         await choose(t, BOB, 25)
-        await t.send(BOB, ORDER)  # Bob's exact claim waits with the owner, holding P
-        bobs = t.db.pending_deposits()[-1]
+        calls = await t.send(BOB, ORDER)  # #1 was sent with it first: Bob's deposit is cancelled
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        assert f"It waits with request #{alices['id']} from <b>Alice</b>" in owner_texts(calls)[-1]
+        assert [d["id"] for d in t.db.pending_deposits()] == [alices["id"]]
+        # A request of Bob's holding P (an older version's): #1 waits for it to be decided.
+        bobs = t.db.create_review_request(BOB["id"], 2500, ORDER, "x", [pay(amount="25")], [ORDER])
         calls = await t.press(OWNER, f"dok:{alices['id']}")
         assert "can't be approved" in t.alert(calls) and balance(t, ALICE) == 0
         shown = t.last_text(calls)
@@ -1253,10 +1258,15 @@ def test_two_customers_waiting_with_one_order_id_is_for_the_owner_to_settle(tmp_
         (alices,) = t.db.pending_deposits()
         fake.payments.append(pay(amount="25"))
         await choose(t, BOB, 25)
-        calls = await t.send(BOB, ORDER)  # Bob sends the same Order ID
-        assert "Sent to the owner" in texts(calls, BOB)[-1] and balance(t, BOB) == 0
-        assert f"request #{alices['id']} for Alice is waiting" in request_text(calls)
-        assert t.db.get_deposit(alices["id"])["status"] == "pending"
+        calls = await t.send(BOB, ORDER)  # Bob sends the same Order ID: refused, as used
+        assert "This Order ID was already used" in texts(calls, BOB)[-1] and balance(t, BOB) == 0
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        notice = owner_texts(calls)[-1]
+        assert "<b>Bob</b>" in notice and "which someone else sent first" in notice
+        assert f"It waits with request #{alices['id']} from <b>Alice</b>" in notice
+        assert [d["id"] for d in t.db.pending_deposits()] == [alices["id"]]
+        await t.press(OWNER, f"dok:{alices['id']}")  # hers to decide: Binance has it now
+        assert balance(t, ALICE) == 2500 and t.db.binance_payment(ORDER)["user_id"] == ALICE["id"]
 
     run(tmp_path, scenario)
 

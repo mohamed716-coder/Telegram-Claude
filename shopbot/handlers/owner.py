@@ -223,13 +223,14 @@ def _skip_kb(context: Ctx, state: dict) -> Any:
 
 
 async def ask_order_id(update: Update, context: Ctx, target: int, amount: int, note: str = "",
-                       *, skip: bool = True) -> None:
+                       *, skip: bool = True, refused: Optional[str] = None) -> None:
     """The amount is known: ask for the Binance Pay Order ID it's for. It's optional:
     ⏭ Skip adds the balance without one, but not right after an Order ID was refused
-    (that payment may be the one this money is for)."""
+    (that payment may be the one this money is for), unless Binance can't be asked about
+    it at all (``refused``: that Order ID, checked again when Skip is pressed)."""
     # The Skip button is valid for exactly this question, not for a later one.
     state = set_state(context, "owner_order_id", target=target, amount=amount, nonce=secrets.token_hex(4),
-                      skip=skip)
+                      skip=skip, refused=refused)
     who = user_html(db_of(context).get_user(target))
     if note:  # the Order ID sent was refused
         text = note + ("\n\nSend another Order ID, or press Cancel." if not skip else
@@ -287,6 +288,14 @@ async def cb_skip_order_id(update: Update, context: Ctx) -> None:
                      show_alert=True)
         return
     clear_state(context)  # before adding: a second press finds nothing to add
+    refused, db = state.get("refused"), db_of(context)
+    if refused and (db.payment_problem([refused], state["target"]) is not None or db.unlinked_payments(refused)
+                    or db.waiting_request_for(refused) is not None):
+        # Offered while nothing was known about that Order ID; something is now (added, or a
+        # request with it): this money may be that payment, so nothing is added.
+        await answer(query, "⚠️ Nothing was added: that Order ID is known to the bot now. Send /addbal "
+                     "again to see it.", show_alert=True)
+        return
     await answer(query)
     try:
         await query.edit_message_reply_markup(reply_markup=None)  # type: ignore[union-attr]
@@ -686,14 +695,14 @@ async def _check_for_owner(update: Update, context: Ctx, kind: str, order_id: st
             return
         else:
             text = f"⚠️ Nothing was {verb}: {esc(why)}."
-            if lasting and kind == "addbal":  # without the Order ID, earlier payments are held back
-                skip = not db.unlinked_payments(order_id)
-                text += ("\nMeanwhile the balance can be added without the Order ID: payments made "
-                         "before it are then held back for you to decide.")
+            if lasting and kind == "addbal":
+                text += _lasting_advice(context, order_id, target, amount)  # type: ignore[arg-type]
+                skip = text.endswith(_WITHOUT)  # without the Order ID, earlier payments are held back
             elif lasting:
                 text += "\nSend it again once Binance answers."
         if kind == "addbal" and nonce is not None:  # another Order ID, or Skip if that's safe
-            await ask_order_id(update, context, target, amount, note=text, skip=skip)  # type: ignore[arg-type]
+            await ask_order_id(update, context, target, amount, note=text, skip=skip,  # type: ignore[arg-type]
+                               refused=order_id if skip else None)
         else:
             await reply(update, text)
     except Exception:  # a background task: nobody else would hear of it
@@ -704,6 +713,37 @@ async def _check_for_owner(update: Update, context: Ctx, kind: str, order_id: st
                                    if kind == "addbal" else "Please send it again."))
         except TelegramError:
             pass
+
+
+_WITHOUT = ("Meanwhile the balance can be added without the Order ID: payments made before it are "
+            "then held back for you to decide.")
+
+
+def _lasting_advice(context: Ctx, order_id: str, target: int, amount: int) -> str:
+    """While Binance refuses the key: what the bot knows about this Order ID itself, and how
+    to add the balance (ends with _WITHOUT only when adding it without the Order ID is safe)."""
+    db = db_of(context)
+    if not order_id.isdigit():  # the bot may know that payment by its Order ID only
+        return ("\nThat's Binance's transaction ID: send the payment's Order ID (the digits in its "
+                "details), which the bot can check against the payments it knows.")
+    waiting = db.waiting_request_for(order_id)
+    if waiting is not None and waiting["user_id"] == target:
+        return (f"\nTheir request #{waiting['id']} ({money(waiting['amount'])}) was sent with this Order ID: "
+                "if it's that payment, approve the request instead (/pending). That adds the balance and "
+                "records the Order ID.")
+    if waiting is not None:
+        return (f"\nRequest #{waiting['id']} from {user_html(db.get_user(waiting['user_id']))} "
+                f"({money(waiting['amount'])}) was sent with this Order ID: decide that one first (/pending).")
+    unlinked = db.unlinked_payments(order_id)
+    if unlinked:
+        return ("\nThe bot knows some payments by Binance's transaction ID only ("
+                + ", ".join(f"<code>{esc(row['order_id'])}</code> on {esc(row['created_at'])} UTC"
+                            for row in unlinked[:3])
+                + (f" and {len(unlinked) - 3} more" if len(unlinked) > 3 else "")
+                + "): it may be one of them. Check in your Binance app: if it isn't, add the balance "
+                  f"without the Order ID (<code>/addbal {target} {amount / 100:g}</code>); if it is, it was "
+                  "added already.")
+    return "\n" + _WITHOUT
 
 
 def _doubt_lines(context: Ctx, payment: Any, target: int) -> tuple[list[str], set[tuple[str, Any]]]:
@@ -722,7 +762,8 @@ def _doubt_lines(context: Ctx, payment: Any, target: int) -> tuple[list[str], se
         lines.append("⚠️ May be added already: it was paid before automatic checking started, "
                      "when deposits came with receipts.")
     # Every one, also those only counted ("and N more"): a new one is never confirmed unseen.
-    keys = {("doubt", row["id"]) for row in doubts} | ({("early", 0)} if early else set())
+    # With its state: one waiting when shown and decided since is new again.
+    keys = {("doubt", (row["id"], row["status"])) for row in doubts} | ({("early", 0)} if early else set())
     return lines, keys
 
 
@@ -781,8 +822,17 @@ async def cb_payment_confirm(update: Update, context: Ctx) -> None:
         # with nothing awaited in between.
         _, now = _doubt_lines(context, entry["payment"], entry["target"])
         if not now <= entry["warned"]:
-            await reply(update, "⚠️ Nothing was added: something new may be about this payment. Send the "
-                                "Order ID again to see it.")
+            payment, db = entry["payment"], db_of(context)
+            problem = db.payment_problem([entry["order_id"], payment.order_id, payment.transaction_id],
+                                         entry["target"])
+            if problem is not None:
+                await reply(update, "⚠️ Nothing was added: "
+                            + _not_registrable(context, problem, entry["order_id"], entry["target"]))
+                return
+            await reply(update, "⚠️ Nothing was added: something new may be about this payment, so here "
+                                "it is again.")
+            await _ask_to_confirm(update, context, entry["kind"], entry["order_id"], entry["target"],
+                                  entry["amount"], payment)
             return
         await do_add_balance(update, context, entry["target"], entry["amount"], entry["order_id"],
                              payment=entry["payment"])

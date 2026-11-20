@@ -221,10 +221,11 @@ key**, the bot checks the payments itself:
    Binance Pay to your Binance ID, and sends the payment's **Order ID** to the bot.
 2. The bot finds the payment in your Binance Pay history. When the coin and the amount
    match, the balance is added at once and you get a message about it.
-3. When they don't (another amount or coin, an Order ID it can't find, or one that was
-   already used), you get a ⚠️ message and the customer is asked for the Order ID again.
-   When the second try fails too, the deposit comes to you with **Approve** / **Reject**,
-   like a receipt (`/pending` shows it again).
+3. When they don't (another amount or coin, or an Order ID it can't find), you get a ⚠️
+   message and the customer is asked for the Order ID again. When the second try fails too,
+   the deposit comes to you with **Approve** / **Reject**, like a receipt (`/pending` shows
+   it again). An Order ID sent again is refused at once and that deposit is cancelled (see
+   below).
 
 Set it up once:
 
@@ -260,6 +261,14 @@ Set it up once:
   when it starts and at the next deposit (again at most every 6 hours), and every deposit
   comes to you to approve: customers can still deposit. So does a deposit while Binance
   can't be reached for a minute or more.
+- An Order ID sent again is refused at once: the customer is told it was already used and
+  that deposit is cancelled (no second try, no request for you). That's an Order ID that was
+  added, registered by you, or sent before with a request still waiting for you, by either
+  of its IDs. When someone else sent it first, you get one 🧾 message saying so; when it
+  waits with the customer's own request, they're told it's with you already. A payment from
+  a request you rejected comes to you again when that request's customer sends it (nobody
+  got it); anyone else is told it was used, and your 🧾 message gives the `/addbal` that adds
+  it for them if it's theirs.
 - A request marked ❗ has an Order ID Binance didn't confirm as a new payment to you (a
   typo, someone else's payment, or Binance couldn't be asked). Approve it only if you find
   the payment in your Binance app and haven't added it already: the request shows what was
@@ -281,12 +290,13 @@ Set it up once:
   have been added already (the same reasons as below), the screen says why and only
   **⚠️ Add anyway** adds it. A payment waiting with that customer's request is settled with
   it (the request is closed); with anyone else's, decide that request first. While Binance
-  refuses the key, nothing is added with an Order ID: add the balance without one.
+  refuses the key, nothing is added with an Order ID: the bot says what it knows about it
+  (a request sent with it, or payments it knows by their transaction ID only), and ⏭ Skip
+  adds the balance without it when nothing is known (checked again when you press it).
 - Balance you add by hand (with or without an Order ID, or with `/modifybal`) holds back
   every payment made before it, for everyone: they come to you instead of being added.
 - A request whose payment was added already (or is kept for another waiting request) can't
-  be approved: its ⛔ line says why. Approving a request adds every payment it shows. A
-  payment in a request you rejected goes to you again when anyone sends it.
+  be approved: its ⛔ line says why. Approving a request adds every payment it shows.
 - A receipt still waiting from before the key was added lists what was added around then
   for that customer (or for a Binance payment of the same amount), like a ❗ request.
 - Records of older versions: Order IDs kept with leading zeros are read without them. A

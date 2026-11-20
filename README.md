@@ -150,9 +150,13 @@ Binance Pay to Binance ID **850940840**. Then:
   When Binance shows a payment with that Order ID, coin and amount, the balance is added at
   once. If not, the owner gets a ⚠️ message and the bot asks for the Order ID again; if the
   second try fails too, the deposit goes to the owner to **Approve** / **Reject**. An Order
-  ID can only ever be used once. A deposit also goes to the owner when Binance can't be
-  asked (the key is refused, or Binance still can't be reached when the customer checks
-  again a minute later), or when the owner may have decided on that payment by hand already.
+  ID can only ever be used once: sent again (by anyone, also while a request with it waits),
+  the bot says it was already used and that deposit is cancelled, with no second try (the
+  owner is told when someone else sent it); only a payment from a request of theirs the
+  owner rejected goes to the owner again, as nobody got it. A deposit also goes to the owner
+  when Binance can't be asked (the key is refused, or Binance still can't be reached when the
+  customer checks again a minute later), or when the owner may have decided on that payment
+  by hand already.
 - **Without a key:** send a **photo of the receipt** and press **Confirm**. The owner gets
   the receipt with **Approve** / **Reject** buttons; on approval the balance is added.
 
@@ -183,8 +187,9 @@ both of its IDs (the Order ID the payer sees and Binance's transaction ID):
   shows several). A request whose payment was added already, is kept for another waiting
   request, or is known only by a transaction ID Binance didn't confirm can't be approved
   (it says why in a ⛔ line); reject it and, if the customer paid with another payment,
-  add that one by hand with its Order ID. A payment someone else claimed in a request you
-  rejected goes to you again when its payer sends it, saying who had it.
+  add that one by hand with its Order ID. When the payer of a payment someone else claimed
+  in a request you rejected sends it, they're told it was used and you get the
+  `/addbal` that adds it for them.
 - **Receipts** (deposits without a key) list what was added for that customer, or for a
   Binance payment of the same amount, in the week before: then only **⚠️ Approve anyway**
   approves, so an old receipt sent again isn't added twice by mistake.

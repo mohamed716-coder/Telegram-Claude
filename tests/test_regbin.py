@@ -87,8 +87,8 @@ def test_a_registered_order_id_is_never_added_again(tmp_path):
         await choose(t, BOB, 10)
         calls = await t.send(BOB, TX)
         assert "This Order ID was already used" in texts(calls, BOB)[-1]
-        assert "already added by hand (you registered it)" in owner_texts(calls)[-1]
-        assert balance(t, BOB) == 0
+        assert "registered as added by hand for <b>Alice</b>" in owner_texts(calls)[-1]
+        assert balance(t, BOB) == 0 and t.db.pending_deposits() == []
 
     run(tmp_path, scenario)
 
@@ -122,7 +122,7 @@ def test_without_a_user_the_payment_is_added_already_whoever_sends_it(tmp_path):
         for _ in range(3):  # however often: never a failed try, never a request
             await choose(t, ALICE, 10)
             calls = await t.send(ALICE, ORDER)
-            assert "This payment was already added by the owner." in texts(calls, ALICE)[-1]
+            assert "already used: this payment was already added by the owner" in texts(calls, ALICE)[-1]
             shown = owner_texts(calls)
             assert len(shown) == 1 and "<b>Alice</b>" in shown[0] and "which you registered" in shown[0]
         assert t.db.pending_deposits() == [] and balance(t, ALICE) == 0
@@ -143,7 +143,11 @@ def test_a_request_naming_only_payments_added_already_cant_be_approved(tmp_path)
         await t.press(OWNER, f"dno:{bobs['id']}")
         await t.send(OWNER, f"/addbal {ALICE['id']} 25")  # Alice's 25$, by hand
         await by_hand(t, f"/regbin {ORDER} {CARL['id']}")  # registered for Carl (a mistake)
-        alices = await to_the_owner(t, ALICE, 25)  # "already used": a request naming no payment
+        await choose(t, ALICE, 25)  # Alice sends it now: used already, her deposit is cancelled
+        assert "This deposit was cancelled." in texts(await t.send(ALICE, ORDER), ALICE)[-1]
+        assert t.db.pending_deposits() == []
+        # A request naming only such payments (an older version's, or sent a moment before)
+        alices = t.db.create_review_request(ALICE["id"], 2500, ORDER, f"{ORDER}: already used", [], [ORDER])
         assert alices["order_id"] is None and alices["unconfirmed"] == ORDER
         calls = await t.press(OWNER, f"dok:{alices['id']}")
         assert "can't be approved" in t.alert(calls) and balance(t, ALICE) == 2500
@@ -162,14 +166,12 @@ def test_registering_a_payment_for_its_customer_closes_their_request_naming_only
         with_binance(t, FakeBinance(pay(amount="25")))
         register(t, ALICE)
         register(t, BOB)
-        bobs = await to_the_owner(t, BOB, 20)
-        await t.press(OWNER, f"dno:{bobs['id']}")
-        await t.send(OWNER, f"/addbal {ALICE['id']} 25")
-        alices = await to_the_owner(t, ALICE, 25)  # Bob's rejected claim: hers to the owner
+        alices = await to_the_owner(t, ALICE, 20)  # paid 25, chose 20: her request holds it
+        await t.send(OWNER, f"/addbal {ALICE['id']} 25")  # the owner pays her out by hand
         assert alices["order_id"] == ORDER and t.db.binance_payment(ORDER)["deposit_id"] == alices["id"]
         calls = await by_hand(t, f"/regbin {ORDER} {ALICE['id']}")
         assert f"Request #{alices['id']} was waiting with it: closed." in owner_texts(calls)[-1]
-        assert any(f"Your deposit request #{alices['id']} (25.00$) is closed" in x for x in texts(calls, ALICE))
+        assert any(f"Your deposit request #{alices['id']} (20.00$) is closed" in x for x in texts(calls, ALICE))
         assert t.db.get_deposit(alices["id"])["status"] == "closed" and balance(t, ALICE) == 2500
 
     run(tmp_path, scenario)
@@ -772,8 +774,9 @@ def test_an_older_versions_payment_kept_for_an_approved_request_counts_as_added(
         assert t.db.pending_deposits() == [] and balance(t, ALICE) == 0
         calls = await t.send(OWNER, f"/addbal {ALICE['id']} 20 {ORDER}")
         assert "Nothing was added" in owner_texts(calls)[-1] and balance(t, ALICE) == 0
-        request = await to_the_owner(t, BOB, 20)  # someone else: never takes it over
-        assert request["order_id"] is None and t.db.binance_payment(ORDER)["deposit_id"] == approved["id"]
+        await choose(t, BOB, 20)  # someone else: used already, never takes it over
+        assert "This Order ID was already used" in texts(await t.send(BOB, ORDER), BOB)[-1]
+        assert t.db.pending_deposits() == [] and t.db.binance_payment(ORDER)["deposit_id"] == approved["id"]
 
     run(tmp_path, scenario)
 
@@ -788,10 +791,11 @@ def test_a_request_whose_payment_was_added_since_for_someone_else_cant_be_approv
         bobs = t.db.pending_deposits()[-1]
         fake.error = None
         await choose(t, ALICE, 25)
-        await t.send(ALICE, ORDER)  # Bob's waiting request may be about it: to the owner
-        alices = t.db.pending_deposits()[-1]
-        await t.press(OWNER, f"dok:{alices['id']}")
-        await t.press(OWNER, f"dokx:{alices['id']}")  # Alice's, the owner is sure
+        calls = await t.send(ALICE, ORDER)  # Bob's waiting request was sent with it first
+        assert "This deposit was cancelled." in texts(calls, ALICE)[-1] and len(t.db.pending_deposits()) == 1
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 25 {ORDER}")  # the owner: it's hers
+        assert f"request #{bobs['id']} for Bob is waiting" in owner_texts(calls)[-1]
+        await confirm(t, calls, anyway=True)
         assert balance(t, ALICE) == 2500 and t.db.get_deposit(bobs["id"])["status"] == "pending"
         calls = await t.press(OWNER, f"dok:{bobs['id']}")
         assert "can't be approved" in t.alert(calls) and balance(t, BOB) == 0
@@ -869,19 +873,20 @@ def test_anything_new_about_the_payment_after_it_was_shown_needs_the_order_id_ag
         add = t.button(await t.send(OWNER, f"/addbal {ALICE['id']} 10 {ORDER}"), "✅ Add 10.00$")
         await t.send(OWNER, f"/addbal {BOB['id']} 10")  # meanwhile: may have been this payment
         calls = await t.press(OWNER, add)
-        assert "Nothing was added: something new may be about this payment" in owner_texts(calls)[-1]
+        shown = owner_texts(calls)
+        assert "Nothing was added: something new may be about this payment, so here it is again." in shown[-2]
+        assert "you added 10.00$ by hand for Bob (" in shown[-1]  # the screen again, with it
         assert balance(t, ALICE) == 0 and t.db.binance_payment(ORDER) is None
         assert "This has expired" in t.alert(await t.press(OWNER, add))  # its buttons are gone
-        anyway = t.button(await t.send(OWNER, f"/addbal {ALICE['id']} 10 {ORDER}"), "anyway")
+        anyway = t.button(calls, "anyway")
         await t.send(OWNER, "/modifybal")  # a raise meanwhile: new too, also after a warning
         await t.send(OWNER, str(BOB["id"]))
         await t.send(OWNER, "15")
         calls = await t.press(OWNER, anyway)
-        assert "something new may be about this payment" in owner_texts(calls)[-1] and balance(t, ALICE) == 0
-        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 10 {ORDER}")
+        assert "something new may be about this payment" in owner_texts(calls)[-2] and balance(t, ALICE) == 0
         assert "you raised a balance by 5.00$ with /modifybal" in owner_texts(calls)[-1]
-        await confirm(t, calls, anyway=True)
-        assert balance(t, ALICE) == 1000
+        await confirm(t, calls, anyway=True)  # nothing new since: added, once
+        assert balance(t, ALICE) == 1000 and "This has expired" in t.alert(await t.press(OWNER, anyway))
 
     run(tmp_path, scenario)
 
@@ -1087,8 +1092,10 @@ def test_a_request_names_the_latest_order_id_nobody_used_even_if_one_used_was_se
         await t.send(BOB, OTHER)  # Bob's, added automatically
         await choose(t, ALICE, 25)
         await t.send(ALICE, unknown)
-        await t.send(ALICE, OTHER)  # used by someone else, sent last
-        (request,) = t.db.pending_deposits()
+        calls = await t.send(ALICE, OTHER)  # used by someone else: her deposit is cancelled
+        assert "This deposit was cancelled." in texts(calls, ALICE)[-1] and t.db.pending_deposits() == []
+        # A request sent with both (an older version's): it names the one nobody used.
+        request = t.db.create_review_request(ALICE["id"], 2500, OTHER, "x", [], [unknown, OTHER])
         assert request["order_id"] == unknown and request["unconfirmed"] == f"{unknown} {OTHER}"
         assert t.db.approval_block(request["id"]) is None
         calls = await t.press(OWNER, f"dok:{request['id']}")  # OTHER was used: a warning first
@@ -1198,7 +1205,7 @@ def test_a_request_that_may_be_a_payment_recorded_by_its_transaction_id_only_say
         calls = await t.press(OWNER, f"dok:{request['id']}")
         assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 0
         caption = deposit_caption(t.app, t.db.get_deposit(request["id"]))
-        assert f"an older version recorded payments by Binance's transaction ID only (<code>{TX}</code>" in caption
+        assert f"the bot knows some payments by Binance's transaction ID only (<code>{TX}</code>" in caption
         assert f"If one of them has Order ID <code>{ORDER}</code> in your Binance app" in caption
         await t.press(OWNER, f"dokx:{request['id']}")  # checked: it isn't
         assert balance(t, ALICE) == 2500
@@ -1296,11 +1303,10 @@ def test_a_blocked_request_can_be_approved_from_its_message_once_nothing_blocks_
         register(t, BOB)
         alices = await to_the_owner(t, ALICE, 25)  # names ORDER, not listed yet
         fake.payments.append(pay(amount="20"))
-        await choose(t, BOB, 25)  # Bob claims it: kept for his request
-        await t.send(BOB, ORDER)
-        await t.send(BOB, ORDER)
-        bobs = t.db.pending_deposits()[-1]
-        assert bobs["user_id"] == BOB["id"] and t.db.binance_payment(ORDER)["deposit_id"] == bobs["id"]
+        # A request of Bob's holding that payment (sent before Alice's, or by an older version)
+        bobs = t.db.create_review_request(BOB["id"], 2500, ORDER, f"{ORDER}: is 20 USDT, not 25 USDT",
+                                          [pay(amount="20")], [ORDER])
+        assert t.db.binance_payment(ORDER)["deposit_id"] == bobs["id"]
         calls = await t.press(OWNER, f"dok:{alices['id']}")
         assert "can't be approved" in t.alert(calls)
         approve = t.button(calls, "✅ Approve")
@@ -1374,10 +1380,10 @@ def test_a_receipts_warnings_fit_in_a_photo_caption(tmp_path):
     run(tmp_path, scenario)
 
 
-def test_the_real_payer_after_a_rejected_wrong_claim_goes_to_the_owner_with_that_payment(tmp_path):
-    # Bob claims Alice's 25 USDT payment with another amount; the owner rejects it, so
-    # nobody got it. Alice, who paid it, sends it: it goes to the owner (not "already used"),
-    # her request holds that payment, says who had it, and can be approved for her.
+def test_a_payment_from_someone_elses_rejected_request_is_refused_and_the_owner_can_add_it(tmp_path):
+    # Bob claims Alice's 25 USDT payment with another amount; the owner rejects it, so nobody
+    # got it. Sent again by anyone else it's refused as used (the owner hears who sent it and
+    # how to add it for them); only Bob, whose request it was, goes to the owner with it again.
     async def scenario(t: ShopTest) -> None:
         with_binance(t, FakeBinance(pay(amount="25")))
         register(t, ALICE)
@@ -1386,22 +1392,40 @@ def test_the_real_payer_after_a_rejected_wrong_claim_goes_to_the_owner_with_that
         await t.press(OWNER, f"dno:{bobs['id']}")
         await choose(t, ALICE, 25)
         calls = await t.send(ALICE, ORDER)
-        assert "Sent to the owner" in texts(calls, ALICE)[-1]
-        assert not any("already used" in x for x in texts(calls, ALICE))
-        (alices,) = t.db.pending_deposits()
-        assert alices["order_id"] == ORDER and t.db.binance_payment(ORDER)["user_id"] == ALICE["id"]
-        shown = request_text(calls)
-        assert f"{ORDER}: was in request #{bobs['id']} for Bob, which you rejected" in shown
-        assert f"it was in request #{bobs['id']} for Bob, which you rejected" in shown
-        assert t.db.approval_block(alices["id"]) is None
-        calls = await t.press(OWNER, f"dok:{alices['id']}")
-        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 0
-        await t.press(OWNER, f"dokx:{alices['id']}")
+        assert "This Order ID was already used" in texts(calls, ALICE)[-1]
+        assert "If you made this payment yourself, please contact" in texts(calls, ALICE)[-1]
+        notice = owner_texts(calls)[-1]
+        assert "which someone else sent first" in notice and f"kept for request #{bobs['id']} from <b>Bob</b>" in notice
+        assert f"<code>/addbal {ALICE['id']} 25 {ORDER}</code>" in notice
+        assert t.db.pending_deposits() == [] and t.db.binance_payment(ORDER)["user_id"] == BOB["id"]
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 25 {ORDER}")  # it's hers: the owner adds it
+        assert f"it was in request #{bobs['id']} for Bob, which you rejected" in owner_texts(calls)[-1]
+        await confirm(t, calls, anyway=True)
         assert balance(t, ALICE) == 2500 and balance(t, BOB) == 0
-        # Bob trying it again now: added already, for someone else.
-        await choose(t, BOB, 25)
-        calls = await t.send(BOB, ORDER)
-        assert "already used" in texts(calls, BOB)[-1] and balance(t, BOB) == 0
+        await choose(t, BOB, 25)  # Bob trying it again now: added already, for someone else
+        assert "already used" in texts(await t.send(BOB, ORDER), BOB)[-1] and balance(t, BOB) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_from_the_customers_own_rejected_request_goes_to_the_owner_again_saying_the_amount(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        rejected = await to_the_owner(t, ALICE, 20)  # 25 USDT, not 20
+        await t.press(OWNER, f"dno:{rejected['id']}")
+        for chosen, note in ((20, "; is 25 USDT, not 20 USDT"), (25, "")):
+            await choose(t, ALICE, chosen)
+            calls = await t.send(ALICE, ORDER)  # her own: the owner decides on it again
+            assert "Sent to the owner" in texts(calls, ALICE)[-1]
+            request = t.db.pending_deposits()[-1]
+            assert (request["note"] or "").endswith(f"{ORDER}: was in request #{rejected['id']}, which you rejected{note}")
+            if note:  # still the wrong amount: rejected again
+                await t.press(OWNER, f"dno:{request['id']}")
+                rejected = request
+        await t.press(OWNER, f"dok:{request['id']}")
+        await t.press(OWNER, f"dokx:{request['id']}")
+        assert balance(t, ALICE) == 2500
 
     run(tmp_path, scenario)
 
@@ -1489,7 +1513,8 @@ def test_by_hand_a_new_warning_anywhere_in_the_list_needs_the_order_id_again(tmp
         anyway = t.button(calls, "anyway")
         await t.send(OWNER, f"/addbal {BOB['id']} 9")  # someone else's, after hers in the list
         calls = await t.press(OWNER, anyway)
-        assert "something new may be about this payment" in owner_texts(calls)[-1]
+        assert "something new may be about this payment" in owner_texts(calls)[-2]
+        assert "; and 1 more." in owner_texts(calls)[-1]  # counted after hers: new, so shown again
         assert balance(t, ALICE) == 1000 and t.db.binance_payment(ORDER) is None
 
     run(tmp_path, scenario)
@@ -1559,12 +1584,421 @@ def test_a_payment_kept_for_a_rejected_unconfirmed_request_names_that_request(tm
         alices = await to_the_owner(t, ALICE, 25)  # names ORDER, not listed yet
         fake.payments.append(pay(amount="20"))
         await choose(t, BOB, 25)
-        await t.send(BOB, "466000199987322999")  # unknown ...
-        await t.send(BOB, ORDER)  # ... then Alice's payment, 20 USDT: kept for Bob's request
-        bobs = t.db.pending_deposits()[-1]
+        await t.send(BOB, "466000199987322999")
+        calls = await t.send(BOB, ORDER)  # Alice's request was sent with it first: cancelled
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        # Bob's request sent with an unknown ID and holding that payment (an older version's)
+        bobs = t.db.create_review_request(
+            BOB["id"], 2500, ORDER, "466000199987322999: not found in your Binance Pay history",
+            [pay(amount="20")], ["466000199987322999", ORDER])
         assert bobs["unverified"] == 1 and t.db.binance_payment(ORDER)["deposit_id"] == bobs["id"]
         await t.press(OWNER, f"dno:{bobs['id']}")
         caption = deposit_caption(t.app, t.db.get_deposit(alices["id"]))
         assert f"it was in request #{bobs['id']} for Bob, which you rejected" in caption
+
+    run(tmp_path, scenario)
+
+
+# ============================================== an Order ID sent again: used, deposit cancelled
+def test_an_order_id_used_already_cancels_the_deposit_at_once_whoever_sends_it(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # added automatically
+        assert balance(t, ALICE) == 2500
+        # Bob sends it: used, so that deposit ends at once (no second try, no request), and the
+        # owner hears it once.
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, ORDER)
+        shown = texts(calls, BOB)[-1]  # after "Checking Order ID ..."
+        assert shown.startswith("❌ This Order ID was already used.") and "This deposit was cancelled." in shown
+        assert "If you made this payment yourself, please contact the owner" in shown
+        (notice,) = owner_texts(calls)
+        assert "<b>Bob</b>" in notice and "which was used already" in notice and "25$ was cancelled" in notice
+        assert "added automatically: <b>25.00$</b> to <b>Alice</b>" in notice
+        assert t.app.user_data[BOB["id"]].get("state") is None and t.db.pending_deposits() == []
+        calls = await t.send(BOB, ORDER)  # nothing waits for an Order ID any more
+        assert "Send /start" in texts(calls, BOB)[-1] and owner_texts(calls) == []
+        # Alice sends her own again: used, cancelled too, and nobody is bothered.
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "already used: this payment was already added to your balance" in texts(calls, ALICE)[-1]
+        assert "This deposit was cancelled." in texts(calls, ALICE)[-1] and owner_texts(calls) == []
+        assert balance(t, ALICE) == 2500 and balance(t, BOB) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_used_order_id_after_a_failed_try_cancels_instead_of_going_to_the_owner(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, "466000199987322999")  # a typo: not found, send it again
+        assert "send the Order ID again" in texts(calls, BOB)[-1]
+        calls = await t.send(BOB, ORDER)  # then Alice's: used, cancelled, not a request
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        assert t.db.pending_deposits() == [] and balance(t, BOB) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_waiting_with_someone_elses_request_cancels_the_deposit_and_says_where_it_waits(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="20")))
+        register(t, ALICE)
+        register(t, BOB)
+        alices = await to_the_owner(t, ALICE, 25)  # paid 20, chose 25: waits for the owner
+        await choose(t, BOB, 20)
+        calls = await t.send(BOB, ORDER)
+        assert "This Order ID was already used" in texts(calls, BOB)[-1]
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        assert f"It's waiting with request #{alices['id']} from <b>Alice</b>" in owner_texts(calls)[-1]
+        assert "which someone else sent first" in owner_texts(calls)[-1]  # not "used": it waits
+        assert [d["id"] for d in t.db.pending_deposits()] == [alices["id"]]  # hers, untouched
+        assert t.db.binance_payment(ORDER)["deposit_id"] == alices["id"] and balance(t, BOB) == 0
+        # Her own, sent again while it waits: with the owner (not "used"), nothing new.
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert f"This payment is already with the owner in your request #{alices['id']}" in texts(calls, ALICE)[-1]
+        assert "This deposit was cancelled." in texts(calls, ALICE)[-1] and len(t.db.pending_deposits()) == 1
+
+    run(tmp_path, scenario)
+
+
+def test_an_order_id_someone_elses_waiting_request_was_sent_with_cancels_the_deposit(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())  # Binance doesn't list it (yet)
+        for user in (ALICE, BOB, CARL):
+            register(t, user)
+        alices = await to_the_owner(t, ALICE, 25)  # names ORDER, unconfirmed: no record of it
+        assert t.db.binance_payment(ORDER) is None
+        asked = len(fake.asked)
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, ORDER)  # by the same ID: refused before Binance is asked
+        assert "This Order ID was already used" in texts(calls, BOB)[-1]
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1] and len(fake.asked) == asked
+        notice = owner_texts(calls)[-1]
+        assert "which someone else sent first" in notice and f"request #{alices['id']} from <b>Alice</b>" in notice
+        assert not [x for x in owner_texts(calls) if "failed" in x]
+        # By its other ID, once Binance lists it: the same.
+        fake.payments.append(pay(amount="25"))
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, TX)
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        # An ID only in a waiting request's list (not the one it names): the same.
+        carls = t.db.create_review_request(CARL["id"], 1000, "466000199987322999",
+                                           "x: not found in your Binance Pay history", [],
+                                           [OTHER, "466000199987322999"])
+        assert carls["order_id"] == "466000199987322999" and OTHER in carls["unconfirmed"]
+        await choose(t, BOB, 10)
+        calls = await t.send(BOB, OTHER)
+        assert "This deposit was cancelled." in texts(calls, BOB)[-1]
+        assert f"request #{carls['id']} from <b>Carl</b>" in owner_texts(calls)[-1]
+        assert [d["id"] for d in t.db.pending_deposits()] == [alices["id"], carls["id"]]
+        assert balance(t, BOB) == 0 and t.db.binance_payment(ORDER) is None
+
+    run(tmp_path, scenario)
+
+
+def test_an_order_id_waiting_with_the_customers_own_request_ends_the_deposit_unless_binance_lists_it(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        first = await to_the_owner(t, ALICE, 25)  # names ORDER: Binance didn't list it
+        for error in (None, BinanceKeyError("refused"), BinanceUnavailable("busy")):
+            fake.error = error
+            await choose(t, ALICE, 25)
+            calls = await t.send(ALICE, ORDER)  # sent again, still not listed
+            shown = texts(calls, ALICE)[-1]
+            assert f"already with the owner in your request #{first['id']}" in shown, (error, shown)
+            assert "This deposit was cancelled." in shown and t.app.user_data[ALICE["id"]].get("state") is None
+            assert not [x for x in owner_texts(calls) if "check failed" in x or "Deposit request" in x]
+            assert [d["id"] for d in t.db.pending_deposits()] == [first["id"]]  # no second request
+        fake.error = None
+        fake.payments.append(pay(amount="25"))  # listed now, exactly what she chose: added
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "Payment received!" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2500
+        assert t.db.get_deposit(first["id"])["status"] == "closed"
+
+    run(tmp_path, scenario)
+
+
+def test_the_transaction_id_of_an_older_payment_known_by_its_order_id_only_is_refused_as_used(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance(pay(amount="25", minutes_ago=3 * 1440), error=BinanceKeyError("refused")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # the key is refused: to the owner, who approves it
+        (request,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{request['id']}")
+        assert balance(t, ALICE) == 2500 and t.db.binance_payment(ORDER)["transaction_id"] is None
+        fake.error = None
+        for user in (BOB, ALICE):  # three days after it was paid, by its other ID
+            await choose(t, user, 25)
+            calls = await t.send(user, TX)
+            assert "This Order ID was already used" in texts(calls, user)[-1], user
+            assert "This deposit was cancelled." in texts(calls, user)[-1]
+        assert t.db.pending_deposits() == [] and balance(t, BOB) == 0 and balance(t, ALICE) == 2500
+        assert t.db.binance_payment(ORDER)["transaction_id"] == TX  # known by both IDs now
+
+    run(tmp_path, scenario)
+
+
+def test_the_owner_trying_a_deposit_with_a_used_order_id_isnt_told_to_contact_themselves(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25"), pay(order_id=OTHER, tx="P_OTHER", amount="10")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await choose(t, OWNER, 25)
+        calls = await t.send(OWNER, ORDER)
+        shown = owner_texts(calls)[-1]
+        assert "This Order ID was already used" in shown and "contact" not in shown
+        assert "added automatically: <b>25.00$</b> to <b>Alice</b>" in shown and "This deposit was cancelled." in shown
+        assert not [x for x in owner_texts(calls) if "sent Order ID" in x]  # no notice about the owner
+        await by_hand(t, f"/regbin {OTHER}")  # registered without a user
+        await choose(t, OWNER, 10)
+        shown = owner_texts(await t.send(OWNER, OTHER))[-1]
+        assert "registered as added by hand" in shown and "your balance" not in shown
+        # One a customer's waiting request was sent with: where it waits, again no notice.
+        waiting = t.db.create_review_request(ALICE["id"], 1000, "466000199987322999",
+                                             "x: not found in your Binance Pay history", [], ["466000199987322999"])
+        await choose(t, OWNER, 10)
+        calls = await t.send(OWNER, "466000199987322999")
+        shown = owner_texts(calls)[-1]
+        assert f"It waits with request #{waiting['id']} from <b>Alice</b>" in shown and "contact" not in shown
+        assert "This deposit was cancelled." in shown and not [x for x in owner_texts(calls) if "sent Order ID" in x]
+
+    run(tmp_path, scenario)
+
+
+def test_an_order_id_of_a_request_the_owner_decided_isnt_refused_as_waiting(tmp_path):
+    # Only a request still waiting for the owner makes an Order ID "sent before": one that
+    # was rejected leaves it to Binance and the doubts, as for anyone.
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        alices = await to_the_owner(t, ALICE, 25)  # names ORDER, Binance didn't list it
+        await t.press(OWNER, f"dno:{alices['id']}")
+        fake.payments.append(pay(amount="25"))
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, ORDER)
+        assert "already used" not in texts(calls, BOB)[-1]
+        assert "Sent to the owner" in texts(calls, BOB)[-1]  # the rejected request may be about it
+        assert f"you rejected request #{alices['id']} for Alice" in request_text(calls)
+
+    run(tmp_path, scenario)
+
+
+# ===================================================== the last review's findings
+def test_approve_anyway_asks_again_when_a_waiting_request_it_listed_was_approved_meanwhile(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        bobs = await to_the_owner(t, BOB, 25, "466000199987322999")  # a wrong Order ID: waits
+        fake.payments.append(pay(amount="25"))
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # Bob's waiting request may be about it: to the owner
+        alices = t.db.pending_deposits()[-1]
+        await t.press(OWNER, f"dok:{alices['id']}")  # shows "request #… for Bob is waiting"
+        await t.press(OWNER, f"dok:{bobs['id']}")  # then Bob's is approved, with one tap
+        calls = await t.press(OWNER, f"dokx:{alices['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 0
+        assert f"you approved request #{bobs['id']} for Bob" in deposit_caption(t.app, t.db.get_deposit(alices["id"]))
+
+    run(tmp_path, scenario)
+
+
+def test_add_anyway_asks_again_when_a_waiting_request_it_listed_was_approved_meanwhile(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        bobs = await to_the_owner(t, BOB, 25, "466000199987322999")
+        fake.payments.append(pay(amount="25"))
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 25 {ORDER}")
+        assert f"request #{bobs['id']} for Bob is waiting" in owner_texts(calls)[-1]
+        anyway = t.button(calls, "anyway")
+        await t.press(OWNER, f"dok:{bobs['id']}")
+        calls = await t.press(OWNER, anyway)
+        assert "something new may be about this payment" in owner_texts(calls)[-2] and balance(t, ALICE) == 0
+        assert f"you approved request #{bobs['id']} for Bob" in owner_texts(calls)[-1]
+
+    run(tmp_path, scenario)
+
+
+def test_with_a_refused_key_a_transaction_id_gets_no_skip_and_skip_is_checked_again_when_pressed(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25"), error=BinanceKeyError("refused")))
+        register(t, ALICE)
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        await t.send(OWNER, "25")
+        calls = await t.send(OWNER, TX)
+        shown = owner_texts(calls)[-1]
+        assert "That's Binance's transaction ID: send the payment's Order ID" in shown
+        assert not t.has_button(calls, "Skip") and "can be added without the Order ID" not in shown
+        # Skip offered for an Order ID nothing is known about; then Alice's request with it is
+        # approved; then Skip: nothing is added.
+        calls = await t.send(OWNER, ORDER)
+        skip = t.button(calls, "⏭ Skip: add 25.00$")
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # the key is refused: to the owner
+        (request,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{request['id']}")
+        assert balance(t, ALICE) == 2500
+        calls = await t.press(OWNER, skip)
+        assert "Nothing was added: that Order ID is known to the bot now" in t.alert(calls)
+        assert balance(t, ALICE) == 2500
+
+    run(tmp_path, scenario)
+
+
+def test_with_a_refused_key_the_customers_own_waiting_request_is_pointed_to(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(error=BinanceKeyError("refused")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        (request,) = t.db.pending_deposits()
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        await t.send(OWNER, "25")
+        calls = await t.send(OWNER, ORDER)
+        shown = owner_texts(calls)[-1]
+        assert f"Their request #{request['id']} (25.00$) was sent with this Order ID" in shown
+        assert "approve the request instead" in shown and not t.has_button(calls, "Skip")
+
+    run(tmp_path, scenario)
+
+
+def test_with_a_refused_key_old_records_are_named_instead_of_offering_skip(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(error=BinanceKeyError("refused")))
+        register(t, ALICE)
+        old_transaction_id_record(t, OWNER_ID)
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 10 {ORDER}")
+        shown = owner_texts(calls)[-1]
+        assert f"by Binance's transaction ID only (<code>{TX}</code> on " in shown
+        assert f"<code>/addbal {ALICE['id']} 10</code>" in shown and "can be added without the Order ID" not in shown
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_binance_listed_without_an_order_id_is_one_that_may_be_any_order_id(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(order_id="", amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, TX)  # added automatically, known by its transaction ID only
+        assert balance(t, ALICE) == 2500 and t.db.binance_payment(TX)["order_id"] == TX
+        t.app.bot_data["binance"] = None  # the key is taken out
+        calls = await t.send(OWNER, f"/addbal {BOB['id']} 25 {ORDER}")
+        assert "by Binance's transaction ID only" in owner_texts(calls)[-1] and balance(t, BOB) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_sent_with_a_payment_waiting_elsewhere_names_it_and_waits_for_that_one(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        bobs = await to_the_owner(t, BOB, 20)  # holds the payment, waits
+        alices = t.db.create_review_request(ALICE["id"], 2500, ORDER, "x", [], [ORDER])  # an older version's
+        assert alices["order_id"] == ORDER
+        assert f"is kept for request #{bobs['id']}, which is waiting: decide that one first" in \
+            t.db.approval_block(alices["id"])
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_names_the_order_id_sent_last_also_when_it_was_sent_before(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        first, second = "466000199987322777", "466000199987322778"
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, first)  # not found: a failed try
+        fake.error = BinanceUnavailable("busy")
+        await t.send(ALICE, second)  # can't be asked: not a try
+        calls = await t.send(ALICE, first)  # the first one again, and the key is refused now
+        fake.error = BinanceKeyError("refused")
+        calls = await t.press(ALICE, t.button(calls, "Check again"))
+        (request,) = t.db.pending_deposits()
+        assert request["order_id"] == first and request["unconfirmed"].split()[-1] == first
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_isnt_warned_about_the_payment_it_holds_itself(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(order_id="", amount="20")))  # listed without an Order ID
+        register(t, ALICE)
+        request = t.db.create_review_request(ALICE["id"], 2500, "466000199987322999",
+                                             "x: not found in your Binance Pay history",
+                                             [pay(order_id="", amount="20")], [TX, "466000199987322999"])
+        assert t.db.binance_payment(TX)["deposit_id"] == request["id"]  # holds it, by its TX only
+        assert t.db.request_unlinked(request["id"]) == []  # not "it may be this one" about itself
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_from_someone_elses_rejected_request_stays_there_until_a_request_naming_it_is_approved(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        bobs = await to_the_owner(t, BOB, 20)
+        await t.press(OWNER, f"dno:{bobs['id']}")
+        alices = t.db.create_review_request(ALICE["id"], 2500, ORDER, "x", [], [ORDER])  # an older version's
+        assert alices["order_id"] == ORDER and t.db.binance_payment(ORDER)["deposit_id"] == bobs["id"]
+        await t.press(OWNER, f"dok:{alices['id']}")  # it was in Bob's rejected request: a warning first
+        assert f"it was in request #{bobs['id']} for Bob, which you rejected" in \
+            deposit_caption(t.app, t.db.get_deposit(alices["id"]))
+        await t.press(OWNER, f"dokx:{alices['id']}")
+        assert balance(t, ALICE) == 2500 and t.db.binance_payment(ORDER)["user_id"] == ALICE["id"]
+
+    run(tmp_path, scenario)
+
+
+def test_something_new_and_the_payment_added_meanwhile_says_it_was_used_instead_of_asking_again(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        add = t.button(await t.send(OWNER, f"/addbal {ALICE['id']} 25 {ORDER}"), "✅ Add 25.00$")
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # meanwhile she sends it: added automatically
+        await t.send(OWNER, f"/addbal {BOB['id']} 5")  # and something new about it
+        calls = await t.press(OWNER, add)
+        shown = owner_texts(calls)[-1]
+        assert "Nothing was added" in shown and "was used already" in shown and "Binance has" not in shown
+        assert balance(t, ALICE) == 2500
+
+    run(tmp_path, scenario)
+
+
+def test_with_a_refused_key_another_customers_waiting_request_is_decided_first(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(error=BinanceKeyError("refused")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, BOB, 25)
+        await t.send(BOB, ORDER)  # the key is refused: Bob's request names it
+        (bobs,) = t.db.pending_deposits()
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 25 {ORDER}")
+        shown = owner_texts(calls)[-1]
+        assert f"Request #{bobs['id']} from <b>Bob</b>" in shown and "decide that one first" in shown
+        assert balance(t, ALICE) == 0
 
     run(tmp_path, scenario)

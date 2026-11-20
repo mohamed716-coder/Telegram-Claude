@@ -313,8 +313,8 @@ def _request_warnings(context: Ctx, deposit: Any, compact: bool = False) -> str:
     for order_id, rows in db_of(context).request_unlinked(deposit["id"]):
         recorded = listed_text([f"<code>{esc(row['order_id'])}</code> ({row['created_at']} UTC)"
                                 for row in rows], ", ")
-        text += (f"⚠️ May be added already: an older version recorded payments by Binance's transaction "
-                 f"ID only ({recorded}). If one of them has Order ID <code>{esc(order_id)}</code> in your "
+        text += (f"⚠️ May be added already: the bot knows some payments by Binance's transaction ID "
+                 f"only ({recorded}). If one of them has Order ID <code>{esc(order_id)}</code> in your "
                  "Binance app, it was added already.\n")
     for order_id, other in elsewhere:
         text += (f"⚠️ Binance has Order ID <code>{esc(order_id)}</code> as a payment kept for request "

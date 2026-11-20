@@ -4,6 +4,10 @@ The customer chooses an amount, sends exactly that with Binance Pay to the shop'
 ID, and sends the payment's Order ID here. The bot finds the payment in the owner's Pay
 history (shopbot/binance.py) and adds it when the coin and the amount match exactly.
 
+An Order ID is used once: one the bot knows already (added, registered by the owner, or
+waiting with a request) ends the deposit at once, as "already used" (only a payment kept
+for a request the owner decided without adding it goes to the owner again: nobody got it).
+
 A check that fails is reported to the owner and the customer is asked for the Order ID
 again. When that fails too, the deposit becomes a request the owner approves or rejects.
 So does a deposit Binance can't be asked about (the key is refused, or Binance can't be
@@ -41,6 +45,7 @@ from .common import (
     btn,
     cfg_of,
     clear_state,
+    contact_owner,
     db_of,
     esc,
     get_state,
@@ -53,7 +58,6 @@ from .common import (
     state_handler,
     try_show,
     user_html,
-    user_name,
 )
 
 log = logging.getLogger("shopbot.autopay")
@@ -234,15 +238,25 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
     db, cfg = db_of(context), cfg_of(context)
     user_id = update.effective_user.id  # type: ignore[union-attr]
     order_id, amount = state["order_id"], state["amount"]
-    tried = state.setdefault("tried", [])
-    if order_id not in tried:  # for the owner's request: which Order IDs Binance confirmed
-        tried.append(order_id)
+    tried = state.setdefault("tried", [])  # for the owner's request, in the order last sent
+    if order_id in tried:
+        tried.remove(order_id)
+    tried.append(order_id)
     used = db.binance_payment(order_id)
     if used is not None:
         await _already_used(update, context, state, reply, used)
         return
+    # Sent before with a request that waits for the owner (Binance didn't confirm it then):
+    # someone else's ends this deposit; their own is asked about again (Binance may list it now).
+    own = db.waiting_request_for(order_id)
+    if own is not None and own["user_id"] != user_id:
+        await _waits_elsewhere(update, context, state, reply, own)
+        return
     client = client_of(context)
     if client is None:  # the key was taken out meanwhile: the owner checks it
+        if own is not None:
+            await _with_own_request(context, state, reply, own)
+            return
         await _to_owner(update, context, state, reply, f"{order_id}: not checked (no Binance key)")
         return
     # The last binance_max_age_hours, also from before automatic checking started: such a
@@ -259,18 +273,50 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
             await reply(RESTARTED, markup([[menu_btn()]]))
             return
         log.warning("Couldn't check a payment with Binance: %s", exc)
+        if own is not None:
+            await _with_own_request(context, state, reply, own)
+            return
         await _unreachable(update, context, state, reply, exc)
         return
     except BinanceError as exc:  # until it's fixed: the key, the server's location, Binance's answers
         log.error("Automatic deposits don't work: %s", exc)
         await _alert_owner(context, f"⚠️ <b>Automatic deposits don't work</b>: {esc(exc)}\n"
                                     "Deposits come to you to approve until it's fixed.")
+        if own is not None:
+            await _with_own_request(context, state, reply, own)
+            return
         why = "Binance refused the API key" if isinstance(exc, BinanceKeyError) else str(exc)
         await _to_owner(update, context, state, reply, f"{order_id}: not checked ({why})")
         return
     db.note_binance_clock(getattr(client, "offset_ms", 0))  # to compare Binance's times with ours
     state.pop("unreachable", None)  # Binance answered: an outage is over
+    if payment is None and not order_id.isdigit():
+        # Binance's transaction ID of an older payment, maybe one used already that the bot
+        # knows by its Order ID only (approved or added by hand while Binance couldn't be
+        # asked): looked up as far back as the owner's checks go, only to refuse it.
+        try:
+            older = await client.find(order_id, int(time.time() * 1000) - OWNER_LOOKBACK_DAYS * 86_400_000)
+        except BinanceUnavailable as exc:
+            if isinstance(exc, BinanceStopping) or getattr(client, "closed", False):
+                await reply(RESTARTED, markup([[menu_btn()]]))
+                return
+            older = None
+        except BinanceError:
+            older = None
+        if older is not None:
+            used = db.binance_payment(older.order_id, older.transaction_id)
+            if used is not None:
+                await _already_used(update, context, state, reply, db.link_payment(used, older))
+                return
+            elsewhere = db.waiting_request_for(older.order_id, older.transaction_id)
+            if elsewhere is not None and elsewhere["user_id"] != user_id:
+                await _waits_elsewhere(update, context, state, reply, elsewhere)
+                return
+            own = own or elsewhere
     if payment is None:
+        if own is not None:
+            await _with_own_request(context, state, reply, own)
+            return
         await _failed(
             update, context, state, reply,
             f"I can't find a payment with Order ID <code>{esc(order_id)}</code> to Binance ID "
@@ -282,7 +328,15 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
     if used is not None:
         await _already_used(update, context, state, reply, db.link_payment(used, payment))
         return
+    elsewhere = db.waiting_request_for(payment.order_id, payment.transaction_id)  # by its other ID
+    if elsewhere is not None and elsewhere["user_id"] != user_id:
+        await _waits_elsewhere(update, context, state, reply, elsewhere)
+        return
+    own = own or elsewhere
     if not payment.received:
+        if own is not None:
+            await _with_own_request(context, state, reply, own)
+            return
         await _failed(update, context, state, reply, "This Order ID isn't a payment to this shop.",
                       "not a payment to the shop")
         return
@@ -334,39 +388,93 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
 async def _already_used(update: Update, context: Ctx, state: dict, reply: _Reply, row: Any) -> None:
     """The payment is in the bot's records already (``row``, from binance_payments)."""
     user_id = update.effective_user.id  # type: ignore[union-attr]
+    owner_id = cfg_of(context).owner_id
     by_hand = row["status"] == "credited" and _added_by_hand(context, row)
-    if by_hand and row["user_id"] == cfg_of(context).owner_id != user_id:
+    if user_id == owner_id and row["user_id"] != user_id or (by_hand and row["deposit_id"] is None
+                                                              and row["user_id"] == user_id == owner_id):
+        # The owner trying a deposit: how it was used; no contact line, no notice to the owner.
+        await _cancel_used(context, state, reply, ".\n" + payment_record(context, row))
+        return
+    if by_hand and row["user_id"] == owner_id != user_id:
         # The owner registered it without saying whose it was: he settled it by hand, so
         # it's added already, whoever asks; it never becomes a request to approve.
-        _done(context, state)
-        await reply("✅ This payment was already added by the owner.", markup([[menu_btn()]]))
+        await _cancel_used(context, state, reply, ": this payment was already added by the owner")
         await notify(context, cfg_of(context).owner_id,
                      f"🧾 {user_html(db_of(context).get_user(user_id))} sent Order ID "
                      f"<code>{esc(state['order_id'])}</code>, which you registered as added by hand. "
-                     "They were told it was added already.")
+                     "They were told it was used already, and their deposit was cancelled.")
         return
     request = db_of(context).held_after_decision(row)
-    if request is not None:
-        # Kept for a request decided without adding it (rejected for its amount, closed), of
-        # this customer or another: nobody got it. Never added automatically: the owner
-        # decides again, told which request had it.
+    if request is not None and row["user_id"] == user_id:
+        # Their own payment, kept for their request decided without adding it (rejected for
+        # its amount, closed): nobody got it. Never added automatically: the owner decides
+        # again, told which request had it (and if the amount still isn't the one chosen).
         verb = "you rejected" if request["status"] == "rejected" else "was closed"
-        whose = "" if request["user_id"] == user_id else \
-            f" for {user_name(db_of(context).get_user(request['user_id']))}"
-        await _to_owner(update, context, state, reply,
-                        f"{state['order_id']}: was in request #{request['id']}{whose}, which {verb}")
+        note = f"{state['order_id']}: was in request #{request['id']}, which {verb}"
+        cfg = cfg_of(context)
+        if row["currency"] and (row["currency"] not in cfg.binance_coins
+                                or Decimal(row["raw_amount"] or "0") != Decimal(state["amount"])):
+            note += f"; is {row['raw_amount']} {row['currency']}, not {state['amount']} {cfg.binance_coins[0]}"
+        await _to_owner(update, context, state, reply, note)
         return
     if row["user_id"] != user_id:
-        await _failed(update, context, state, reply, "This Order ID was already used.",
-                      "already added by hand (you registered it)" if by_hand
-                      else "already used by someone else")
+        # Someone else sent it first (it was added for them, registered for them by the
+        # owner, or waits with their request): an Order ID is used once, so this deposit
+        # ends here; it's never a try to repeat or a request for the owner to approve.
+        await _cancel_used(context, state, reply,
+                           f".\nIf you made this payment yourself, please {contact_owner(context)}")
+        used = db_of(context).used(row)
+        how = "which was used already" if used else "which someone else sent first"
+        text = (f"🧾 {user_html(db_of(context).get_user(user_id))} sent Order ID "
+                f"<code>{esc(state['order_id'])}</code>, {how}. They were told it was used already, "
+                f"and their deposit of {state['amount']}$ was cancelled.\n{payment_record(context, row)}")
+        if request is not None:  # nobody got it: if it's this customer's, add it by hand
+            text += (f"\nIf it's their payment: <code>/addbal {user_id} {state['amount']} "
+                     f"{esc(state['order_id'])}</code>")
+        await notify(context, owner_id, text)
         return
-    if db_of(context).used(row):  # added already (also as part of an approved request)
-        _done(context, state)
-        await reply(_used_text(row), markup([[menu_btn()]]))
+    if db_of(context).used(row):  # added already for them (also as part of an approved request)
+        await _cancel_used(context, state, reply, _used_text(row))
+        return
+    request = db_of(context).get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+    if request is not None:  # kept for their own request, which waits for the owner
+        await _with_own_request(context, state, reply, request, "payment")
         return
     _done(context, state)
-    await reply(_used_text(row), markup([[menu_btn()]]))
+    await reply("🧾 This payment is already with the owner, who decides on it.", markup([[menu_btn()]]))
+
+
+async def _waits_elsewhere(update: Update, context: Ctx, state: dict, reply: _Reply, request: Any) -> None:
+    """Sent again: someone else's request waiting for the owner was sent with this Order ID
+    (Binance didn't confirm it). Like a used one, it ends this deposit; the owner hears it."""
+    db, owner_id = db_of(context), cfg_of(context).owner_id
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    waits = (f"🧾 It waits with request #{request['id']} from {user_html(db.get_user(request['user_id']))} "
+             f"(<b>{money(request['amount'])}</b>): see /pending.")
+    if user_id == owner_id:  # the owner trying a deposit
+        await _cancel_used(context, state, reply, ".\n" + waits)
+        return
+    await _cancel_used(context, state, reply,
+                       f".\nIf you made this payment yourself, please {contact_owner(context)}")
+    await notify(context, owner_id,
+                 f"🧾 {user_html(db.get_user(user_id))} sent Order ID <code>{esc(state['order_id'])}</code>, "
+                 f"which someone else sent first. They were told it was used already, and their deposit "
+                 f"of {state['amount']}$ was cancelled.\n{waits}")
+
+
+async def _with_own_request(context: Ctx, state: dict, reply: _Reply, request: Any, what: str = "Order ID") -> None:
+    """Sent again by the customer whose request waits with it: it's with the owner already,
+    so this deposit ends (no try counted, no second request)."""
+    _done(context, state)
+    await reply(f"🧾 This {what} is already with the owner in your request #{request['id']}, who decides "
+                "on it.\n\nThis deposit was cancelled.", markup([[menu_btn()]]))
+
+
+async def _cancel_used(context: Ctx, state: dict, reply: _Reply, why: str) -> None:
+    """An Order ID sent again: it was used already, and this deposit is cancelled."""
+    _done(context, state)
+    await reply(f"❌ This Order ID was already used{why}.\n\nThis deposit was cancelled.",
+                markup([[menu_btn()]]))
 
 
 async def _unreachable(update: Update, context: Ctx, state: dict, reply: _Reply, exc: Exception) -> None:
@@ -450,11 +558,10 @@ def _done(context: Ctx, state: dict) -> None:
 
 
 def _used_text(row: Any) -> str:
+    """How a payment of this customer's was used, after "This Order ID was already used"."""
     if row["approved_in"] is not None:  # shown in a request the owner approved
-        return f"🧾 This payment was in your request #{row['approved_in']}, which the owner approved."
-    if row["status"] == "credited":
-        return "✅ This payment was already added to your balance."
-    return "🧾 This payment is already with the owner, who decides on it."
+        return f": it was in your request #{row['approved_in']}, which the owner approved"
+    return ": this payment was already added to your balance"
 
 
 async def _alert_owner(context: Ctx, text: str) -> None:
