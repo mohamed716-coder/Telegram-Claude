@@ -256,7 +256,10 @@ def _added(context: Ctx, row: Any, user_id: int) -> str:
 def _request_warnings(context: Ctx, deposit: Any) -> str:
     """What the owner should know before approving a Binance request, as it is now."""
     text = ""
+    held, since, elsewhere = db_of(context).request_warnings(deposit["id"])
     left = db_of(context).still_unconfirmed(deposit) if deposit["unverified"] else []
+    if left:  # one Binance has, waiting with another request, gets its own line below
+        left = [value for value in left if value not in {order_id for order_id, _ in elsewhere}]
     if left is None or left:
         ids = [f"<code>{esc(value)}</code>" for value in left or []]
         text += (f"❗ Binance didn't confirm Order ID {_listed(ids, ', ')} as a new payment to you"
@@ -265,7 +268,10 @@ def _request_warnings(context: Ctx, deposit: Any) -> str:
                  "already (each automatic deposit sent you a 💳 message).\n")
     if deposit["status"] != "pending":
         return text
-    held, since = db_of(context).request_warnings(deposit["id"])
+    for order_id, other in elsewhere:
+        text += (f"⚠️ Binance has Order ID <code>{esc(order_id)}</code> as a payment kept for request "
+                 f"#{other['id']}{_whose(context, other, deposit['user_id'])}, which is waiting: "
+                 "approving this request takes that payment for this customer.\n")
     for payment, doubts, early in held:
         if early:
             text += (f"⚠️ May be added already: <code>{esc(payment['order_id'])}</code> was paid "

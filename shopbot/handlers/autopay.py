@@ -61,7 +61,6 @@ TRIES = 2  # failed checks of one deposit before the owner decides
 UNREACHABLE_TRIES = 2  # checks of one deposit while Binance can't be reached, before the owner
 UNREACHABLE_FOR = 60.0  # decides; they must span this many seconds (short outages pass)
 OWNER_ALERT_GAP = 6 * 3600  # seconds between two "automatic deposits don't work" alerts
-CHECK_DEADLINE = 90.0  # seconds one check may ask Binance (a long search takes ~40)
 RESTARTED = ("⚠️ The bot restarted while checking your payment. Please start again from "
              "💳 Add Balance in a minute.")
 
@@ -215,6 +214,14 @@ async def _check(update: Update, context: Ctx, state: dict, reply: _Reply) -> No
             raise
     except Exception:  # never leave the customer at "Checking ..."
         log.exception("Checking a Binance payment failed")
+        state["errors"] = state.get("errors", 0) + 1
+        if state["errors"] >= TRIES:  # it keeps happening: the owner checks the payment
+            try:
+                await _to_owner(update, context, state, reply,
+                                f"{state['order_id']}: not checked (the bot had an error)")
+                return
+            except Exception:
+                log.exception("Sending a deposit to the owner failed too")
         await reply("⚠️ Something went wrong while checking. Please press 🔄 Check again.",
                     _cancel_kb(again=True))
     finally:
@@ -238,11 +245,7 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         return
     since = max(db.binance_auto_since(), int(time.time() * 1000) - cfg.binance_max_age_hours * 3_600_000)
     try:
-        try:
-            async with asyncio.timeout(CHECK_DEADLINE):
-                payment = await client.find(order_id, since)
-        except TimeoutError:  # e.g. every host hangs: like an outage
-            raise BinanceUnavailable("Binance took too long to answer") from None
+        payment = await client.find(order_id, since)  # a hang ends with httpx's timeouts
     except BinanceUnavailable as exc:  # for now: the network, maintenance, too many requests
         if isinstance(exc, BinanceStopping) or getattr(client, "closed", False):
             # Not an outage: the bot is restarting (a request it cut off fails like the

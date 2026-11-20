@@ -1183,6 +1183,54 @@ def test_approving_a_payment_closes_the_requests_waiting_with_it(tmp_path):
     run(tmp_path, scenario)
 
 
+def test_an_approval_doesnt_close_a_request_that_still_holds_another_payment(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance(pay(order_id=OTHER, amount="20", tx="P_OTHER")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)  # not listed yet: #1 names it
+        (first,) = t.db.pending_deposits()
+        fake.payments.append(pay(amount="25"))
+        await choose(t, ALICE, 30)  # then Q (20 USDT) and P (25 USDT): both wrong for 30$
+        await t.send(ALICE, OTHER)
+        await t.send(ALICE, ORDER)
+        second = t.db.pending_deposits()[-1]
+        assert second["order_id"] == ORDER
+        calls = await t.press(OWNER, f"dok:{first['id']}")  # P waits with #2: he's warned
+        assert "may have been added already" in t.alert(calls)
+        assert f"kept for request #{second['id']}, which is waiting" in t.last_text(calls)
+        calls = await t.press(OWNER, f"dokx:{first['id']}")
+        assert balance(t, ALICE) == 2500 and "closed" not in t.last_text(calls, OWNER["id"])
+        kept = t.db.get_deposit(second["id"])  # #2 stays for Q, its other payment
+        assert kept["status"] == "pending" and kept["order_id"] == OTHER
+        assert t.db.binance_payment(OTHER)["status"] == "owner"
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_naming_a_payment_kept_for_another_customer_warns(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)  # #1 names P, not listed yet
+        (alices,) = t.db.pending_deposits()
+        fake.payments.append(pay(amount="25"))
+        await choose(t, BOB, 25)
+        await t.send(BOB, ORDER)  # Bob's exact claim waits with the owner, holding P
+        bobs = t.db.pending_deposits()[-1]
+        calls = await t.press(OWNER, f"dok:{alices['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 0
+        shown = t.last_text(calls)
+        assert f"kept for request #{bobs['id']} for Bob, which is waiting" in shown
+        assert "❗" not in shown  # Binance does have that Order ID now
+
+    run(tmp_path, scenario)
+
+
 def test_two_customers_waiting_with_one_order_id_is_for_the_owner_to_settle(tmp_path):
     async def scenario(t: ShopTest) -> None:
         fake = with_binance(t, FakeBinance())
@@ -1602,19 +1650,23 @@ def test_a_stop_doesnt_wait_without_limit_for_a_check_started_before_it(tmp_path
     run(tmp_path, scenario)
 
 
-def test_a_check_binance_never_answers_ends_as_an_outage(tmp_path, monkeypatch):
-    monkeypatch.setattr(autopay_module, "CHECK_DEADLINE", 0.05)
+def test_an_error_that_keeps_happening_sends_the_deposit_to_the_owner(tmp_path):
+    class Broken(FakeBinance):
+        async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
+            raise RuntimeError("a bug")
 
     async def scenario(t: ShopTest) -> None:
-        with_binance(t, Hanging())
+        with_binance(t, Broken())
         register(t, ALICE)
         await choose(t, ALICE, 25)
         calls = await t.send(ALICE, ORDER)
-        assert "can't be reached right now" in t.last_text(calls, ALICE["id"])
-        assert t.has_button(calls, "Check again") and t.db.pending_deposits() == []
+        assert "Something went wrong" in t.last_text(calls, ALICE["id"]) and t.db.pending_deposits() == []
+        calls = await t.press(ALICE, t.button(calls, "Check again"))
+        assert "Sent to the owner" in t.last_text(calls, ALICE["id"])
+        (request,) = t.db.pending_deposits()
+        assert "not checked (the bot had an error)" in request["note"] and request["unverified"] == 1
 
     run(tmp_path, scenario)
-
 
 def test_a_check_cut_off_by_the_stop_still_answers_before_the_bot_is_gone(tmp_path, monkeypatch):
     from shopbot import app as app_module

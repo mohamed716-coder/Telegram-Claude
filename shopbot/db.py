@@ -940,18 +940,25 @@ class Database:
     def _close_settled(self, user_id: int, ids: Sequence[Optional[str]], note: str) -> tuple[int, ...]:
         """Close this customer's requests waiting with exactly this payment, which was just
         added: they can't be approved any more (Binance listed it late, or couldn't be
-        asked). Their ids."""
+        asked). One that still holds another payment stays, naming that one. Ids closed."""
         ids = [value for value in ids if value]
         if not ids:
             return ()
-        closed = tuple(row["id"] for row in self._all(
-            "SELECT id FROM deposits WHERE status = 'pending' AND user_id = ? AND order_id IN"
-            f" ({', '.join('?' for _ in ids)})", (user_id, *ids)))
-        for request_id in closed:
+        closed = []
+        for request in self._all(
+                "SELECT id FROM deposits WHERE status = 'pending' AND user_id = ? AND order_id IN"
+                f" ({', '.join('?' for _ in ids)})", (user_id, *ids)):
+            others = [row for row in self.deposit_payments(request["id"]) if row["status"] == "owner"]
+            if others:  # it still holds another payment for the owner: it stays, naming that
+                self.conn.execute(
+                    "UPDATE deposits SET order_id = ?, note = COALESCE(note || char(10), '') || ?"
+                    " WHERE id = ?", (others[-1]["order_id"], note.replace("closed: ", ""), request["id"]))
+                continue
             self.conn.execute(
                 "UPDATE deposits SET status = 'closed', decided_at = ?,"
-                " note = COALESCE(note || char(10), '') || ? WHERE id = ?", (now(), note, request_id))
-        return closed
+                " note = COALESCE(note || char(10), '') || ? WHERE id = ?", (now(), note, request["id"]))
+            closed.append(request["id"])
+        return tuple(closed)
 
     def manual_deposit(
         self, user_id: int, amount: int, seller_threshold: int
@@ -1122,7 +1129,7 @@ class Database:
         return left
 
     def request_warnings(self, deposit_id: int) -> tuple[list[tuple[sqlite3.Row, list[sqlite3.Row], bool]],
-                                                         list[sqlite3.Row]]:
+                                                         list[sqlite3.Row], list[tuple[str, sqlite3.Row]]]:
         """What the owner should know before approving this Binance request, most telling
         first (lists are shown cut short):
         - for each payment it holds, what may be about it already (payment_doubts, and a
@@ -1131,10 +1138,12 @@ class Database:
         - for a request with an Order ID Binance didn't confirm (the owner picks the payment
           himself), the deposits added since it was made that may be that payment: this
           customer's first, then anyone's of the same amount (also when Binance's payment
-          had it but another amount was chosen); newest first."""
+          had it but another amount was chosen); newest first;
+        - an Order ID of it that Binance has as a payment kept for another waiting request
+          (approving this one would take that payment away from it)."""
         dep = self.get_deposit(deposit_id)
         if dep is None or dep["method"] != "binance" or dep["receipt_file_id"]:
-            return [], []
+            return [], [], []
         rank = {"approved": 0, "rejected": 1}
         held = []
         for row in self.deposit_payments(deposit_id):
@@ -1162,7 +1171,15 @@ class Database:
                 (deposit_id, self._before(dep["created_at"]), dep["user_id"], dep["amount"],
                  dep["amount"], dep["user_id"]),
             )
-        return held, since
+        elsewhere = []  # its payment, as Binance has it, waits with another request
+        for value in dict.fromkeys([dep["order_id"], *(dep["unconfirmed"] or "").split()]):
+            row = self.binance_payment(value) if value else None
+            other = (self.get_deposit(row["deposit_id"])
+                     if row is not None and row["status"] == "owner" and row["deposit_id"] not in (None, deposit_id)
+                     else None)
+            if other is not None and other["status"] == "pending":
+                elsewhere.append((row["order_id"], other))
+        return held, since, elsewhere
 
     def approval_warnings(self, deposit_id: int, listed: int = 3) -> list[sqlite3.Row]:
         """Why approving this request may add a payment twice: what request_warnings gives,
@@ -1176,9 +1193,10 @@ class Database:
             used = self.binance_payment(dep["order_id"])
             if used is not None and used["status"] == "credited":
                 return []
-        held, since = self.request_warnings(deposit_id)
+        held, since, elsewhere = self.request_warnings(deposit_id)
         found = {row["id"]: row for _, doubts, _ in held for row in doubts[:listed]}
         found.update((row["id"], row) for row in since[:listed])
+        found.update((other["id"], other) for _, other in elsewhere)
         if any(early for _, _, early in held):
             found[0] = dep  # paid before automatic checking started: confirm that too
         return [found[key] for key in sorted(found)]
