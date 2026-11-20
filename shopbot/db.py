@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -198,6 +199,25 @@ class PriceChanged(ShopError):
         self.unit = unit
 
 
+class PaymentWaiting(ShopError):
+    """This Binance payment is kept for a request still waiting for the owner."""
+
+    def __init__(self, row: sqlite3.Row, request: sqlite3.Row) -> None:
+        super().__init__("This payment is waiting with a deposit request.")
+        self.row = row
+        self.request = request
+
+
+class PaymentApproved(ShopError):
+    """This Binance payment was kept for a request the owner approved: it may be part of
+    that approval, so adding balance for it by hand could add it twice."""
+
+    def __init__(self, row: sqlite3.Row, request: Optional[sqlite3.Row]) -> None:
+        super().__init__("This payment was in a request that was approved.")
+        self.row = row
+        self.request = request
+
+
 class PaymentUsed(ShopError):
     """This Binance payment (Order ID) was already used."""
 
@@ -241,6 +261,21 @@ class DepositDecision:
     closed: tuple[int, ...] = ()  # requests closed because this added their payment
 
 
+@dataclass
+class Registered:
+    """A Binance payment the owner recorded as added by hand (/regbin, /addbal with an
+    Order ID)."""
+    payment: sqlite3.Row
+    closed: tuple[int, ...] = ()  # this customer's requests waiting with it, now closed
+
+
+@dataclass
+class ManualDeposit:
+    user: sqlite3.Row
+    became_seller: bool
+    registered: Optional[Registered] = None  # with an Order ID
+
+
 def clean_label_name(raw: str) -> str:
     return " ".join((raw or "").split())
 
@@ -259,6 +294,9 @@ class Database:
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._tx_depth = 0
+        # Who gets a sale among sellers of one product, and which products are pulled;
+        # tests may put a seeded random.Random here.
+        self.rng: random.Random = random.SystemRandom()
         self.conn.execute("PRAGMA foreign_keys = ON")
         if path != ":memory:":
             mode = self.conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
@@ -780,7 +818,7 @@ class Database:
         seller_discount_percent: int,
         expected_unit: Optional[int] = None,
     ) -> PurchaseResult:
-        """Buy ``quantity`` items of a product, oldest stock first.
+        """Buy ``quantity`` items of a product, picked fairly between sellers (_pick_fairly).
 
         ``expected_unit`` is the price each that the buyer was shown and confirmed; if the
         price is different now (the owner changed it, or the seller discount ended),
@@ -805,11 +843,7 @@ class Database:
             if expected_unit is not None and unit != expected_unit:
                 raise PriceChanged(unit)
             total = unit * quantity
-            rows = self._all(
-                "SELECT id, owner_id FROM items WHERE label_id = ? AND status = 'available'"
-                " ORDER BY id LIMIT ?",
-                (label_id, quantity),
-            )
+            rows = self._pick_fairly(label_id, quantity)
             if len(rows) < quantity:
                 if not rows:
                     raise ShopError("Sorry, this product is sold out.")
@@ -848,6 +882,71 @@ class Database:
                 self._scalar("SELECT balance FROM users WHERE id = ?", (buyer_id,))
             )
         return PurchaseResult(order, items, new_balance, credits)  # type: ignore[arg-type]
+
+    def _pick_fairly(self, label_id: int, quantity: int) -> list[sqlite3.Row]:
+        """``quantity`` available items of a product (fewer if there are fewer), unit by unit:
+        each unit comes from a seller chosen at random among those who still have one, all
+        with the same chance however many they have (100, 5 or 1: a third each); from that
+        seller, the oldest. A seller whose stock runs out drops out, and the others share
+        the chance."""
+        left = {row["owner_id"]: row["n"] for row in self._all(
+            "SELECT owner_id, COUNT(*) AS n FROM items WHERE label_id = ? AND status = 'available'"
+            " GROUP BY owner_id", (label_id,))}
+        taken: dict[int, int] = {}
+        for _ in range(min(quantity, sum(left.values()))):
+            seller = self.rng.choice(sorted(owner for owner, n in left.items() if n > 0))
+            left[seller] -= 1
+            taken[seller] = taken.get(seller, 0) + 1
+        rows: list[sqlite3.Row] = []
+        for seller, count in taken.items():
+            rows += self._all(
+                "SELECT id, owner_id FROM items WHERE label_id = ? AND status = 'available'"
+                " AND owner_id = ? ORDER BY id LIMIT ?", (label_id, seller, count))
+        return sorted(rows, key=lambda row: row["id"])
+
+    # -------------------------------------------------------------------- pulls
+    def seller_products(self, owner_id: int) -> list[sqlite3.Row]:
+        """The products (labels) where this seller has stock: label id and count."""
+        return self._all(
+            "SELECT i.label_id AS label_id, COUNT(*) AS n FROM items i JOIN labels l ON l.id = i.label_id"
+            " WHERE i.owner_id = ? AND i.status = 'available' AND l.deleted = 0"
+            " GROUP BY i.label_id ORDER BY i.label_id", (owner_id,))
+
+    def pull_random(self, label_id: int, owner_id: int, count: int, by_user: int) -> list[sqlite3.Row]:
+        """Take up to ``count`` of this seller's available items of a product, chosen at
+        random, out of the shop for ``by_user`` (status 'pulled'). The items taken."""
+        if count < 1:
+            raise ShopError("The number must be at least 1.")
+        with self.tx():
+            ids = [row["id"] for row in self._all(
+                "SELECT id FROM items WHERE label_id = ? AND owner_id = ? AND status = 'available'"
+                " ORDER BY id", (label_id, owner_id))]
+            chosen = sorted(self.rng.sample(ids, min(count, len(ids))))
+            if not chosen:
+                return []
+            ts = now()
+            self.conn.executemany(
+                "UPDATE items SET status = 'pulled', closed_at = ?, buyer_id = ? WHERE id = ?"
+                " AND status = 'available'", [(ts, by_user, item_id) for item_id in chosen])
+            return self._all(
+                f"SELECT * FROM items WHERE id IN ({', '.join('?' for _ in chosen)}) ORDER BY id", chosen)
+
+    def restore_pulled(self, item_ids: Sequence[int]) -> list[int]:
+        """Put pulled items that couldn't be sent back in stock, if their product is still
+        one (not deleted, no labels inside). The ids put back."""
+        if not item_ids:
+            return []
+        with self.tx():
+            back = [row["id"] for row in self._all(
+                "SELECT i.id FROM items i JOIN labels l ON l.id = i.label_id"
+                f" WHERE i.status = 'pulled' AND i.id IN ({', '.join('?' for _ in item_ids)})"
+                " AND l.deleted = 0 AND NOT EXISTS (SELECT 1 FROM labels c WHERE c.parent_id = l.id"
+                " AND c.deleted = 0) ORDER BY i.id", list(item_ids))]
+            if back:
+                self.conn.execute(
+                    "UPDATE items SET status = 'available', closed_at = NULL, buyer_id = NULL"
+                    f" WHERE id IN ({', '.join('?' for _ in back)})", back)
+            return back
 
     def get_order(self, order_id: int) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM orders WHERE id = ?", (order_id,))
@@ -961,18 +1060,23 @@ class Database:
         return tuple(closed)
 
     def manual_deposit(
-        self, user_id: int, amount: int, seller_threshold: int
-    ) -> tuple[sqlite3.Row, bool]:
-        """Owner-added balance (/addbal). Counts as a deposit."""
+        self, user_id: int, amount: int, seller_threshold: int, order_id: Optional[str] = None
+    ) -> ManualDeposit:
+        """Owner-added balance (/addbal). Counts as a deposit. With ``order_id``, that
+        Binance payment is registered as added with it (see register_payment): if it can't
+        be (PaymentUsed, PaymentWaiting), nothing is added."""
         if amount <= 0:
             raise ShopError("The amount must be more than 0.")
-        with self.tx():
+        registered = None
+        with self.tx():  # _register refusing rolls the deposit back too
             self.ensure_user(user_id)
             cur = self.conn.execute(
-                "INSERT INTO deposits (user_id, amount, method, status, created_at, decided_at)"
-                " VALUES (?, ?, 'manual', 'approved', ?, ?)",
-                (user_id, amount, now(), now()),
+                "INSERT INTO deposits (user_id, amount, method, status, created_at, decided_at, order_id)"
+                " VALUES (?, ?, 'manual', 'approved', ?, ?, ?)",
+                (user_id, amount, now(), now(), order_id),
             )
+            if order_id:
+                registered = self._register(order_id, user_id, amount, int(cur.lastrowid))
             self.conn.execute(
                 "UPDATE users SET balance = balance + ?, total_deposits = total_deposits + ?"
                 " WHERE id = ?",
@@ -980,7 +1084,8 @@ class Database:
             )
             self._log_balance(user_id, amount, "manual deposit", f"deposit#{cur.lastrowid}")
             became_seller = self._maybe_auto_seller(user_id, seller_threshold)
-        return self.get_user(user_id), became_seller  # type: ignore[return-value]
+            user = self.get_user(user_id)
+        return ManualDeposit(user, became_seller, registered)  # type: ignore[arg-type]
 
     def set_balance(
         self, user_id: int, new_balance: int, expected_old: Optional[int] = None
@@ -1003,6 +1108,117 @@ class Database:
         return old, new_balance
 
     # --------------------------------------------------------- binance payments
+    def _check_registrable(self, order_id: str, user_id: int, adding: bool = False) -> Optional[sqlite3.Row]:
+        """The row of this payment if it was kept for a request decided without adding it, or
+        for this customer's waiting request that holds only it (it's closed with this);
+        None if there's no row. PaymentUsed if it was added, PaymentWaiting if a request
+        still waits with it otherwise; with ``adding`` (balance is added for it),
+        PaymentApproved if a request that held it was approved (it may be part of that)."""
+        row = self.binance_payment(order_id)
+        if row is None:
+            return None
+        if row["status"] == "credited":
+            raise PaymentUsed(row)
+        request = self.get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+        if request is not None and request["status"] == "pending" and not (
+                request["user_id"] == user_id
+                and [p["order_id"] for p in self.deposit_payments(request["id"]) if p["status"] == "owner"]
+                == [row["order_id"]]):
+            raise PaymentWaiting(row, request)
+        if adding and row["approved_in"] is not None:
+            raise PaymentApproved(row, self.get_deposit(row["approved_in"]))
+        return row
+
+    def _register(self, order_id: str, user_id: int, amount: int, deposit_id: Optional[int]) -> Registered:
+        row = self._check_registrable(order_id, user_id, adding=deposit_id is not None)
+        closed: list[int] = []
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO binance_payments (order_id, user_id, amount, raw_amount, currency,"
+                " status, deposit_id, created_at) VALUES (?, ?, ?, '', '', 'credited', ?, ?)",
+                (order_id, user_id, amount, deposit_id, now()))
+        else:  # kept for a request: the owner settled it by hand
+            request = self.get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+            self.conn.execute(
+                "UPDATE binance_payments SET status = 'credited', user_id = ?, amount = ?,"
+                " held_before = deposit_id, deposit_id = ? WHERE order_id = ?",
+                (user_id, amount, deposit_id, row["order_id"]))
+            if request is not None and request["status"] == "pending":  # this customer's, holding only it
+                self.conn.execute(
+                    "UPDATE deposits SET status = 'closed', decided_at = ?,"
+                    " note = COALESCE(note || char(10), '') || ? WHERE id = ?",
+                    (now(), "closed: added by hand", request["id"]))
+                closed.append(request["id"])
+        row = self.binance_payment(order_id)
+        assert row is not None
+        ids = {order_id, row["order_id"], row["transaction_id"]} - {None}
+        closed += self._close_settled(user_id, tuple(ids), "closed: added by hand")
+        # This customer's requests that name no payment and hold none, whose Order IDs are
+        # all added for them now (this one among them): settled too.
+        for request in self._all(
+                "SELECT * FROM deposits WHERE status = 'pending' AND user_id = ? AND method = 'binance'"
+                " AND receipt_file_id IS NULL AND order_id IS NULL AND unconfirmed IS NOT NULL",
+                (user_id,)):
+            if (ids & set(request["unconfirmed"].split()) and not self.deposit_payments(request["id"])
+                    and self.still_unconfirmed(request) == []):
+                self.conn.execute(
+                    "UPDATE deposits SET status = 'closed', decided_at = ?,"
+                    " note = COALESCE(note || char(10), '') || ? WHERE id = ?",
+                    (now(), "closed: added by hand", request["id"]))
+                closed.append(request["id"])
+        return Registered(row, tuple(closed))
+
+    def register_payment(self, order_id: str, user_id: Optional[int] = None) -> Registered:
+        """The owner added this Binance payment by hand (/regbin): it's recorded as added,
+        so it can never be added again, automatically or by a request. ``user_id``: whose
+        it was (the owner's if not said). PaymentUsed if it was added already,
+        PaymentWaiting if a request still waits with it (decide that instead)."""
+        user_id = user_id or self.owner_id
+        with self.tx():
+            self.ensure_user(user_id)
+            return self._register(order_id, user_id, 0, None)
+
+    def registered_payment(self, order_id: str) -> Optional[sqlite3.Row]:
+        """The record whose own Order ID is this (not one that has it as its other ID)."""
+        return self._one("SELECT * FROM binance_payments WHERE order_id = ?", (order_id,))
+
+    def complete_payment(self, row: sqlite3.Row, payment: Any) -> sqlite3.Row:
+        """Binance showed a payment that was registered by one of its IDs only: note its other
+        ID (unless another record has it), amount and time too, in this record."""
+        rowid = self._scalar("SELECT rowid FROM binance_payments WHERE order_id = ?", (row["order_id"],))
+        if rowid is None:
+            return row
+        self.link_payment(row, payment)  # may change this record's Order ID, never its rowid
+        mine = self._one("SELECT * FROM binance_payments WHERE rowid = ?", (rowid,))
+        if mine is not None and not mine["currency"]:
+            self.conn.execute(
+                "UPDATE binance_payments SET raw_amount = ?, currency = ?, paid_at = COALESCE(paid_at, ?)"
+                " WHERE rowid = ?",
+                (format(payment.amount.normalize(), "f"), payment.currency, self._paid_at(payment), rowid))
+        return self._one("SELECT * FROM binance_payments WHERE rowid = ?", (rowid,)) or row
+
+    def payment_records(self, *ids: str) -> list[sqlite3.Row]:
+        """Every record that has one of these IDs as its Order ID or its other ID."""
+        values = [value for value in ids if value]
+        if not values:
+            return []
+        marks = ", ".join("?" for _ in values)
+        return self._all(f"SELECT * FROM binance_payments WHERE order_id IN ({marks})"
+                         f" OR transaction_id IN ({marks}) ORDER BY rowid", (*values, *values))
+
+    def request_used(self, deposit_id: int) -> list[sqlite3.Row]:
+        """Payments a waiting Binance request names (its Order ID, or one Binance didn't
+        confirm) that something else added already: approving it may add them again."""
+        dep = self.get_deposit(deposit_id)
+        if dep is None or dep["method"] != "binance" or dep["receipt_file_id"]:
+            return []
+        used: dict[str, sqlite3.Row] = {}
+        for value in dict.fromkeys([dep["order_id"], *(dep["unconfirmed"] or "").split()]):
+            row = self.binance_payment(value) if value else None
+            if row is not None and row["status"] == "credited" and row["deposit_id"] != deposit_id:
+                used.setdefault(row["order_id"], row)
+        return list(used.values())
+
     def binance_payment(self, *ids: str) -> Optional[sqlite3.Row]:
         """The already used payment with one of these Order IDs or transaction IDs."""
         for value in ids:
@@ -1199,6 +1415,9 @@ class Database:
         found.update((other["id"], other) for _, other in elsewhere)
         if any(early for _, _, early in held):
             found[0] = dep  # paid before automatic checking started: confirm that too
+        for row in self.request_used(deposit_id):  # it names a payment added already
+            added = self.get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+            found[added["id"] if added is not None else -1] = added if added is not None else dep
         return [found[key] for key in sorted(found)]
 
     def link_payment(self, row: sqlite3.Row, payment: Any) -> sqlite3.Row:

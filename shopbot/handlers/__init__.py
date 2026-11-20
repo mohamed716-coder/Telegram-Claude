@@ -22,6 +22,7 @@ COMMANDS = [
     ("cancel", common.cmd_cancel),
     ("withdraw", money.cmd_withdraw),
     ("addbal", owner.cmd_addbal),
+    ("regbin", owner.cmd_regbin),
     ("modifybal", owner.cmd_modifybal),
     ("addadmin", owner.cmd_addadmin),
     ("removeadmin", owner.cmd_removeadmin),
@@ -34,6 +35,7 @@ COMMANDS = [
     ("status", owner.cmd_status),
     ("pending", money.cmd_pending),
     ("announce", broadcast.cmd_announce),
+    ("pull", stock.cmd_pull),
 ]
 
 # (regex on callback_data, handler). Callback data formats:
@@ -41,6 +43,9 @@ COMMANDS = [
 #   sc:<label>:<qty>:<nonce>  confirm purchase      mo:<page> / mov:<order>  my orders
 #   lb/ln/lp/lr/ld/ldy/lx  labels (lx = disable/enable)   ap/apd/apc  add product
 #   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dokx/dno  deposits
+#   plp:<seller>:<page> / pl:<seller>:<label> / plq:<seller>:<label>:<n> / plo:<seller>:<label>
+#   ply:<seller>:<label>:<n>:<nonce>  /pull: list, product, how many, other amount, confirm
+#   plr:<item>  send a pulled product that may not have arrived again
 #   dck  check a Binance Order ID again (autopay.py)
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
 #   an:<nonce> / anc[:<nonce>] / ans:<job>  send / cancel / stop an announcement (owner)
@@ -73,6 +78,12 @@ CALLBACKS = [
     (r"^mry:", stock.cb_item_remove_yes),
     (r"^mu:", stock.cb_item_pull),
     (r"^ma$", stock.cb_analysis),
+    (r"^plp:", stock.cb_pull_page),
+    (r"^pl:", stock.cb_pull_product),
+    (r"^plq:", stock.cb_pull_quantity),
+    (r"^plo:", stock.cb_pull_other),
+    (r"^ply:", stock.cb_pull_yes),
+    (r"^plr:", stock.cb_pull_resend),
     (r"^dp$", money.cb_deposit_menu),
     (r"^da:", money.cb_deposit_amount),
     (r"^dc$", money.cb_deposit_custom),

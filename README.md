@@ -114,11 +114,25 @@ The owner sees and manages everyone's products; an admin only their own.
 **📥 Download sales analysis** sends a spreadsheet (CSV) with sold / left / revenue per
 product and per seller.
 
+**`/pull`** takes many at once: choose one of your products and how many (1, 5, 10, 50,
+all, or any number up to 200 at a time). They're **picked at random** from your stock,
+taken out of the shop and sent to you. Admins pull their own; the owner pulls his own
+with `/pull`, or an admin's with `/pull ID` (the admin is told how many). A product that
+can't be sent goes back in stock, and you're told which; one Telegram didn't answer for (it
+may have arrived) is tried once more and otherwise stays pulled, with a button to get it
+again, so it's never sold to someone else as well.
+
 ### 4. Buying
 
 Customers open 🛍 Shop, pick a product and a quantity, and confirm. The price comes off
 their balance and the products are sent right away. The money goes to the **earnings** of
 whoever added each product (owner or admin).
+
+**Fair between sellers:** when several sellers have the same product in stock, every sale
+is drawn at random between them, all with the **same chance**, however many each one has.
+With Adam at 100, Bella at 1 and the owner at 5, each sale is a third each; once Bella's
+one is sold it's half and half between Adam and the owner, until someone adds stock. An
+order of several is drawn one product at a time (each seller's oldest one goes).
 
 - The buyer always pays the total shown on the **Confirm** screen. If the price changes
   before they press Confirm, nothing is charged and they're shown the new total to confirm.
@@ -145,6 +159,18 @@ Binance Pay to Binance ID **850940840**. Then:
 If a request ever doesn't reach the owner (or the message gets deleted), `/pending` sends
 every waiting request again with its buttons.
 
+**A payment the owner added by hand** (the customer sent the money and wrote to him):
+`/addbal ID AMOUNT ORDER_ID` adds the balance and registers the payment's Order ID in one
+go, or `/regbin ORDER_ID` (optionally `/regbin ORDER_ID USER_ID`) registers it afterwards.
+Either way that payment can never be added again automatically, and the customer is told
+it was already added; a request that names it needs **⚠️ Approve anyway**. With a Binance
+key the bot then looks the payment up and tells the owner what Binance has (amount, coin,
+time), with a ⚠️ if it isn't what he added or the bot knew it under its other ID. If the
+payment is waiting with that customer's request (and is the only one it holds), registering
+it for them closes the request and tells them; with anyone else's request, or one that
+holds more payments, decide the request first. A payment from a request you approved isn't
+added by hand with its Order ID (it may be part of that approval).
+
 **Sellers** get **10% off** every product. Anyone whose total deposits reach **1000$**
 becomes a seller automatically, or the owner can use `/seller ID`.
 
@@ -166,7 +192,9 @@ earned: they still see 📊 Earnings and can use `/withdraw`.
 | `/id` | everyone | Show your Telegram ID (also the 🆔 My ID button). The owner can send `/id @username` to get someone's ID (they must have used the bot) |
 | `/cancel` | everyone | Cancel what you're doing |
 | `/withdraw` | owner, admins | Withdraw earnings to Binance |
-| `/addbal ID AMOUNT` | owner | Add balance to a user (counts as a deposit) |
+| `/pull` | owner, admins | Take products out of your stock, picked at random, as many as you choose (owner: `/pull ID` for an admin's) |
+| `/addbal ID AMOUNT` | owner | Add balance to a user (counts as a deposit). `/addbal ID AMOUNT ORDER_ID` also registers that Binance Pay payment, so it can't be added again |
+| `/regbin ORDER_ID [USER_ID]` | owner | Register a Binance Pay payment you added by hand: it can't be added again |
 | `/modifybal ID` | owner | Show a user's balance and set a new one |
 | `/addadmin ID` / `/removeadmin ID` | owner | Give / remove the admin panel |
 | `/seller ID` / `/removeseller ID` | owner | Give / remove the 10% seller discount |

@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import pytest
 
-from harness import OWNER, OWNER_ID, ShopTest, run, tg_user
+from harness import OWNER, OWNER_ID, Picks, ShopTest, run, tg_user
 from shopbot.db import CODE_ALPHABET, CODE_LENGTH
 from shopbot.handlers import stock as stock_module
 
@@ -1702,8 +1702,9 @@ def test_sales_analysis_owner_gets_all_sellers_with_totals(tmp_path):
         await add_products(t, OWNER, ids["five"], ["O-1", "O-2", "O-3"])
         await add_products(t, ADMIN, ids["five"], ["A-1", "A-2"])
         await add_products(t, ADMIN2, ids["ten"], ["B-1", "B-2", "B-3"])
-        # Alice buys 4 × 5GB: the oldest first → O-1, O-2, O-3, A-1.
+        # Alice buys 4 × 5GB: the owner makes 3 of the sales, Adam 1 → O-1, O-2, O-3, A-1.
         await give_balance(t, ALICE, 100)
+        t.db.rng = Picks(OWNER_ID, OWNER_ID, OWNER_ID, ADMIN["id"])
         calls = await buy(t, ALICE, ids["five"], 4)
         codes = {"O-1", "O-2", "O-3", "A-1", "A-2"}
         assert [c.params["text"] for c in sent_to(calls, ALICE["id"], {"sendMessage"})

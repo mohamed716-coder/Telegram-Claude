@@ -31,7 +31,7 @@ from typing import Any, Optional
 
 import pytest
 
-from harness import BOT_USER, OWNER, OWNER_ID, Call, ShopTest, run, tg_user
+from harness import BOT_USER, OWNER, OWNER_ID, Call, Picks, ShopTest, run, tg_user
 from shopbot.handlers.common import setup_bot_profile
 
 ALICE = tg_user(1001, "Alice", "alice")
@@ -494,6 +494,7 @@ def test_customer_cannot_open_someone_elses_order(tmp_path):
     async def scenario(t: ShopTest):
         world = build_world(t)
         give_balance(t, ALICE, 5000)
+        t.db.rng = Picks(OWNER_ID)  # the owner's SECRET-OWNER-1 is sold
         calls = await t.press(ALICE, f"sb:{world['five']}:1")
         await t.press(ALICE, t.button(calls, "Confirm"))
         (order,) = t.db.user_orders(ALICE["id"], 0, 10)
@@ -1463,7 +1464,7 @@ def test_big_purchase_orders_and_reports_stay_within_telegram_limits(tmp_path):
         calls = await t.press(buyer, f"sh:{five}:0")
         calls = await t.press(buyer, t.button(calls, "Other amount"))
         assert "from 1 to 70" in t.last_text(calls)
-        calls = await t.send(buyer, "65")  # oldest first: 40 owner + 20 Adam + 5 Zara
+        calls = await t.send(buyer, "65")  # all of Adam's 20 and Zara's 10, 35 of the owner's
         calls = await t.press(buyer, t.button(calls, "Confirm"))
         summary = [x for x in t.texts(calls, buyer["id"]) if "Purchase successful" in x]
         assert summary and "(+15)" in summary[0]
@@ -1621,6 +1622,7 @@ def test_double_presses_do_not_repeat_one_shot_actions(tmp_path):
         world = build_world(t)
         give_balance(t, ALICE, 5000)
         five = world["five"]
+        t.db.rng = Picks(OWNER_ID)  # Adam's item stays in stock for the pull below
 
         calls = await t.press(ALICE, f"sb:{five}:1")
         confirm = t.button(calls, "Confirm")

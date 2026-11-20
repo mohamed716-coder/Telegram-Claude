@@ -53,6 +53,7 @@ USER_COMMANDS = [
 ADMIN_COMMANDS = [
     ("start", "Open the admin panel"),
     ("withdraw", "Withdraw your earnings"),
+    ("pull", "Take products out of your stock"),
     ("id", "Show your Telegram ID"),
     ("help", "Show all commands"),
     ("cancel", "Cancel the current action"),
@@ -61,6 +62,7 @@ OWNER_COMMANDS = [
     ("start", "Open the owner panel"),
     ("help", "Show all commands"),
     ("addbal", "Add balance to a user by ID"),
+    ("regbin", "Register a Binance payment added by hand"),
     ("modifybal", "See and set a user's balance"),
     ("addadmin", "Make a user an admin by ID"),
     ("removeadmin", "Remove an admin by ID"),
@@ -69,6 +71,7 @@ OWNER_COMMANDS = [
     ("ban", "Ban a user by ID"),
     ("unban", "Unban a user by ID"),
     ("withdraw", "Withdraw your earnings"),
+    ("pull", "Take products out of stock"),
     ("close", "Close the shop"),
     ("open", "Open the shop"),
     ("status", "All users, balances and deposits"),
@@ -495,6 +498,10 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
             "",
             "👑 <b>Owner panel</b>",
             "/addbal <code>ID AMOUNT</code> — add balance to a user",
+            "/addbal <code>ID AMOUNT ORDER_ID</code> — the same for a Binance Pay payment: "
+            "its Order ID can't be added again",
+            "/regbin <code>ORDER_ID</code> — register a Binance payment you added by hand, so it "
+            "can't be added again (<code>/regbin ORDER_ID USER_ID</code>: whose it was)",
             "/modifybal <code>ID</code> — see a user's balance and set a new one",
             "/addadmin <code>ID</code> — make a user an admin",
             "/removeadmin <code>ID</code> — remove an admin",
@@ -508,6 +515,7 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
             "/pending — deposits and withdrawals waiting for your answer",
             "/announce — send a message to all users (or <code>/announce your text</code>)",
             "/id <code>@username</code> — find a user's ID (someone who has started the bot)",
+            "/pull <code>ID</code> — take products out of an admin's stock",
             "",
             "Buttons: 🛍 Shop · 📦 My Products · ➕ Add Product · 🏷 Add Label · "
             "📊 Earnings · 💳 Add Balance",
@@ -518,6 +526,8 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
             "👮 <b>Admin panel</b>",
             "/withdraw — withdraw your earnings to Binance"
             + (" (recorded instantly for the owner)" if role == OWNER else ""),
+            "/pull — take products out of your stock: choose one and how many, they're picked "
+            "at random and sent to you",
         ]
         if role == ADMIN:
             lines.append(

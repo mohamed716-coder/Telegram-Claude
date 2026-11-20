@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import logging
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -17,6 +18,7 @@ from telegram.error import TelegramError
 
 from ..content import extract_content, send_content
 from ..db import ShopError
+from . import shop
 from .common import (
     BLUE,
     GREEN,
@@ -25,6 +27,7 @@ from .common import (
     answer,
     btn,
     callback_ints,
+    cancel_kb,
     cfg_of,
     clear_state,
     csv_safe,
@@ -39,14 +42,18 @@ from .common import (
     markup,
     menu_btn,
     money,
+    need_text,
+    notify,
     page_count,
     pager,
+    parse_int,
     set_state,
     short,
     show,
     stale_button,
     state_handler,
     try_show,
+    user_html,
     user_name,
     utf16_len,
 )
@@ -665,6 +672,333 @@ async def cb_item_pull(update: Update, context: Ctx) -> None:
             )
         except TelegramError:
             pass
+
+
+# ===================================================================== /pull
+PULL_PAGE_SIZE = 20
+PULL_QUICK = (1, 5, 10, 50)
+MAX_PULL = shop.MAX_QUANTITY  # products in one pull (they're sent one message each)
+RESEND_BUTTONS = 10  # "send again" buttons under a pull's summary
+
+
+def tail_path(path: str, limit: int = 40) -> str:
+    """'A › B › C' cut from the front, so the product's own name always shows."""
+    if len(path) <= limit:
+        return path
+    parts = path.split(" › ")
+    text = parts[-1]
+    for part in reversed(parts[:-1]):
+        if len("… › ") + len(part) + len(" › ") + len(text) > limit:
+            break
+        text = f"{part} › {text}"
+    return short("… › " + text, limit)
+
+
+def _from_whom(context: Ctx, user_id: int, seller: int) -> str:
+    if seller == user_id:
+        return "your stock"
+    return f"the stock of {user_html(db_of(context).get_user(seller))}"
+
+
+async def cmd_pull(update: Update, context: Ctx) -> None:
+    """/pull: take products out of your stock, picked at random. The owner pulls from
+    anyone's stock with /pull ID."""
+    message = update.effective_message
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    if message is None:
+        return
+    if not is_staff(context, user_id):
+        await message.reply_text("⛔ Only the owner and admins can use this command.")
+        return
+    args = context.args or []
+    seller = user_id
+    if args:
+        target = parse_int(args[0]) if len(args) == 1 else None
+        if target is None or target <= 0:
+            await message.reply_text(
+                f"⚠️ {' '.join(args)} isn't a user ID. Send /pull for your products"
+                + (", or /pull ID for another seller's." if is_owner(context, user_id) else "."))
+            return
+        if target != user_id and not is_owner(context, user_id):
+            await message.reply_text("⛔ Only the owner can pull another seller's products. "
+                                     "Send /pull for yours.")
+            return
+        seller = target
+    await render_pull_list(update, context, seller, 0, new=True)
+
+
+async def _pull_allowed(update: Update, context: Ctx, seller: int) -> bool:
+    """A button of /pull: still staff, and the owner or pulling from their own stock."""
+    if not await _staff_only(update, context):
+        return False
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    if seller != user_id and not is_owner(context, user_id):
+        await answer(update.callback_query, "You can only pull your own products.", show_alert=True)
+        return False
+    return True
+
+
+async def render_pull_list(
+    update: Update, context: Ctx, seller: int, page: int = 0, *, new: bool = False
+) -> None:
+    db = db_of(context)
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    products = db.seller_products(seller)
+    lines = ["📤 <b>Pull products</b>", f"From {_from_whom(context, user_id, seller)}.", ""]
+    if not products:
+        lines.append("There are no products in stock." if seller == user_id
+                     else "They have no products in stock.")
+        await show(update, context, "\n".join(lines), markup([[menu_btn()]]), new=new)
+        return
+    lines.append("Choose a product, then how many: they're picked at random, taken out of the "
+                 "shop and sent to you here.")
+    if seller == user_id and is_owner(context, user_id):
+        lines.append("To pull an admin's products: /pull <code>ID</code>")
+    pages = page_count(len(products), PULL_PAGE_SIZE)
+    page = min(page, pages - 1)
+    buttons = [btn(f"{tail_path(db.path_text(row['label_id']))} · {row['n']}", f"pl:{seller}:{row['label_id']}")
+               for row in products[page * PULL_PAGE_SIZE : (page + 1) * PULL_PAGE_SIZE]]
+    rows: list[list[Any]] = [[b] for b in buttons]
+    rows.append(pager(f"plp:{seller}:", page, pages))
+    rows.append([menu_btn()])
+    await show(update, context, "\n".join(lines), markup(rows), new=new)
+
+
+async def cb_pull_page(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    try:
+        seller, page = callback_ints(query.data, 2)
+    except ValueError:
+        await stale_button(update)
+        return
+    if not await _pull_allowed(update, context, seller):
+        return
+    await answer(query)
+    await render_pull_list(update, context, seller, page)
+
+
+async def render_pull_product(
+    update: Update, context: Ctx, seller: int, label_id: int, *, new: bool = False, note: str = ""
+) -> None:
+    db = db_of(context)
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    label = db.get_label(label_id)
+    stock = db.count_items(label_id, seller) if label is not None else 0
+    lines = [note, ""] if note else []
+    lines += ["📤 <b>Pull products</b>"]
+    if label is None or not stock:
+        lines.append("There are no products left here." if label is not None
+                     else "This product no longer exists.")
+        await show(update, context, "\n".join(lines),
+                   markup([[btn("⬅️ Back", f"plp:{seller}:0"), menu_btn()]]), new=new)
+        return
+    most = min(stock, MAX_PULL)
+    lines += [
+        f"📦 {esc(db.path_text(label_id))}",
+        f"From {_from_whom(context, user_id, seller)}: <b>{stock}</b> in stock",
+        "",
+        "How many? They're picked at random.",
+    ]
+    if stock > MAX_PULL:
+        lines.append(f"Up to {MAX_PULL} at a time.")
+    buttons = [btn(str(n), f"plq:{seller}:{label_id}:{n}") for n in PULL_QUICK if n < most]
+    buttons.append(btn(f"All · {most}" if most == stock else str(most), f"plq:{seller}:{label_id}:{most}"))
+    rows: list[list[Any]] = grid(buttons, 3)
+    rows.append([btn("✏️ Other amount", f"plo:{seller}:{label_id}", BLUE)])
+    rows.append([btn("⬅️ Back", f"plp:{seller}:0"), menu_btn()])
+    await show(update, context, "\n".join(lines), markup(rows), new=new)
+
+
+async def cb_pull_product(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    try:
+        seller, label_id = callback_ints(query.data, 2)
+    except ValueError:
+        await stale_button(update)
+        return
+    if not await _pull_allowed(update, context, seller):
+        return
+    await answer(query)
+    await render_pull_product(update, context, seller, label_id)
+
+
+async def render_pull_confirm(
+    update: Update, context: Ctx, seller: int, label_id: int, count: int, *, new: bool = False
+) -> None:
+    db = db_of(context)
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    stock = db.count_items(label_id, seller)
+    if count < 1 or count > min(stock, MAX_PULL) or db.get_label(label_id) is None:
+        note = "⚠️ There are no products left here." if not stock else f"⚠️ There are {stock} in stock."
+        await render_pull_product(update, context, seller, label_id, new=new, note=note)
+        return
+    # Valid once, for exactly this product, seller and number: a second press can't pull again.
+    nonce = secrets.token_hex(4)
+    context.user_data["pull_nonce"] = {  # type: ignore[index]
+        "nonce": nonce, "seller": seller, "label_id": label_id, "count": count,
+    }
+    text = (
+        f"📤 <b>Pull {count} product(s)?</b>\n\n"
+        f"📦 {esc(db.path_text(label_id))}\n"
+        f"From {_from_whom(context, user_id, seller)}: {stock} in stock\n\n"
+        "They're picked at random, taken out of the shop and sent to you here."
+    )
+    rows = [[btn(f"📤 Pull {count}", f"ply:{seller}:{label_id}:{count}:{nonce}", GREEN),
+             btn("❌ Cancel", f"pl:{seller}:{label_id}", RED)]]
+    await show(update, context, text, markup(rows), new=new)
+
+
+async def cb_pull_quantity(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    try:
+        seller, label_id, count = callback_ints(query.data, 3)
+    except ValueError:
+        await stale_button(update)
+        return
+    if not await _pull_allowed(update, context, seller):
+        return
+    await answer(query)
+    await render_pull_confirm(update, context, seller, label_id, count)
+
+
+async def cb_pull_other(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    try:
+        seller, label_id = callback_ints(query.data, 2)
+    except ValueError:
+        await stale_button(update)
+        return
+    if not await _pull_allowed(update, context, seller):
+        return
+    await answer(query)
+    stock = db_of(context).count_items(label_id, seller)
+    if not stock:
+        await render_pull_product(update, context, seller, label_id)
+        return
+    set_state(context, "pull_count", seller=seller, label_id=label_id)
+    await show(update, context, f"✏️ How many to pull? Send a number from 1 to {min(stock, MAX_PULL)}.",
+               cancel_kb())
+
+
+@state_handler("pull_count")
+async def on_pull_count(update: Update, context: Ctx, state: dict) -> None:
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    seller, label_id = state["seller"], state["label_id"]
+    if not is_staff(context, user_id) or (seller != user_id and not is_owner(context, user_id)):
+        clear_state(context)
+        return
+    text = await need_text(update)
+    if text is None:
+        return
+    count = parse_int(text)
+    most = min(db_of(context).count_items(label_id, seller), MAX_PULL)
+    if most and (count is None or not 1 <= count <= most):
+        await update.effective_message.reply_text(f"⚠️ Please send a number from 1 to {most}.")  # type: ignore[union-attr]
+        return
+    clear_state(context)
+    await render_pull_confirm(update, context, seller, label_id, count or 0, new=True)
+
+
+async def cb_pull_yes(update: Update, context: Ctx) -> None:
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    try:
+        seller, label_id, count = callback_ints(query.data, 3)
+        nonce = parts[4]
+    except (ValueError, IndexError):
+        await stale_button(update)
+        return
+    if not await _pull_allowed(update, context, seller):
+        return
+    quote = context.user_data.get("pull_nonce")  # type: ignore[union-attr]
+    if not (isinstance(quote, dict) and quote.get("nonce") == nonce and quote.get("seller") == seller
+            and quote.get("label_id") == label_id and quote.get("count") == count):
+        await answer(query, "This confirmation has expired. Please choose again.", show_alert=True)
+        return
+    context.user_data.pop("pull_nonce", None)  # type: ignore[union-attr]
+    db = db_of(context)
+    user_id = query.from_user.id
+    try:
+        items = db.pull_random(label_id, seller, count, user_id)
+    except ShopError as exc:
+        await answer(query, str(exc), show_alert=True)
+        return
+    if not items:
+        await answer(query, "There are no products left here.", show_alert=True)
+        await render_pull_product(update, context, seller, label_id)
+        return
+    # Pulled. Every Telegram call from here on is best-effort: the products are sent
+    # whatever happens before.
+    await answer(query, "📤 Pulled")
+    path = db.path_text(label_id)
+    codes = ", ".join(f"<code>{item['code']}</code>" for item in items[:50])
+    if len(items) > 50:
+        codes += f" … (+{len(items) - 50})"
+    fewer = f" (only {len(items)} were left)" if len(items) < count else ""
+    await try_show(
+        update, context,
+        f"📤 <b>Pulled {len(items)} product(s)</b>{fewer}\n\n📦 {esc(path)}\n"
+        f"From {_from_whom(context, user_id, seller)}\n🆔 Product IDs: {codes}\n\n"
+        "Your product(s) 👇" + shop.eta_note(len(items)),
+    )
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+    async def deliver() -> None:
+        failed: list[Any] = []  # not sent
+        unsure: list[Any] = []  # Telegram didn't answer: they may have arrived
+        await shop.deliver_items(context, chat_id, items, failed, unsure)
+        if unsure:  # once more: getting one twice does no harm, selling it after all would
+            again, unsure[:] = list(unsure), []
+            await shop.deliver_items(context, chat_id, again, failed, unsure)
+        back = set(db.restore_pulled([item["id"] for item in failed]))  # nothing is lost
+        kept = [item for item in failed if item["id"] not in back] + unsure  # stay pulled
+        lines = []
+        if back:
+            lines.append(f"⚠️ {len(back)} product(s) couldn't be sent, so they're back in stock: "
+                         + _codes([item for item in failed if item["id"] in back]))
+        if kept:
+            lines.append(f"⚠️ {len(kept)} product(s) may not have arrived (or their product was "
+                         f"deleted meanwhile): {_codes(kept)}\nThey stay pulled: press one below to get "
+                         "it again.")
+        end = "\n\n".join(lines) or f"✅ Sent {len(items)} pulled product(s)."
+        rows = [[btn(f"📤 {item['code']}", f"plr:{item['id']}", BLUE)] for item in kept[:RESEND_BUTTONS]]
+        try:
+            await context.bot.send_message(chat_id, end, parse_mode=ParseMode.HTML,
+                                           reply_markup=markup(rows + [[menu_btn()]]))
+        except TelegramError as exc:
+            log.warning("Could not send the pull summary to %s: %s", chat_id, exc)
+        taken = len(items) - len(back)
+        if seller != user_id and taken:
+            await notify(context, seller, f"📤 The owner pulled <b>{taken}</b> of your products out of "
+                                          f"the shop:\n📦 {esc(path)}")
+
+    shop.start_delivery(context, chat_id, deliver)
+
+
+def _codes(items: list[Any], limit: int = 50) -> str:
+    text = ", ".join(f"<code>{item['code']}</code>" for item in items[:limit])
+    return text + (f" … (+{len(items) - limit})" if len(items) > limit else "")
+
+
+async def cb_pull_resend(update: Update, context: Ctx) -> None:
+    """A pulled product that may not have arrived: send it again to whoever pulled it."""
+    query = update.callback_query
+    try:
+        (item_id,) = callback_ints(query.data, 1)
+    except ValueError:
+        await stale_button(update)
+        return
+    item = db_of(context).get_item(item_id)
+    if item is None or item["status"] != "pulled" or item["buyer_id"] != query.from_user.id:
+        await answer(query, "This product isn't one you pulled.", show_alert=True)
+        return
+    try:
+        await shop.send_product(context, query.message.chat.id, json.loads(item["content"]))  # type: ignore[union-attr]
+    except (TelegramError, ValueError, KeyError) as exc:
+        log.warning("Could not send pulled product %s again: %s", item["code"], exc)
+        await answer(query, "Couldn't send it right now. Please try again in a minute.", show_alert=True)
+        return
+    await answer(query, f"📤 Sent {item['code']} again")
 
 
 # ============================================================ Sales analysis

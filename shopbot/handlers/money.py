@@ -253,6 +253,15 @@ def _added(context: Ctx, row: Any, user_id: int) -> str:
     return f"{money(row['amount'])}{whose} with request #{row['id']}{payment} ({row['decided_at']} UTC)"
 
 
+def _used(context: Ctx, row: Any, user_id: int) -> str:
+    """How a payment a request names was added already (see Database.request_used)."""
+    added = db_of(context).get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+    if added is not None:
+        return _added(context, added, user_id)
+    whose = "" if row["user_id"] == cfg_of(context).owner_id else _whose(context, row, user_id)
+    return f"you registered it as added by hand{whose} ({row['created_at']} UTC)"
+
+
 def _request_warnings(context: Ctx, deposit: Any) -> str:
     """What the owner should know before approving a Binance request, as it is now."""
     text = ""
@@ -268,6 +277,9 @@ def _request_warnings(context: Ctx, deposit: Any) -> str:
                  "already (each automatic deposit sent you a 💳 message).\n")
     if deposit["status"] != "pending":
         return text
+    for row in db_of(context).request_used(deposit["id"]):
+        text += (f"⚠️ Order ID <code>{esc(row['order_id'])}</code> was added already: "
+                 f"{_used(context, row, deposit['user_id'])}.\n")
     for order_id, other in elsewhere:
         text += (f"⚠️ Binance has Order ID <code>{esc(order_id)}</code> as a payment kept for request "
                  f"#{other['id']}{_whose(context, other, deposit['user_id'])}, which is waiting: "

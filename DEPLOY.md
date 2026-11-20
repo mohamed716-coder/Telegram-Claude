@@ -275,6 +275,12 @@ Set it up once:
   anyway**, which approves only if nothing new turned up meanwhile.
 - When a ❗ request's payment is then added automatically (Binance listed it late, or could
   be reached again), that request is closed by itself and you're told.
+- **A payment you add by hand** (the customer wrote to you): add it with
+  `/addbal ID AMOUNT ORDER_ID`, or register it afterwards with `/regbin ORDER_ID USER_ID`.
+  Then it's never added again automatically (a request naming it needs ⚠️ Approve anyway),
+  and the bot tells you what Binance has for it. A payment waiting with that customer's
+  request is settled with it (the request is closed); with anyone else's, decide that
+  request first.
 - Only payments made after the key was added, and in the last 48 hours, are found. Only
   USDT counts by default (1 USDT = 1$); to take USDC too, add `BINANCE_COINS=USDT,USDC` to
   `~/Telegram-Claude/.env` on the server.

@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 
 from ..content import send_content
 from ..db import InsufficientBalance, PriceChanged, PurchaseResult, ShopError, seller_price
@@ -450,7 +450,7 @@ async def cb_confirm(update: Update, context: Ctx) -> None:
         f"💰 Paid: <b>{money(order['total'])}</b>\n"
         f"💳 New balance: <b>{money(result.new_balance)}</b>\n"
         f"🆔 Product IDs: {codes}\n\n"
-        "Your product(s) 👇" + _eta_note(len(result.items))
+        "Your product(s) 👇" + eta_note(len(result.items))
     )
     await try_show(update, context, summary)
 
@@ -460,7 +460,7 @@ async def cb_confirm(update: Update, context: Ctx) -> None:
     start_delivery(context, user_id, deliver)
 
 
-def _eta_note(count: int) -> str:
+def eta_note(count: int) -> str:
     seconds = max(0, count - DELIVERY_BURST) * DELIVERY_INTERVAL
     if seconds < 60:
         return ""
@@ -527,29 +527,45 @@ def start_delivery(context: Ctx, chat_id: int, job: Callable[[], Awaitable[None]
     context.application.create_task(run(), name=f"shopbot:delivery:{chat_id}")
 
 
-async def deliver_items(context: Ctx, chat_id: int, items: list[Any]) -> int:
-    """Send each product message, paced for Telegram. Returns how many weren't sent."""
-    failed = 0
+async def deliver_items(
+    context: Ctx, chat_id: int, items: list[Any], not_sent: Optional[list[Any]] = None,
+    unsure: Optional[list[Any]] = None,
+) -> int:
+    """Send each product message, paced for Telegram. Returns how many weren't sent;
+    ``not_sent``, if given, gets those items. With ``unsure``, the ones Telegram didn't
+    answer for (they may have arrived) go there instead."""
+    failed: list[Any] = [] if not_sent is None else not_sent
+    maybe: list[Any] = failed if unsure is None else unsure
+    start = len(failed) + (len(maybe) if maybe is not failed else 0)
+
+    def count() -> int:
+        return len(failed) + (len(maybe) if maybe is not failed else 0) - start
+
     for index, item in enumerate(items):
         if not context.application.running:  # stopping: finish soon
             since = context.bot_data.setdefault("stopping_since", time.monotonic())
             if time.monotonic() - since > STOP_GRACE:
-                log.warning("Stopping: %s product(s) for %s left for My Orders", len(items) - index, chat_id)
-                return failed + len(items) - index
+                log.warning("Stopping: %s product(s) for %s not sent", len(items) - index, chat_id)
+                failed.extend(items[index:])
+                return count()
         if index >= DELIVERY_BURST and DELIVERY_INTERVAL > 0:
             await asyncio.sleep(DELIVERY_INTERVAL)
         try:
-            await _send_product(context, chat_id, json.loads(item["content"]))
+            await send_product(context, chat_id, json.loads(item["content"]))
         except Forbidden as exc:  # the buyer blocked the bot: the rest can't arrive either
             log.warning("Could not deliver to %s: %s", chat_id, exc)
-            return failed + len(items) - index
+            failed.extend(items[index:])
+            return count()
         except (TelegramError, ValueError, KeyError) as exc:
-            failed += 1
+            if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+                maybe.append(item)  # no answer from Telegram: it may have arrived
+            else:
+                failed.append(item)
             log.warning("Could not deliver item %s to %s: %s", item["code"], chat_id, exc)
-    return failed
+    return count()
 
 
-async def _send_product(context: Ctx, chat_id: int, content: dict) -> None:
+async def send_product(context: Ctx, chat_id: int, content: dict) -> None:
     try:
         await send_content(context.bot, chat_id, content)
     except (RetryAfter, FloodWait) as exc:
@@ -632,7 +648,7 @@ async def cb_order_view(update: Update, context: Ctx) -> None:
         f"🧾 <b>Order <code>#{order['code']}</code></b>\n"
         f"📦 {esc(order['product_name'])}\n"
         f"🔢 Quantity: {order['quantity']} · 💰 {money(order['total'])}\n"
-        f"🕒 {order['created_at']} UTC\n\nYour product(s) 👇" + _eta_note(len(items))
+        f"🕒 {order['created_at']} UTC\n\nYour product(s) 👇" + eta_note(len(items))
     )
 
     async def resend() -> None:

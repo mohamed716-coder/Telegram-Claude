@@ -13,7 +13,7 @@ from typing import Callable, Optional
 import pytest
 from telegram.error import TimedOut
 
-from harness import OWNER, OWNER_ID, Call, ShopTest, run, tg_user
+from harness import OWNER, OWNER_ID, Call, Picks, ShopTest, run, tg_user
 from shopbot.db import ShopError
 
 ALICE = tg_user(1001, "Alice", "alice")
@@ -775,7 +775,7 @@ def test_customer_tops_up_from_the_not_enough_screen_and_then_buys(tmp_path):
     run(tmp_path, scenario)
 
 
-def test_fifo_mix_of_owner_and_admin_items_credits_each_adder(tmp_path):
+def test_a_mix_of_owner_and_admin_items_credits_each_adder(tmp_path):
     async def scenario(t: ShopTest) -> None:
         make_label(t, "Esim/5GB", 1000)
         calls = await t.send(OWNER, f"/addadmin {ADMIN['id']}")
@@ -789,10 +789,11 @@ def test_fifo_mix_of_owner_and_admin_items_credits_each_adder(tmp_path):
         set_balance(t, ALICE, 5000)
 
         five = make_label(t, "Esim/5GB")
+        t.db.rng = Picks(ADMIN["id"], OWNER_ID, OWNER_ID)  # each seller's oldest goes first
         calls = await buy(t, ALICE, five, 3)
         texts = t.texts(calls, ALICE["id"])
         delivered = [x for x in texts if x in ("OWN-1", "ADM-1", "OWN-2", "ADM-2")]
-        assert delivered == ["OWN-1", "ADM-1", "OWN-2"]
+        assert delivered == ["OWN-1", "ADM-1", "OWN-2"]  # in the order they were added
 
         assert balance(t, ALICE) == 5000 - 3000
         assert earnings(t, OWNER_ID) == 2000
@@ -821,6 +822,7 @@ def test_two_admins_and_owner_each_get_their_own_sale_notification(tmp_path):
         add_stock(t, five, "Z1", "Z2", owner_id=ADMIN2["id"])
         add_stock(t, five, "O1")
         set_balance(t, ALICE, 5000)
+        t.db.rng = Picks(ADMIN["id"], ADMIN2["id"], ADMIN2["id"])
         calls = await buy(t, ALICE, five, 3)  # A1, Z1, Z2
         assert earnings(t, ADMIN["id"]) == 300 and earnings(t, ADMIN2["id"]) == 600
         assert earnings(t, OWNER_ID) == 0
@@ -829,6 +831,133 @@ def test_two_admins_and_owner_each_get_their_own_sale_notification(tmp_path):
         assert "New sale" not in all_text(calls, OWNER_ID)
 
     run(tmp_path, scenario)
+
+
+# ============================================================ fair between sellers
+def test_each_seller_with_stock_has_the_same_chance_whatever_they_have(tmp_path):
+    """Adam has 100, Zara 1 and the owner 5 of the same product: every sale is drawn
+    between the three alike. Zara drops out when her one is sold; a new seller's stock
+    joins the draw."""
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/5GB", 100)
+        make_admin(t, ADMIN)
+        make_admin(t, ADMIN2)
+        add_stock(t, five, *[f"A{i}" for i in range(100)], owner_id=ADMIN["id"])
+        add_stock(t, five, "Z0", owner_id=ADMIN2["id"])
+        add_stock(t, five, *[f"O{i}" for i in range(5)])
+        set_balance(t, ALICE, 5000)
+        everyone = [ADMIN["id"], ADMIN2["id"], OWNER_ID]
+        picks = t.db.rng = Picks(ADMIN["id"], OWNER_ID, ADMIN2["id"], OWNER_ID)
+
+        calls = await buy(t, ALICE, five, 1)  # Adam won the draw
+        assert "A0" in t.texts(calls, ALICE["id"])
+        assert picks.offers == [everyone]  # one draw, the same for all three
+        calls = await buy(t, ALICE, five, 1)  # the owner won: still three alike
+        assert "O0" in t.texts(calls, ALICE["id"])
+        assert picks.offers == [everyone, everyone]
+        calls = await buy(t, ALICE, five, 1)  # Zara's only one
+        assert "Z0" in t.texts(calls, ALICE["id"])
+        assert picks.offers[-1] == everyone
+        calls = await buy(t, ALICE, five, 1)  # now half and half
+        assert "O1" in t.texts(calls, ALICE["id"])
+        assert picks.offers[-1] == [ADMIN["id"], OWNER_ID]
+        assert earnings(t, ADMIN["id"]) == 100 and earnings(t, ADMIN2["id"]) == 100
+        assert earnings(t, OWNER_ID) == 200
+        # Zara adds stock again: three alike.
+        add_stock(t, five, "Z1", owner_id=ADMIN2["id"])
+        await buy(t, ALICE, five, 1)
+        assert picks.offers[-1] == everyone
+
+    run(tmp_path, scenario)
+
+
+def test_each_product_in_one_order_is_drawn_on_its_own(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/5GB", 100)
+        make_admin(t, ADMIN)
+        make_admin(t, ADMIN2)
+        add_stock(t, five, "A0", "A1", "A2", owner_id=ADMIN["id"])
+        add_stock(t, five, "Z0", owner_id=ADMIN2["id"])
+        add_stock(t, five, "O0", "O1")
+        set_balance(t, ALICE, 5000)
+        picks = t.db.rng = Picks(ADMIN2["id"], OWNER_ID, ADMIN["id"], OWNER_ID)
+
+        calls = await buy(t, ALICE, five, 4)
+        # Zara won the first draw with her only one; the other three were drawn between
+        # the two who still had stock.
+        assert picks.offers == [[ADMIN["id"], ADMIN2["id"], OWNER_ID]] + [[ADMIN["id"], OWNER_ID]] * 3
+        delivered = [x for x in t.texts(calls, ALICE["id"]) if x[:1] in "AZO" and x[1:].isdigit()]
+        assert delivered == ["A0", "Z0", "O0", "O1"]  # in the order they were added
+        (order,) = orders_of(t, ALICE)
+        assert [i["owner_id"] for i in t.db.order_items(order["id"])] == [
+            ADMIN["id"], ADMIN2["id"], OWNER_ID, OWNER_ID]
+        assert earnings(t, ADMIN["id"]) == 100 and earnings(t, ADMIN2["id"]) == 100
+        assert earnings(t, OWNER_ID) == 200
+        assert "1 product(s) · <b>+1.00$</b>" in all_text(calls, ADMIN["id"])
+        assert "1 product(s) · <b>+1.00$</b>" in all_text(calls, ADMIN2["id"])
+        assert "2 product(s) · <b>+2.00$</b>" in all_text(calls, OWNER_ID)
+        assert [x["owner_id"] for x in t.db.list_items(five)] == [ADMIN["id"], ADMIN["id"]]
+
+    run(tmp_path, scenario)
+
+
+def test_only_sellers_with_stock_left_are_in_the_draw(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        five = make_label(t, "Esim/5GB", 100)
+        ten = make_label(t, "Esim/10GB", 100)
+        make_admin(t, ADMIN)
+        make_admin(t, ADMIN2)
+        add_stock(t, five, "A0", owner_id=ADMIN["id"])
+        add_stock(t, ten, "A-TEN", owner_id=ADMIN["id"])  # another product doesn't count
+        (zara,) = add_stock(t, five, "Z0", owner_id=ADMIN2["id"])
+        add_stock(t, five, "O0")
+        zara_item = t.db.conn.execute("SELECT id FROM items WHERE code = ?", (zara,)).fetchone()["id"]
+        t.db.close_item(zara_item, "removed", ADMIN2["id"])
+        set_balance(t, ALICE, 5000)
+        picks = t.db.rng = Picks(OWNER_ID)
+        await buy(t, ALICE, five, 1)
+        assert picks.offers == [[ADMIN["id"], OWNER_ID]]
+        calls = await buy(t, ALICE, five, 1)  # Adam is the only one left
+        assert picks.offers[-1] == [ADMIN["id"]]
+        assert "A0" in t.texts(calls, ALICE["id"])
+        assert balance(t, ALICE) == 5000 - 200
+        assert [x["code"] for x in t.db.list_items(ten)] and t.db.count_items(five) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_the_draw_gives_every_seller_a_third_over_many_sales(tmp_path):
+    """The shop's own random choices: 3000 draws for one product with stock of 100, 1 and 5."""
+    async def scenario(t: ShopTest) -> None:
+        import random
+
+        five = make_label(t, "Esim/5GB", 100)
+        make_admin(t, ADMIN)
+        make_admin(t, ADMIN2)
+        add_stock(t, five, *[f"A{i}" for i in range(100)], owner_id=ADMIN["id"])
+        add_stock(t, five, "Z0", owner_id=ADMIN2["id"])
+        add_stock(t, five, *[f"O{i}" for i in range(5)])
+        for rng in (random.Random(20261120), random.SystemRandom()):
+            t.db.rng = rng
+            wins = {ADMIN["id"]: 0, ADMIN2["id"]: 0, OWNER_ID: 0}
+            for _ in range(3000):
+                (row,) = t.db._pick_fairly(five, 1)
+                wins[row["owner_id"]] += 1
+            for seller, count in wins.items():
+                assert 850 <= count <= 1150, (seller, wins)  # 1000 each; ±150 is ~6 sd
+
+    run(tmp_path, scenario)
+
+
+def test_the_shop_draws_with_the_system_random_generator(tmp_path):
+    import random
+    from shopbot.db import Database
+
+    db = Database(str(tmp_path / "shop.db"), OWNER_ID)
+    try:
+        assert isinstance(db.rng, random.SystemRandom)
+    finally:
+        db.close()
 
 
 def test_buying_your_own_stock_sends_no_sale_notification_to_yourself(tmp_path):
@@ -974,7 +1103,7 @@ def test_stock_removed_between_confirmation_and_confirm_is_not_charged(tmp_path)
         assert t.db.count_items(five) == 1 and earnings(t, OWNER_ID) == 0
         assert "B" not in t.texts(calls, ALICE["id"])
 
-        # The removed item is skipped: buying 1 now gets the next oldest one.
+        # The removed item is skipped: buying 1 now gets the next one (one seller: oldest first).
         calls = await buy(t, ALICE, five, 1)
         assert "B" in t.texts(calls, ALICE["id"]) and "A" not in t.texts(calls, ALICE["id"])
 

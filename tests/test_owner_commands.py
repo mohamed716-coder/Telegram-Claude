@@ -39,7 +39,7 @@ NO_STATE = "Send /start to open the shop menu"
 ASK_ID = "Send the user's Telegram ID"
 
 OWNER_COMMAND_NAMES = {
-    "addbal", "modifybal", "addadmin", "removeadmin", "seller", "removeseller",
+    "addbal", "regbin", "modifybal", "addadmin", "removeadmin", "seller", "removeseller",
     "ban", "unban", "close", "open", "status", "pending", "announce",
 }
 
@@ -1281,7 +1281,7 @@ def test_help_owner_sees_every_section(tmp_path):
         calls = await t.send(OWNER, "/help")
         text = t.last_text(calls)
         assert "Owner panel" in text and "Admin panel" in text and "Everyone" in text
-        assert help_commands(text) == OWNER_COMMAND_NAMES | {"withdraw", "start", "help", "cancel", "id"}
+        assert help_commands(text) == OWNER_COMMAND_NAMES | {"withdraw", "pull", "start", "help", "cancel", "id"}
         assert "Add Label" in text
         assert utf16_len(text) <= 4096
 
@@ -1295,7 +1295,7 @@ def test_help_admin_sees_admin_and_everyone_sections(tmp_path):
         text = t.last_text(calls)
         assert "Admin panel" in text and "Everyone" in text
         assert "Owner panel" not in text and "Add Label" not in text
-        assert help_commands(text) == {"withdraw", "start", "help", "cancel", "id"}
+        assert help_commands(text) == {"withdraw", "pull", "start", "help", "cancel", "id"}
 
     run(tmp_path, scenario)
 
@@ -1340,7 +1340,7 @@ def test_start_owner_panel(tmp_path):
             "Add Label": "success", "Earnings": "primary", "Add Balance": "success", "My ID": None})
         menu = scoped_commands(calls, OWNER_ID)
         assert menu is not None and set(menu) == OWNER_COMMAND_NAMES | {
-            "start", "help", "withdraw", "cancel", "id"}
+            "start", "help", "withdraw", "pull", "cancel", "id"}
 
     run(tmp_path, scenario)
 
@@ -1355,7 +1355,7 @@ def test_start_admin_panel(tmp_path):
         assert_panel_buttons(panel, {
             "Shop": "success", "My Products": "primary", "Add Product": "success",
             "Earnings": "primary", "Add Balance": "success", "My ID": None})
-        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "id", "help", "cancel"]
+        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "pull", "id", "help", "cancel"]
 
     run(tmp_path, scenario)
 
@@ -1452,7 +1452,7 @@ def test_bot_profile_description_and_command_menus(tmp_path):
         owner_menu = scoped_commands(calls, OWNER_ID)
         assert owner_menu is not None and OWNER_COMMAND_NAMES <= set(owner_menu)
         assert "start" in owner_menu
-        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "id", "help", "cancel"]
+        assert scoped_commands(calls, ADMIN["id"]) == ["start", "withdraw", "pull", "id", "help", "cancel"]
         for c in calls:
             if c.method == "setMyCommands":
                 for cmd in c.params["commands"]:

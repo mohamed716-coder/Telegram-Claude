@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -327,9 +328,22 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
 
 async def _already_used(update: Update, context: Ctx, state: dict, reply: _Reply, row: Any) -> None:
     """The payment is in the bot's records already (``row``, from binance_payments)."""
-    if row["user_id"] != update.effective_user.id:  # type: ignore[union-attr]
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    by_hand = row["status"] == "credited" and _added_by_hand(context, row)
+    if by_hand and row["user_id"] == cfg_of(context).owner_id != user_id:
+        # The owner registered it without saying whose it was: he settled it by hand, so
+        # it's added already, whoever asks; it never becomes a request to approve.
+        _done(context, state)
+        await reply("✅ This payment was already added by the owner.", markup([[menu_btn()]]))
+        await notify(context, cfg_of(context).owner_id,
+                     f"🧾 {user_html(db_of(context).get_user(user_id))} sent Order ID "
+                     f"<code>{esc(state['order_id'])}</code>, which you registered as added by hand. "
+                     "They were told it was added already.")
+        return
+    if row["user_id"] != user_id:
         await _failed(update, context, state, reply, "This Order ID was already used.",
-                      "already used by someone else")
+                      "already added by hand (you registered it)" if by_hand
+                      else "already used by someone else")
         return
     request = db_of(context).get_deposit(row["deposit_id"]) if row["status"] == "owner" else None
     if request is not None and request["status"] != "pending":
@@ -449,3 +463,89 @@ async def check_at_start(app: Application) -> None:
             await app.bot.send_message(settings.owner_id, "💳 " + esc(report), parse_mode=ParseMode.HTML)
         except Exception as exc:  # best effort: the log has it too
             log.info("Could not tell the owner about the Binance key: %s", exc)
+
+
+# ----------------------------------------------- payments the owner added by hand
+def _added_by_hand(context: Ctx, row: Any) -> bool:
+    """A payment recorded with /regbin, or with /addbal and its Order ID."""
+    deposit = db_of(context).get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+    return deposit is None or deposit["method"] == "manual"
+
+
+def payment_record(context: Ctx, row: Any) -> str:
+    """What the bot did with a payment it has a record of (``row``), for the owner (HTML)."""
+    db, cfg = db_of(context), cfg_of(context)
+    user = db.get_user(row["user_id"])
+    who = user_html(user) if user is not None else f"<code>{row['user_id']}</code>"
+    deposit = db.get_deposit(row["deposit_id"]) if row["deposit_id"] else None
+    if row["status"] == "credited":
+        if deposit is None:
+            whose = "" if row["user_id"] == cfg.owner_id else f" for {who}"
+            return f"✅ It was registered as added by hand{whose} ({esc(row['created_at'])} UTC)."
+        how = {"manual": "added by hand", "binance_auto": "added automatically"}.get(
+            deposit["method"], f"added with request #{deposit['id']}")
+        return (f"✅ It was already {how}: <b>{money(deposit['amount'])}</b> to {who} "
+                f"(deposit #{deposit['id']}, {esc(deposit['decided_at'] or deposit['created_at'])} UTC).")
+    if deposit is not None and deposit["status"] == "pending":
+        return (f"🧾 It's waiting with request #{deposit['id']} from {who} "
+                f"(<b>{money(deposit['amount'])}</b>): see /pending.")
+    if deposit is not None:
+        return f"🧾 It's kept for request #{deposit['id']} from {who}, which was {esc(deposit['status'])}."
+    return f"🧾 It's kept for {who}, for you to decide."
+
+
+def look_up_registered(context: Ctx, order_id: str, amount: Optional[int] = None) -> bool:
+    """After the owner registered a payment as added by hand: ask Binance for it in the
+    background, note its other ID, amount and time (so either ID is known), and tell the
+    owner what Binance has. ``amount``: the cents he added for it, if he did. False if
+    there's no Binance key to ask with."""
+    client = client_of(context)
+    if client is None:
+        return False
+    # Not Application.create_task, like a payment check: a stop ends it (app.py).
+    task = asyncio.get_running_loop().create_task(_look_up(context, client, order_id, amount),
+                                                  name=f"shopbot:binance:regbin:{order_id}")
+    tasks = context.bot_data.setdefault("binance_tasks", set())  # keep a reference
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return True
+
+
+async def _look_up(context: Ctx, client: BinancePay, order_id: str, amount: Optional[int]) -> None:
+    db, cfg = db_of(context), cfg_of(context)
+    head = f"🔎 <b>Order ID</b> <code>{esc(order_id)}</code>"
+    since = int(time.time() * 1000) - cfg.binance_max_age_hours * 3_600_000
+    try:
+        payment = await client.find(order_id, since)  # a hang ends with httpx's timeouts
+    except BinanceError as exc:
+        if isinstance(exc, BinanceStopping) or getattr(client, "closed", False):
+            return  # the bot is stopping: the registration stands, the details can wait
+        log.warning("Couldn't look up a registered payment with Binance: %s", exc)
+        await notify(context, cfg.owner_id, f"{head}\n⚠️ Binance couldn't be asked about it "
+                                            f"({esc(exc)}). It's registered all the same.")
+        return
+    except Exception:
+        log.exception("Looking up a registered payment failed")
+        return
+    db.note_binance_clock(getattr(client, "offset_ms", 0))
+    if payment is None:
+        await notify(context, cfg.owner_id,
+                     f"{head}\n⚠️ Binance doesn't list a payment with this ID in the last "
+                     f"{cfg.binance_max_age_hours} hours (older ones can't be added automatically "
+                     "anyway). It's registered all the same: check that the ID is right.")
+        return
+    row = db.registered_payment(order_id)  # this record, not one with the ID as its other ID
+    if row is not None:
+        row = db.complete_payment(row, payment)
+    paid = datetime.fromtimestamp(payment.time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"{head}\nBinance has <b>{esc(_paid(payment))}</b>, paid {paid} UTC"
+             + (f", from {esc(payment.payer)}" if payment.payer else "") + "."]
+    if not payment.received:
+        lines.append("⚠️ It isn't a payment to the shop.")
+    elif amount is not None and (payment.currency not in cfg.binance_coins
+                                 or payment.amount * 100 != amount):
+        lines.append(f"⚠️ You added <b>{money(amount)}</b> for it.")
+    for other in db.payment_records(payment.order_id, payment.transaction_id):
+        if row is None or other["order_id"] != row["order_id"]:  # known by its other ID before
+            lines.append("⚠️ The bot has it under its other ID too: " + payment_record(context, other))
+    await notify(context, cfg.owner_id, "\n".join(lines))

@@ -192,6 +192,33 @@ def tg_user(user_id: int, first_name: str = "User", username: Optional[str] = No
 OWNER = tg_user(OWNER_ID, "Mohamed", "the_owner")
 
 
+class Picks:
+    """Stands in for the shop's random choices (Database.rng) so a test knows the outcome.
+
+    choice() gets the sellers who may make a sale (sorted by ID) and returns the next of
+    ``picks``, which must be one of them; once ``picks`` are used up, the first offered
+    (the lowest ID). sample() keeps the first k. Every offer is kept in ``offers``, every
+    sample asked for in ``samples``."""
+
+    def __init__(self, *picks: int) -> None:
+        self.picks = list(picks)
+        self.offers: list[list[Any]] = []
+        self.samples: list[tuple[list[Any], int]] = []
+
+    def choice(self, seq: Any) -> Any:
+        seq = list(seq)
+        self.offers.append(seq)
+        if not self.picks:
+            return seq[0]
+        pick = self.picks.pop(0)
+        assert pick in seq, f"picked {pick}, but only {seq} have stock"
+        return pick
+
+    def sample(self, population: Any, k: int) -> list[Any]:
+        self.samples.append((list(population), k))
+        return list(population)[:k]
+
+
 class ShopTest:
     """Drives the real Application with fake updates."""
 
@@ -203,6 +230,9 @@ class ShopTest:
         self.settings = Settings(**options)
         self.app = build_application(self.settings, request=self.tg, rate_limit=False)
         self.db = self.app.bot_data["db"]
+        # Known outcomes: the lowest seller ID makes each sale, unless a test sets Picks(...)
+        # (or a real random generator, for the fairness tests).
+        self.db.rng = Picks()
         self._update_ids = itertools.count(1)
         self._incoming_ids = itertools.count(1)
         stock_module.STATUS_DELAY = 0  # post the "Received N" status immediately

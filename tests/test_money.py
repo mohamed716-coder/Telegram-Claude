@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import pytest
 from telegram.error import TimedOut
 
-from harness import OWNER, OWNER_ID, Call, ShopTest, run, tg_user
+from harness import OWNER, OWNER_ID, Call, Picks, ShopTest, run, tg_user
 
 ALICE = tg_user(1001, "Alice", "alice")
 BOB = tg_user(1002, "Bob", "bob")
@@ -875,8 +875,9 @@ async def build_sales(t: ShopTest) -> tuple[int, int]:
     await approve_deposit(t, dep_id)
     await t.send(BOB, "/start")
     await t.send(OWNER, f"/addbal {BOB['id']} 50")
-    await buy(t, ALICE, five, 4)  # O1 O2 O3 (owner) + A1 (Adam): oldest first
-    await buy(t, BOB, steam, 1)  # S1 (Adam)
+    t.db.rng = Picks(OWNER_ID, OWNER_ID, OWNER_ID, ADMIN["id"], ADMIN["id"])
+    await buy(t, ALICE, five, 4)  # O1 O2 O3 (owner) + A1 (Adam)
+    await buy(t, BOB, steam, 1)  # S1 (Adam), not Zara's Z1
     return five, steam
 
 
