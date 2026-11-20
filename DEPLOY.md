@@ -257,15 +257,19 @@ Set it up once:
 | `this key can do more than read` | Delete that key in API Management and create one with only *Enable Reading*. |
 
 - While Binance refuses the key (or doesn't serve the server's location), the bot tells you
-  once and every deposit comes to you to approve: customers can still deposit. So does a
-  deposit while Binance can't be reached for a few minutes.
-- A request marked ❗ has an Order ID Binance didn't confirm (a typo, or Binance couldn't
-  be asked). Approve it only if you find the payment in your Binance app and haven't added
-  it already. The bot can't tell which payment such a request is about, so it never adds a
-  payment made before one by itself: such a payment comes to you instead. The same goes
-  for a payment made before balance you added to that customer with `/addbal`,
-  and for a payment that was in a request you already decided (e.g. rejected for its
-  amount): you decide again, with the amount Binance shows.
+  when it starts and at the next deposit (again at most every 6 hours), and every deposit
+  comes to you to approve: customers can still deposit. So does a deposit while Binance
+  can't be reached for a minute or more.
+- A request marked ❗ has an Order ID Binance didn't confirm as a new payment to you (a
+  typo, someone else's payment, or Binance couldn't be asked). Approve it only if you find
+  the payment in your Binance app and haven't added it already: the request shows what was
+  added since it was made.
+- The bot can't tell which payment you approve such a request for, so it never adds a
+  payment by itself that you may have added already: one made before you decided a ❗
+  request, or while that customer's ❗ request waits, or before balance you added to that
+  customer with `/addbal`. Such a payment comes to you instead, with a ⚠️ line saying why,
+  and approving it takes a second press. A payment that was in a request you already
+  decided (e.g. rejected for its amount) comes back to you too.
 - Only payments made after the key was added, and in the last 48 hours, are found. Only
   USDT counts by default (1 USDT = 1$); to take USDC too, add `BINANCE_COINS=USDT,USDC` to
   `~/Telegram-Claude/.env` on the server.

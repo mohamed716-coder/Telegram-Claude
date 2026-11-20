@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from telegram import Update
@@ -49,6 +50,10 @@ from .common import (
 log = logging.getLogger("shopbot.money")
 
 MAX_ADMINS_LISTED = 25
+NOTE_LINES = 6  # lines of a request's notes shown, each up to NOTE_LINE_CHARS: the message
+NOTE_LINE_CHARS = 160  # must stay within Telegram's 4096 characters
+LISTED = 3  # deposits named in one warning line, then "and N more"
+CONFIRM_FOR = 120.0  # seconds in which a second ✅ Approve approves a request with a warning
 
 
 # ================================================================ deposits
@@ -177,7 +182,10 @@ def deposit_caption(context: Ctx, deposit: Any) -> str:
         f"<code>{esc(p['order_id'])}</code>, paid {esc(p['paid_at'])} UTC\n"
         for p in db.deposit_payments(deposit["id"]) if p["currency"]
     )
-    notes = "".join(f"• {esc(line)}\n" for line in (deposit["note"] or "").splitlines() if line)
+    lines = [line for line in (deposit["note"] or "").splitlines() if line]
+    if len(lines) > NOTE_LINES:
+        lines = lines[:NOTE_LINES - 1] + [f"... and {len(lines) - NOTE_LINES + 1} more"]
+    notes = "".join(f"• {esc(_short(line, NOTE_LINE_CHARS))}\n" for line in lines)
     return (
         f"💳 <b>Deposit request #{deposit['id']}</b>\n"
         f"👤 {user_html(user)}\n"
@@ -185,13 +193,69 @@ def deposit_caption(context: Ctx, deposit: Any) -> str:
         + (f"🧾 Binance Order ID: <code>{esc(order)}</code>\n" if order else "")
         + found
         + (f"⚠️ Not added automatically:\n{notes}" if notes else "")
-        + ("❗ Binance didn't confirm this Order ID. Approve only if you find the payment in "
-           "your Binance app and haven't added it already (each automatic deposit sent you a "
-           "💳 message).\n" if deposit["unverified"] else "")
+        + _request_warnings(context, deposit)
         + f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
         f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
         f"🕒 {deposit['created_at']} UTC"
     )
+
+
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _listed(parts: list[str], sep: str = "; ") -> str:
+    """The first LISTED parts, then "and N more"."""
+    shown = sep.join(parts[:LISTED])
+    return shown + (f"{sep}and {len(parts) - LISTED} more" if len(parts) > LISTED else "")
+
+
+def _whose(context: Ctx, row: Any, user_id: int) -> str:
+    if row["user_id"] == user_id:
+        return ""
+    return f" for {esc(user_name(db_of(context).get_user(row['user_id'])))}"
+
+
+def _doubt(context: Ctx, row: Any, user_id: int) -> str:
+    """A deposit that may be about a payment (see Database.payment_doubts), as it is now."""
+    whose = _whose(context, row, user_id)
+    if row["method"] == "manual":
+        return f"you added {money(row['amount'])} by hand{whose} ({row['created_at']} UTC)"
+    if row["status"] == "pending":
+        return f"request #{row['id']}{whose} is waiting, with an Order ID Binance didn't confirm"
+    return f"you {row['status']} request #{row['id']}{whose}, whose Order ID Binance didn't confirm"
+
+
+def _added(context: Ctx, row: Any, user_id: int) -> str:
+    """A deposit added since a request was made (see Database.request_warnings)."""
+    whose = _whose(context, row, user_id)
+    if row["method"] == "manual":
+        return f"{money(row['amount'])} by hand{whose} ({row['created_at']} UTC)"
+    if row["method"] == "binance_auto":
+        return (f"{money(row['amount'])} automatically{whose}, Order ID "
+                f"<code>{esc(row['order_id'] or '')}</code> ({row['decided_at']} UTC)")
+    return f"{money(row['amount'])}{whose} with request #{row['id']} ({row['decided_at']} UTC)"
+
+
+def _request_warnings(context: Ctx, deposit: Any) -> str:
+    """What the owner should know before approving a Binance request, as it is now."""
+    text = ""
+    if deposit["unverified"]:
+        ids = [f"<code>{esc(value)}</code>" for value in (deposit["unconfirmed"] or "").split()]
+        text += (f"❗ Binance didn't confirm Order ID {_listed(ids, ', ')} as a new payment to you"
+                 if ids else "❗ Binance didn't confirm this request's Order ID as a new payment to you")
+        text += (". Approve only if you find the payment in your Binance app and haven't added it "
+                 "already (each automatic deposit sent you a 💳 message).\n")
+    if deposit["status"] != "pending":
+        return text
+    held, since = db_of(context).request_warnings(deposit["id"])
+    for payment, doubts in held:
+        text += (f"⚠️ May be added already: after <code>{esc(payment['order_id'])}</code> was paid, "
+                 + _listed([_doubt(context, row, deposit["user_id"]) for row in doubts]) + ".\n")
+    if since:
+        text += ("⚠️ Added since this request was made: "
+                 + _listed([_added(context, row, deposit["user_id"]) for row in since]) + ".\n")
+    return text
 
 
 async def cb_deposit_send(update: Update, context: Ctx) -> None:
@@ -263,15 +327,16 @@ async def send_withdrawal_to_owner(context: Ctx, withdrawal: Any) -> bool:
     )
 
 
-async def _edit_request(update: Update, text: str) -> None:
-    """Replace a request message's caption/text and remove its buttons (best-effort)."""
+async def _edit_request(update: Update, text: str, keyboard: Any = None) -> None:
+    """Replace a request message's caption/text and its buttons (none by default;
+    best-effort)."""
     query = update.callback_query
     message = query.message  # type: ignore[union-attr]
     try:
         if message is not None and getattr(message, "text", None) is None:
-            await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=None)  # type: ignore[union-attr]
+            await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)  # type: ignore[union-attr]
         else:
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=None)  # type: ignore[union-attr]
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)  # type: ignore[union-attr]
     except TelegramError as exc:
         log.info("Could not edit request message: %s", exc)
 
@@ -288,6 +353,18 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         await answer(query, "Only the owner can do that.", show_alert=True)
         return
     db, cfg = db_of(context), cfg_of(context)
+    warned = context.bot_data.setdefault("approve_warned", {})  # request id -> when warned
+    if approve and db.approval_warnings(deposit_id):
+        at = warned.get(deposit_id)
+        if at is None or time.monotonic() - at > CONFIRM_FOR:  # first press: say why, first
+            warned[deposit_id] = time.monotonic()
+            await answer(query, "⚠️ This may have been added already: see the ⚠️ lines of the "
+                         "request. Press ✅ Approve again within 2 minutes to approve anyway.",
+                         show_alert=True)
+            await _edit_request(update, deposit_caption(context, db.get_deposit(deposit_id)),
+                                _decision_keyboard("dok", "dno", deposit_id))
+            return
+    warned.pop(deposit_id, None)
     try:
         decision = db.decide_deposit(deposit_id, approve, cfg.seller_auto_threshold * 100)
     except ShopError as exc:

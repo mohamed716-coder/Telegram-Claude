@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
@@ -28,6 +28,13 @@ MAX_LABEL_NAME = 40
 PENDING_STOCK = "pending_stock_alert"
 # settings key: the broadcast going out, with how far it got (resumed after a restart)
 BROADCAST_JOB = "broadcast_job"
+# Seconds of margin when times this server noted are compared with Binance's: the clocks
+# may differ by up to 10 s without Binance complaining (larger differences are measured).
+DOUBT_MARGIN = 120
+# What the notes of a request say about an Order ID Binance didn't confirm as a new
+# payment to the shop (for requests written by versions that didn't store it).
+UNCONFIRMED_NOTES = ("not found in your Binance Pay history", "not checked (",
+                     "not a payment to the shop", "already used by someone else")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -264,11 +271,18 @@ class Database:
             self.conn.execute("ALTER TABLE deposits ADD COLUMN order_id TEXT")
         if "note" not in columns:  # why it wasn't added automatically, one line per check
             self.conn.execute("ALTER TABLE deposits ADD COLUMN note TEXT")
-        if "unverified" not in columns:  # 1: a request with an Order ID Binance didn't confirm
-            self.conn.execute("ALTER TABLE deposits ADD COLUMN unverified INTEGER NOT NULL DEFAULT 0")
-            self.conn.execute(  # requests made before this column existed, by their notes
-                "UPDATE deposits SET unverified = 1 WHERE receipt_file_id IS NULL AND"
-                " (note LIKE '%not found in your Binance Pay history%' OR note LIKE '%not checked (%')"
+        with self.tx():  # the columns and the marks below: all of it, or none
+            if "unverified" not in columns:  # 1: a request with an Order ID Binance didn't confirm
+                self.conn.execute("ALTER TABLE deposits ADD COLUMN unverified INTEGER NOT NULL DEFAULT 0")
+            if "unconfirmed" not in columns:  # those Order IDs ("": none; NULL: an older version's)
+                self.conn.execute("ALTER TABLE deposits ADD COLUMN unconfirmed TEXT")
+            # Requests written by an older version (also one gone back to after an update)
+            # say in their notes whether Binance confirmed them: mark them, at every start.
+            self.conn.execute(
+                "UPDATE deposits SET unverified = 1 WHERE unconfirmed IS NULL AND unverified = 0"
+                " AND method = 'binance' AND receipt_file_id IS NULL AND ("
+                + " OR ".join("note LIKE ?" for _ in UNCONFIRMED_NOTES) + ")",
+                [f"%{text}%" for text in UNCONFIRMED_NOTES],
             )
 
     def close(self) -> None:
@@ -958,22 +972,85 @@ class Database:
     def _paid_at(payment: Any) -> str:
         return datetime.fromtimestamp(payment.time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    def requests_in_doubt(self, payment: Any, user_id: int) -> list[sqlite3.Row]:
-        """Deposits made after this payment was paid that may be about it without naming
-        it, so it must not be added automatically too:
-        - requests (anyone's) with an Order ID Binance didn't confirm (a typo, or Binance
-          couldn't be asked): the owner may have approved this payment through one, or
-          rejected it and added the money by hand. A pending request that names exactly
-          this payment doesn't count: approving it is refused once the payment is added;
-        - balance the owner added to this customer by hand (/addbal), e.g. while Binance
-          couldn't be reached."""
-        ids = {value for value in (payment.order_id, payment.transaction_id) if value}
+    def binance_clock_offset(self) -> int:
+        """Binance's clock minus this server's (ms), as the Binance client last measured it."""
+        return int(self.get_setting("binance_clock_offset_ms") or 0)
+
+    def note_binance_clock(self, offset_ms: int) -> None:
+        if int(offset_ms) != self.binance_clock_offset():
+            self.set_setting("binance_clock_offset_ms", str(int(offset_ms)))
+
+    def _before(self, when: str, binance_clock: bool = False) -> str:
+        """``when`` (as now() writes it) minus DOUBT_MARGIN, on this server's clock; with
+        ``binance_clock``, ``when`` is a time from Binance (a payment's)."""
+        moment = datetime.strptime(when, "%Y-%m-%d %H:%M:%S") - timedelta(seconds=DOUBT_MARGIN)
+        if binance_clock:
+            moment -= timedelta(milliseconds=self.binance_clock_offset())
+        return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+    def payment_doubts(self, ids: Sequence[str], paid_at: str, user_id: int,
+                       exclude: Optional[int] = None) -> list[sqlite3.Row]:
+        """Deposits that may be about this payment (paid at ``paid_at``, known by ``ids``,
+        claimed by ``user_id``) without naming it, so it's never added without the owner:
+        - requests with an Order ID Binance didn't confirm ("unverified", anyone's) that
+          the owner decided after it was paid: he may have approved this payment through
+          one, or rejected it and refunded it or added the money by hand;
+        - such requests still waiting: this customer's (he may approve one for it), and
+          anyone's made after it was paid. One that names exactly this payment doesn't
+          count: approving it is refused once the payment is added;
+        - balance the owner added to this customer by hand (/addbal) after it was paid.
+        ``exclude``: the request asking. paid_at is on Binance's clock, converted to this
+        server's, with a margin for what the conversion can't know."""
+        since = self._before(paid_at, binance_clock=True)
         rows = self._all(
-            "SELECT * FROM deposits WHERE created_at >= ?"
-            " AND (unverified = 1 OR (method = 'manual' AND user_id = ?)) ORDER BY id",
-            (self._paid_at(payment), user_id),
+            "SELECT * FROM deposits WHERE id != ? AND ("
+            " (unverified = 1 AND status != 'pending' AND decided_at >= ?)"
+            " OR (unverified = 1 AND status = 'pending' AND (created_at >= ? OR user_id = ?))"
+            " OR (method = 'manual' AND user_id = ? AND created_at >= ?)) ORDER BY id",
+            (exclude or 0, since, since, user_id, user_id, since),
         )
-        return [r for r in rows if not (r["status"] == "pending" and r["order_id"] in ids)]
+        named = {value for value in ids if value}
+        return [r for r in rows if not (r["status"] == "pending" and r["order_id"] in named)]
+
+    def request_warnings(self, deposit_id: int) -> tuple[list[tuple[sqlite3.Row, list[sqlite3.Row]]],
+                                                         list[sqlite3.Row]]:
+        """What the owner should know before approving this Binance request:
+        - for each payment it holds, what may be about it already (payment_doubts);
+        - for a request with an Order ID Binance didn't confirm (the owner picks the payment
+          himself), what was added since it was made that may be that payment: this
+          customer's deposits, and anyone's Binance deposits of the same amount."""
+        dep = self.get_deposit(deposit_id)
+        if dep is None or dep["method"] != "binance" or dep["receipt_file_id"]:
+            return [], []
+        held = [(row, self.payment_doubts((row["order_id"], row["transaction_id"] or ""),
+                                          row["paid_at"], dep["user_id"], exclude=deposit_id))
+                for row in self.deposit_payments(deposit_id)
+                if row["status"] == "owner" and row["currency"] and row["paid_at"]]
+        since: list[sqlite3.Row] = []
+        if dep["unverified"]:
+            since = self._all(
+                "SELECT * FROM deposits WHERE id != ? AND status = 'approved' AND decided_at >= ?"
+                " AND ((user_id = ? AND method IN ('binance', 'binance_auto', 'manual'))"
+                " OR (method IN ('binance', 'binance_auto') AND amount = ?)) ORDER BY id",
+                (deposit_id, self._before(dep["created_at"]), dep["user_id"], dep["amount"]),
+            )
+        return [(row, doubts) for row, doubts in held if doubts], since
+
+    def approval_warnings(self, deposit_id: int) -> list[sqlite3.Row]:
+        """Deposits that may already have added what approving this request would add:
+        approved ones among request_warnings. Empty when approving would be refused anyway
+        (the payment it names was added already)."""
+        dep = self.get_deposit(deposit_id)
+        if dep is None or dep["status"] != "pending":
+            return []
+        if dep["order_id"]:
+            used = self.binance_payment(dep["order_id"])
+            if used is not None and used["status"] == "credited":
+                return []
+        held, since = self.request_warnings(deposit_id)
+        found = {row["id"]: row for _, doubts in held for row in doubts if row["status"] == "approved"}
+        found.update((row["id"], row) for row in since)
+        return [found[key] for key in sorted(found)]
 
     def link_payment(self, row: sqlite3.Row, payment: Any) -> sqlite3.Row:
         """Binance shows a payment the bot knows by only one of its IDs (an approval of the
@@ -1017,14 +1094,15 @@ class Database:
     ) -> DepositDecision:
         """Add a received Binance Pay transfer to the balance, once: its Order ID (and
         transaction ID) can never be used again, not even by two people at the same time.
-        PaymentInDoubt: the owner may have decided on it by hand already (requests_in_doubt)."""
+        PaymentInDoubt: the owner may have decided on it by hand already (payment_doubts)."""
         if cents <= 0:
             raise ShopError("The amount is too small to add.")
         with self.tx():
             used = self.binance_payment(payment.order_id, payment.transaction_id)
             if used is not None:
                 raise PaymentUsed(used)
-            doubt = self.requests_in_doubt(payment, user_id)
+            doubt = self.payment_doubts((payment.order_id, payment.transaction_id),
+                                        self._paid_at(payment), user_id)
             if doubt:
                 raise PaymentInDoubt(doubt)
             self.ensure_user(user_id)
@@ -1049,44 +1127,58 @@ class Database:
 
     def create_review_request(
         self, user_id: int, amount: int, order_id: Optional[str], note: str, payments: list[Any],
-        *, unverified: bool = False,
+        tried: Sequence[str] = (),
     ) -> sqlite3.Row:
         """A deposit the bot couldn't add (its checks failed): a request the owner approves
         or rejects. The received ``payments`` Binance found are kept for it, so nobody can
         claim them while the owner decides, and so is a payment of this customer's kept for
-        an earlier request the owner already decided. The request names the first of those
-        (an approval marks it as added), else ``order_id`` (the last one the customer sent)
-        unless it's used already. ``unverified``: some Order ID wasn't confirmed by Binance."""
+        an earlier request the owner already decided. ``order_id`` is the Order ID checked
+        last, ``tried`` all the ones the customer sent.
+
+        The request names the payment an approval marks as added: the one checked last if
+        it's kept, else the latest one kept, else ``order_id`` if nobody used it. The Order
+        IDs sent that aren't a payment kept for it are "unconfirmed": the owner may approve
+        it for a payment the bot can't name (see payment_doubts)."""
         if amount <= 0:
             raise ShopError("The amount must be more than 0.")
         with self.tx():
             self.ensure_user(user_id)
             cur = self.conn.execute(
-                "INSERT INTO deposits (user_id, amount, method, status, created_at, note, unverified)"
-                " VALUES (?, ?, 'binance', 'pending', ?, ?, ?)",
-                (user_id, amount, now(), note or None, int(unverified)),
+                "INSERT INTO deposits (user_id, amount, method, status, created_at, note)"
+                " VALUES (?, ?, 'binance', 'pending', ?, ?)",
+                (user_id, amount, now(), note or None),
             )
             deposit_id = int(cur.lastrowid)
-            named: Optional[str] = None
+            kept: list[str] = []  # the payments kept for it, in the order they were sent
 
-            def keep(row: Optional[sqlite3.Row], payment: Any = None) -> Optional[str]:
+            def keep(row: Optional[sqlite3.Row], payment: Any = None) -> None:
                 if row is None and payment is not None:  # found at Binance, used by nobody
                     self._record_payment(user_id, payment, 0, "owner", deposit_id)
-                    return payment.order_id or payment.transaction_id
-                if row is not None and self._held_after_decision(row, user_id):
+                    kept.append(payment.order_id or payment.transaction_id)
+                elif row is not None and self._held_after_decision(row, user_id):
                     self.conn.execute("UPDATE binance_payments SET deposit_id = ? WHERE order_id = ?",
                                       (deposit_id, row["order_id"]))
-                    return row["order_id"]
-                return None
+                    kept.append(row["order_id"])
 
             for payment in payments:
-                kept = keep(self.binance_payment(payment.order_id, payment.transaction_id), payment)
-                named = named or kept
+                keep(self.binance_payment(payment.order_id, payment.transaction_id), payment)
             if order_id:
-                row = self.binance_payment(order_id)
-                kept = keep(row)
-                named = named or kept or (order_id if row is None else None)
-            self.conn.execute("UPDATE deposits SET order_id = ? WHERE id = ?", (named, deposit_id))
+                keep(self.binance_payment(order_id))
+            last = self.binance_payment(order_id) if order_id else None
+            if last is not None and last["deposit_id"] == deposit_id and last["status"] == "owner":
+                named: Optional[str] = last["order_id"]  # the payment being claimed now
+            elif kept:
+                named = kept[-1]
+            else:
+                named = order_id if last is None else None
+            held = {value for row in self.deposit_payments(deposit_id)
+                    for value in (row["order_id"], row["transaction_id"]) if value}
+            sent = list(dict.fromkeys([*tried, *([order_id] if order_id else [])]))
+            unconfirmed = [value for value in sent if value not in held]
+            self.conn.execute(
+                "UPDATE deposits SET order_id = ?, unverified = ?, unconfirmed = ? WHERE id = ?",
+                (named, int(bool(unconfirmed)), " ".join(unconfirmed), deposit_id),
+            )
             return self.get_deposit(deposit_id)  # type: ignore[return-value]
 
     def deposit_payments(self, deposit_id: int) -> list[sqlite3.Row]:

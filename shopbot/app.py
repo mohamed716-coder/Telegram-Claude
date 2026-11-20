@@ -69,7 +69,11 @@ async def _post_stop(app: Application) -> None:
         await asyncio.wait(checks, timeout=CHECKS_TIMEOUT)
     client = app.bot_data.get("binance")
     if client is not None:
-        await client.close()
+        await client.close()  # a check still running now ends as if Binance couldn't be reached
+    late = [t for t in checks if not t.done()]
+    if late:
+        log.warning("%s payment check(s) were cut off by the stop", len(late))
+        await asyncio.wait(late, timeout=5)  # their answer, while the bot can still send it
     # Broadcasts notice the stop within a second and save how far they got.
     busy = [t for t in app.bot_data.get("broadcast_tasks", ()) if not t.done()]
     if busy:

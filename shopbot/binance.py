@@ -136,16 +136,27 @@ class BinancePay:
         self.base_urls = base_urls
         self._http = http
         self._offset_ms = 0  # Binance's clock minus ours
+        self._closed = False
         self._lock = asyncio.Lock()
         self._last_call = 0.0
         self._cache: dict[tuple[int, int], tuple[float, list[Payment]]] = {}
 
+    @property
+    def offset_ms(self) -> int:
+        """Binance's clock minus this computer's, in ms, as last measured (Binance answers
+        -1021 when they differ by more than it allows; until then this is 0)."""
+        return self._offset_ms
+
     async def close(self) -> None:
+        """For good: a request after this fails as if Binance couldn't be reached."""
+        self._closed = True
         if self._http is not None:
             await self._http.aclose()
             self._http = None
 
     def _client(self) -> httpx.AsyncClient:
+        if self._closed:
+            raise BinanceUnavailable("the bot is stopping")
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=20.0)
         return self._http

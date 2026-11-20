@@ -255,6 +255,10 @@ def test_other_coins_and_payments_sent_by_the_shop_are_failed_tries(tmp_path):
         assert deposit["order_id"] == ORDER  # the payment Binance has, kept for this request
         assert t.db.binance_payment(ORDER)["status"] == "owner"
         assert t.db.binance_payment(out) is None and balance(t, ALICE) == 0
+        # Binance didn't confirm the second one as a payment to the shop: approving the
+        # request may be for a payment the bot can't name.
+        assert deposit["unverified"] == 1 and deposit["unconfirmed"] == out
+        assert f"❗ Binance didn't confirm Order ID <code>{out}</code> as a new payment to you" in request
 
     run(tmp_path, scenario)
 
@@ -485,17 +489,21 @@ def test_an_approved_order_id_binance_did_not_know_cannot_let_the_real_one_be_ad
         calls = await t.send(ALICE, "466000199987322889")
         (request,) = t.db.pending_deposits()
         assert request["unverified"] == 1
-        assert "Binance didn't confirm this Order ID" in request_text(calls)
+        assert ("❗ Binance didn't confirm Order ID <code>466000199987322888</code>, "
+                "<code>466000199987322889</code> as a new payment to you") in request_text(calls)
         await t.press(OWNER, f"dok:{request['id']}")
         assert balance(t, ALICE) == 2500
         await choose(t, ALICE, 25)
         calls = await t.send(ALICE, ORDER)
         assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2500
         shown = request_text(calls)
-        assert f"paid before request #{request['id']} (approved) with an Order ID Binance didn't confirm" in shown
-        assert "Binance has: <b>25 USDT</b>" in shown and "Binance didn't confirm this Order ID" not in shown
+        assert (f"⚠️ May be added already: after <code>{ORDER}</code> was paid, you approved "
+                f"request #{request['id']}, whose Order ID Binance didn't confirm.") in shown
+        assert "Binance has: <b>25 USDT</b>" in shown and "❗" not in shown
         (again,) = t.db.pending_deposits()
         assert again["order_id"] == ORDER and t.db.binance_payment(ORDER)["status"] == "owner"
+        calls = await t.press(OWNER, f"dok:{again['id']}")  # approving it asks once more
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2500
         await t.press(OWNER, f"dno:{again['id']}")
         assert balance(t, ALICE) == 2500
 
@@ -513,9 +521,14 @@ def test_the_real_order_id_sent_while_such_a_request_waits_goes_to_the_owner_too
         await choose(t, ALICE, 25)
         calls = await t.send(ALICE, ORDER)
         assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 0
-        assert f"paid before request #{first['id']} (pending)" in request_text(calls)
+        assert (f"request #{first['id']} is waiting, with an Order ID Binance didn't confirm"
+                in request_text(calls))
         second = t.db.pending_deposits()[-1]
         await t.press(OWNER, f"dok:{second['id']}")  # the one Binance confirmed
+        assert balance(t, ALICE) == 2500
+        calls = await t.press(OWNER, f"dok:{first['id']}")  # it may be that same payment
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2500
+        assert f"25.00$ with request #{second['id']}" in t.last_text(calls)  # shown on the request
         await t.press(OWNER, f"dno:{first['id']}")
         assert balance(t, ALICE) == 2500
 
@@ -541,7 +554,8 @@ def test_a_payment_settled_by_hand_after_a_rejected_request_is_not_added_again(t
         calls = await t.send(ALICE, ORDER)
         assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2000
         shown = request_text(calls)
-        assert f"request #{request['id']} (rejected)" in shown and "the 20.00$ you added by hand at" in shown
+        assert f"you rejected request #{request['id']}, whose Order ID Binance didn't confirm" in shown
+        assert "you added 20.00$ by hand (" in shown
 
     run(tmp_path, scenario)
 
@@ -559,7 +573,12 @@ def test_balance_added_by_hand_stops_an_earlier_payment_being_added_again(tmp_pa
         fake.error = None
         calls = await t.press(ALICE, t.button(calls, "Check again"))
         assert "Sent to the owner" in t.last_text(calls, ALICE["id"]) and balance(t, ALICE) == 2500
-        assert "paid before the 25.00$ you added by hand at" in request_text(calls)
+        assert "you added 25.00$ by hand (" in request_text(calls)
+        (request,) = t.db.pending_deposits()
+        calls = await t.press(OWNER, f"dok:{request['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2500
+        await t.press(OWNER, f"dok:{request['id']}")  # pressed again: the owner is sure
+        assert balance(t, ALICE) == 5000
         # Balance added by hand to Alice doesn't hold up Bob's own payment.
         fake.payments.append(pay(order_id=OTHER, amount="10", tx="P_OTHER"))
         await choose(t, BOB, 10)
@@ -568,43 +587,286 @@ def test_balance_added_by_hand_stops_an_earlier_payment_being_added_again(tmp_pa
     run(tmp_path, scenario)
 
 
-def test_which_deposits_put_an_earlier_payment_in_doubt(tmp_path):
+def test_which_deposits_put_a_payment_in_doubt(tmp_path):
     db = Database(str(tmp_path / "shop.db"), OWNER["id"])
     payment = pay(amount="25")  # paid 5 minutes ago
+
+    def doubts(user: dict = ALICE, paid: Payment = payment) -> list[int]:
+        ids = (paid.order_id, paid.transaction_id)
+        return [r["id"] for r in db.payment_doubts(ids, db._paid_at(paid), user["id"])]
+
     db.create_deposit(BOB["id"], 1000, "file", "photo")  # a receipt: no Order ID at all
-    db.create_review_request(BOB["id"], 1000, OTHER, "x", [])  # Binance answered for it
+    db.create_review_request(BOB["id"], 1000, OTHER, "x", [pay(order_id=OTHER, tx="P_OTHER")])  # confirmed
     db.manual_deposit(BOB["id"], 1000, 100_000)  # someone else's balance added by hand
-    assert db.requests_in_doubt(payment, ALICE["id"]) == []
-    named = db.create_review_request(ALICE["id"], 2500, ORDER, "x", [], unverified=True)
-    assert db.requests_in_doubt(payment, ALICE["id"]) == []  # waits, and names this payment
+    bobs = db.conn.execute("SELECT MAX(id) FROM deposits").fetchone()[0]
+    assert doubts() == [] and doubts(BOB) == [bobs]
+    named = db.create_review_request(ALICE["id"], 2500, ORDER, "x", [])  # Binance didn't confirm it
+    assert named["unverified"] == 1 and named["unconfirmed"] == ORDER
+    assert doubts() == []  # it waits, and names exactly this payment
     db.decide_deposit(named["id"], False, 100_000)
-    assert [r["id"] for r in db.requests_in_doubt(payment, ALICE["id"])] == [named["id"]]
-    other = db.create_review_request(BOB["id"], 2500, "466000199987322888", "x", [], unverified=True)
+    assert doubts() == [named["id"]]  # rejected after it was paid: refunded, or added by hand?
+    other = db.create_review_request(BOB["id"], 2500, "466000199987322888", "x", [])
     db.manual_deposit(ALICE["id"], 2500, 100_000)
-    doubt = db.requests_in_doubt(payment, ALICE["id"])
-    assert [r["id"] for r in doubt][:2] == [named["id"], other["id"]] and doubt[2]["method"] == "manual"
-    assert db.requests_in_doubt(pay(amount="25", minutes_ago=-10), ALICE["id"]) == []  # paid after
+    added = db.conn.execute("SELECT MAX(id) FROM deposits").fetchone()[0]
+    assert doubts() == [named["id"], other["id"], added]
+    assert doubts(BOB) == [bobs, named["id"], other["id"]]  # Alice's balance by hand isn't Bob's
     with pytest.raises(PaymentInDoubt):
         db.credit_binance_payment(ALICE["id"], payment, 2500, 100_000)
     assert db.get_user(ALICE["id"])["balance"] == 2500 and db.binance_payment(ORDER) is None
+    # A payment made after all of these: the decided ones and Bob's can't be about it, but
+    # Alice's own waiting request can (she may have sent its Order IDs before paying).
+    later = pay(order_id="466000199987322999", amount="25", minutes_ago=-30, tx="P_LATER")
+    assert doubts(paid=later) == []
+    waiting = db.create_review_request(ALICE["id"], 2500, "466000199987322777", "x", [])
+    db.conn.execute("UPDATE deposits SET created_at = '2000-01-01 00:00:00' WHERE id = ?", (waiting["id"],))
+    assert doubts(paid=later) == [waiting["id"]]
+    assert doubts(BOB, later) == [other["id"]]  # Bob's own waiting request, not Alice's
+    # Decided after the payment counts, however long before it the request was made.
+    db.decide_deposit(waiting["id"], True, 100_000)
+    db.conn.execute("UPDATE deposits SET decided_at = ? WHERE id = ?",
+                    (db._paid_at(later), waiting["id"]))
+    assert doubts(BOB, later) == [other["id"], waiting["id"]]
     db.close()
 
 
 def test_an_older_database_marks_its_requests_binance_did_not_confirm(tmp_path):
     path = str(tmp_path / "shop.db")
     db = Database(path, OWNER["id"])
-    unconfirmed = db.create_review_request(ALICE["id"], 2500, ORDER,
-                                           f"{ORDER}: not found in your Binance Pay history", [])
-    unchecked = db.create_review_request(ALICE["id"], 2500, OTHER,
-                                         f"{OTHER}: not checked (Binance refused the API key)", [])
-    answered = db.create_review_request(ALICE["id"], 2500, None, f"{OTHER}: already used by someone else", [])
-    receipt = db.create_deposit(ALICE["id"], 1000, "file", "photo")
-    db.conn.execute("ALTER TABLE deposits DROP COLUMN unverified")  # as before this version
+
+    def as_before(note: str) -> int:  # a request written by an older version
+        db.ensure_user(ALICE["id"])
+        cur = db.conn.execute(
+            "INSERT INTO deposits (user_id, amount, method, status, created_at, note)"
+            " VALUES (?, 2500, 'binance', 'pending', '2026-11-19 10:00:00', ?)", (ALICE["id"], note))
+        return int(cur.lastrowid)
+
+    marked = [as_before(f"{ORDER}: not found in your Binance Pay history"),
+              as_before(f"{ORDER}: not checked (Binance refused the API key)"),
+              as_before(f"{ORDER}: not a payment to the shop"),
+              as_before(f"{ORDER}: already used by someone else")]
+    left = [as_before(f"{ORDER}: is 20 USDT, not 25 USDT"),
+            db.create_deposit(ALICE["id"], 1000, "file", "photo")["id"]]
+    # Written by this version: Binance confirmed its Order ID in the end (the first check
+    # came before Binance listed it), so it stays unmarked although its notes say "not found".
+    mine = db.create_review_request(ALICE["id"], 2000, ORDER, f"{ORDER}: not found in your Binance Pay history",
+                                    [pay(amount="20")], [ORDER])
+    assert mine["unverified"] == 0 and mine["unconfirmed"] == ""
+    db.close()
+    db = Database(path, OWNER["id"])  # the next start marks the older version's requests
+    assert [db.get_deposit(i)["unverified"] for i in marked] == [1, 1, 1, 1]
+    assert [db.get_deposit(i)["unverified"] for i in left + [mine["id"]]] == [0, 0, 0]
+    again = as_before(f"{OTHER}: not found in your Binance Pay history")  # e.g. after going back
     db.close()
     db = Database(path, OWNER["id"])
-    marks = [db.get_deposit(d["id"])["unverified"] for d in (unconfirmed, unchecked, answered, receipt)]
-    assert marks == [1, 1, 0, 0]
+    assert db.get_deposit(again)["unverified"] == 1  # marked at every start
     db.close()
+
+
+def test_a_request_made_before_the_payment_and_approved_after_it_still_holds_it(tmp_path):
+    # Order IDs Binance doesn't know sent BEFORE paying (an old one, or made up): the owner
+    # then finds the payment in the app and approves. What counts is when he decided.
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, "466000199987322888")
+        await t.send(ALICE, "466000199987322889")
+        (request,) = t.db.pending_deposits()
+        earlier = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3600))
+        t.db.conn.execute("UPDATE deposits SET created_at = ? WHERE id = ?", (earlier, request["id"]))
+        fake.payments.append(pay(amount="25"))  # paid 5 minutes ago, long after the request
+        await choose(t, ALICE, 25)  # while it waits, her own payments aren't added either
+        calls = await t.send(ALICE, ORDER)
+        assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 0
+        assert f"request #{request['id']} is waiting" in request_text(calls)
+        held = t.db.pending_deposits()[-1]
+        await t.press(OWNER, f"dno:{held['id']}")  # the owner deals with the first one
+        await t.press(OWNER, f"dok:{request['id']}")  # he found her 25 USDT in the app
+        assert balance(t, ALICE) == 2500
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2500
+        assert f"you approved request #{request['id']}" in request_text(calls)
+        # Bob's payment made before that decision is in doubt too: it may be the one.
+        fake.payments.append(pay(order_id=OTHER, amount="10", tx="P_OTHER"))
+        await choose(t, BOB, 10)
+        calls = await t.send(BOB, OTHER)
+        assert "Sent to the owner" in texts(calls, BOB)[-1] and balance(t, BOB) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_that_reaches_the_owner_another_way_still_says_why_it_may_be_added(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, "466000199987322888")
+        await t.send(ALICE, "466000199987322889")
+        (first,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{first['id']}")  # the owner found her 25 USDT in the app
+        await choose(t, ALICE, 24)  # another amount: her payment doesn't match it
+        await t.send(ALICE, ORDER)
+        calls = await t.send(ALICE, ORDER)
+        shown = request_text(calls)
+        assert "is 25 USDT, not 24 USDT" in shown and f"you approved request #{first['id']}" in shown
+        (second,) = t.db.pending_deposits()
+        calls = await t.press(OWNER, f"dok:{second['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2500
+
+    run(tmp_path, scenario)
+
+
+def test_a_payment_kept_for_a_rejected_request_and_settled_by_hand_says_so(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="20")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)
+        (first,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dno:{first['id']}")
+        await t.send(OWNER, f"/addbal {ALICE['id']} 20")
+        await choose(t, ALICE, 20)
+        calls = await t.send(ALICE, ORDER)
+        shown = request_text(calls)
+        assert f"was in request #{first['id']}, which you rejected" in shown
+        assert "you added 20.00$ by hand (" in shown
+        (second,) = t.db.pending_deposits()
+        calls = await t.press(OWNER, f"dok:{second['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2000
+
+    run(tmp_path, scenario)
+
+
+def test_the_request_names_the_payment_being_claimed(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25"), pay(order_id=OTHER, amount="20", tx="P_OTHER")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, BOB, 10)  # Bob's request with Order IDs Binance doesn't know
+        await t.send(BOB, "466000199987322888")
+        await t.send(BOB, "466000199987322889")
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, OTHER)  # her 20 USDT payment: not the amount chosen
+        calls = await t.send(ALICE, ORDER)  # her 25 USDT one, which Bob's request may be about
+        assert "Sent to the owner" in texts(calls, ALICE)[-1]
+        request = t.db.pending_deposits()[-1]
+        assert request["order_id"] == ORDER and request["unverified"] == 0
+        await t.press(OWNER, f"dok:{request['id']}")  # Bob's request only waits: no warning
+        assert balance(t, ALICE) == 2500
+        assert t.db.binance_payment(ORDER)["status"] == "credited"
+        assert t.db.binance_payment(OTHER)["status"] == "owner"  # not added: the owner decides it
+
+    run(tmp_path, scenario)
+
+
+def test_an_order_id_binance_lists_late_is_confirmed_and_holds_up_nobody(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance(pay(order_id=OTHER, amount="10", tx="P_OTHER", minutes_ago=3)))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)  # sent before Binance lists it: not found
+        fake.payments.append(pay(amount="20"))  # listed now: 20 USDT, not the 25 chosen
+        calls = await t.press(ALICE, t.button(calls, "Check again"))
+        (request,) = t.db.pending_deposits()
+        assert request["unverified"] == 0 and request["unconfirmed"] == ""
+        assert "❗" not in request_text(calls)
+        await choose(t, BOB, 10)  # paid before Alice's request: not held up by it
+        assert "Payment received!" in texts(await t.send(BOB, OTHER), BOB)[-1]
+
+    run(tmp_path, scenario)
+
+
+def test_the_owner_sees_how_things_stand_when_deciding(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, "466000199987322888")
+        await t.send(ALICE, "466000199987322889")
+        (first,) = t.db.pending_deposits()
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        second = t.db.pending_deposits()[-1]
+        await t.press(OWNER, f"dok:{first['id']}")  # meanwhile: approved for her 25 USDT
+        calls = await t.send(OWNER, "/pending")
+        (shown,) = [x for x in owner_texts(calls) if f"Deposit request #{second['id']}" in x]
+        assert f"you approved request #{first['id']}, whose Order ID Binance didn't confirm" in shown
+        calls = await t.press(OWNER, f"dok:{second['id']}")
+        assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 2500
+        assert f"you approved request #{first['id']}" in t.last_text(calls)  # the request now says so
+
+    run(tmp_path, scenario)
+
+
+def test_a_server_clock_behind_binances_still_counts_a_decision_after_the_payment(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25", minutes_ago=-1)))  # Binance's clock is ahead
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, BOB, 25)
+        await t.send(BOB, "466000199987322888")
+        await t.send(BOB, "466000199987322889")
+        (request,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{request['id']}")  # "before" the payment by this clock
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_clock_difference_binance_measured_is_allowed_for(tmp_path):
+    # This server's clock is 30 minutes behind Binance's: the client measures that (-1021)
+    # and it's kept, so a payment's time can be compared with the owner's decisions.
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance(pay(amount="25", minutes_ago=-25)))  # by Binance's clock
+        fake.offset_ms = 30 * 60_000
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, BOB, 25)
+        await t.send(BOB, "466000199987322888")
+        await t.send(BOB, "466000199987322889")
+        (request,) = t.db.pending_deposits()
+        assert t.db.binance_clock_offset() == 30 * 60_000  # noted at Bob's checks
+        await t.press(OWNER, f"dok:{request['id']}")  # 5 minutes after Alice paid, really
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 0
+        fake.offset_ms = 0  # the clock was set right: the next check notes that too
+        await t.send(ALICE, "/start")
+        await choose(t, BOB, 25)
+        await t.send(BOB, "466000199987322777")
+        assert t.db.binance_clock_offset() == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_stays_short_enough_to_send_whatever_it_lists(tmp_path):
+    from shopbot.handlers.common import utf16_len
+    from shopbot.handlers.money import deposit_caption
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        register(t, BOB)
+        for n in range(70):  # e.g. a day while Binance refused the key
+            t.db.create_review_request(BOB["id"], 1000, f"4660001999873{n:05d}", "x", [])
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "and 67 more." in request_text(calls)
+        request = t.db.pending_deposits()[-1]
+        notes = "\n".join(f"{n:05d}: " + "why " * 60 for n in range(20))
+        t.db.conn.execute("UPDATE deposits SET note = ?, unconfirmed = ?, unverified = 1 WHERE id = ?",
+                          (notes, " ".join(f"4660001999872{n:05d}" for n in range(40)), request["id"]))
+        caption = deposit_caption(t.app, t.db.get_deposit(request["id"]))
+        assert "... and 15 more" in caption and "and 37 more as a new payment" in caption
+        assert utf16_len(caption) <= 4096
+
+    run(tmp_path, scenario)
 
 
 def test_the_other_id_of_a_payment_the_owner_added_is_recognised(tmp_path):
@@ -667,10 +929,12 @@ def test_a_payment_left_over_from_an_approved_request_goes_back_to_the_owner(tmp
         await t.send(ALICE, ORDER)
         await t.send(ALICE, OTHER)
         (first,) = t.db.pending_deposits()
-        assert first["order_id"] == ORDER and t.db.binance_payment(OTHER)["status"] == "owner"
+        assert first["order_id"] == OTHER  # the one sent last
+        assert t.db.binance_payment(ORDER)["status"] == "owner"
         await t.press(OWNER, f"dok:{first['id']}")  # 25$ for both: the owner's call
-        await choose(t, ALICE, 30)
-        calls = await t.send(ALICE, OTHER)
+        assert t.db.binance_payment(OTHER)["status"] == "credited"
+        await choose(t, ALICE, 20)
+        calls = await t.send(ALICE, ORDER)
         assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 2500
         assert f"was in request #{first['id']}, which you approved" in request_text(calls)
 
@@ -735,6 +999,52 @@ def test_when_binance_stays_unreachable_the_deposit_goes_to_the_owner(tmp_path, 
     run(tmp_path, scenario)
 
 
+def test_binance_unreachable_twice_a_minute_apart_sends_the_deposit_to_the_owner(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25"), error=BinanceUnavailable("busy")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "if it still can't be reached then, the owner checks your payment by hand" in t.last_text(calls)
+        t.app.user_data[ALICE["id"]]["state"]["unreachable"][0] -= 61  # as if a minute ago
+        calls = await t.press(ALICE, t.button(calls, "Check again"))
+        assert "Sent to the owner" in t.last_text(calls, ALICE["id"])
+
+    run(tmp_path, scenario)
+
+
+def test_cancelling_while_binance_cannot_be_reached_offers_nothing(tmp_path):
+    class SlowDown(FakeBinance):
+        go = asyncio.Event()
+
+        async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
+            await self.go.wait()
+            raise BinanceUnavailable("busy")
+
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, SlowDown())
+        SlowDown.go = asyncio.Event()
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        settle = t.settle
+
+        async def quick() -> None:
+            await asyncio.sleep(0.01)
+
+        t.settle = quick  # type: ignore[method-assign]
+        await t.send(ALICE, ORDER)
+        await t.press(ALICE, "cancel")
+        mark = len(t.tg.calls)
+        fake.go.set()
+        t.settle = settle  # type: ignore[method-assign]
+        await t.settle()
+        calls = t.tg.calls[mark:]
+        assert "Cancelled" in t.last_text(calls, ALICE["id"]) and not t.has_button(calls, "Check again")
+        assert owner_texts(calls) == [] and t.db.pending_deposits() == []
+
+    run(tmp_path, scenario)
+
+
 def test_stopping_lets_a_payment_check_finish_before_binance_is_closed(tmp_path):
     from shopbot import app as app_module
 
@@ -753,6 +1063,30 @@ def test_stopping_lets_a_payment_check_finish_before_binance_is_closed(tmp_path)
         task = asyncio.get_running_loop().create_task(check(), name=f"shopbot:binance:{ALICE['id']}")
         await app_module._post_stop(t.app)
         assert events == ["checked", "closed"] and task.done()
+
+    run(tmp_path, scenario)
+
+
+def test_a_check_cut_off_by_the_stop_still_answers_before_the_bot_is_gone(tmp_path, monkeypatch):
+    from shopbot import app as app_module
+
+    monkeypatch.setattr(app_module, "CHECKS_TIMEOUT", 0.01)  # Binance hangs longer than allowed
+
+    async def scenario(t: ShopTest) -> None:
+        events: list[str] = []
+
+        class Client:
+            async def close(self) -> None:
+                events.append("closed")
+
+        async def check() -> None:
+            await asyncio.sleep(0.1)  # its request fails once the client is closed ...
+            events.append("answered")  # ... and the customer is told
+
+        t.app.bot_data["binance"] = Client()
+        task = asyncio.get_running_loop().create_task(check(), name=f"shopbot:binance:{ALICE['id']}")
+        await app_module._post_stop(t.app)
+        assert events == ["closed", "answered"] and task.done()
 
     run(tmp_path, scenario)
 
@@ -941,6 +1275,26 @@ def test_a_search_after_a_clock_correction_reaches_binances_now(monkeypatch):
     found = asyncio.run(go())
     assert found is not None and found.transaction_id == wanted
     assert windows[0][1] < paid <= windows[-1][1]  # the first window ended too early
+
+
+def test_a_closed_client_stays_closed(monkeypatch):
+    monkeypatch.setattr(binance_module, "MIN_GAP", 0)
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        return httpx.Response(200, json={"code": "000000", "success": True, "data": []})
+
+    async def go() -> None:
+        client = fake_api(handler)
+        assert await client.page(0, 1) == []
+        await client.close()  # the bot stops; a check still running mustn't open a new one
+        with pytest.raises(BinanceUnavailable):
+            await client.page(5_000, 9_000)  # another window: not answered from the cache
+        assert client._http is None
+
+    asyncio.run(go())
+    assert asked == ["/sapi/v1/pay/transactions"]
 
 
 def test_the_key_check_warns_about_a_key_that_can_do_too_much(monkeypatch):
