@@ -22,6 +22,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Conflict, NetworkError, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from ..binance import clean_order_id
 from ..config import Settings
 from ..db import Database
 
@@ -38,7 +39,8 @@ OWNER, ADMIN, USER = "owner", "admin", "user"
 MAX_DB_INT = 2**63 - 1
 
 # Callback prefixes that must NOT end the action in progress (see pre_handler).
-KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "dck", "wall", "dok", "dokx", "dno", "wok", "wno", "noop"}
+KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "dck", "wall", "dok", "dokx", "dno", "wok", "wno", "noop",
+                       "abk"}
 
 BOT_DESCRIPTION = "🛍 Welcome to the shop!\n\nPress /start to start the shop."
 BOT_SHORT_DESCRIPTION = "🛍 Send /start to start the shop."
@@ -497,7 +499,8 @@ def help_text(role: str, cfg: Settings, *, earnings: int = 0, support: str = "")
         lines += [
             "",
             "👑 <b>Owner panel</b>",
-            "/addbal <code>ID AMOUNT</code> — add balance to a user",
+            "/addbal <code>ID AMOUNT</code> — add balance to a user (send /addbal alone and the "
+            "bot asks for each, the Binance Pay Order ID last: it's optional)",
             "/addbal <code>ID AMOUNT ORDER_ID</code> — the same for a Binance Pay payment: "
             "its Order ID can't be added again",
             "/regbin <code>ORDER_ID</code> — register a Binance payment you added by hand, so it "
@@ -684,6 +687,15 @@ async def pre_handler(update: Update, context: Ctx) -> None:
                 )
             except TelegramError as exc:
                 log.info("Could not send the discard warning to %s: %s", chat.id, exc)
+        cancelled = (update.callback_query is not None and update.callback_query.data == "cancel") or (
+            update.callback_query is None and (update.effective_message.text or "").startswith("/cancel"))  # type: ignore[union-attr]
+        if old and old.get("name") == "owner_order_id" and not cancelled:
+            who = user_name(db_of(context).get_user(old["target"]))
+            try:
+                await context.bot.send_message(
+                    chat.id, f"⚠️ Add balance stopped: {money(old['amount'])} for {who} was not added.")
+            except TelegramError as exc:
+                log.info("Could not send the stopped warning to %s: %s", chat.id, exc)
 
 
 async def cmd_start(update: Update, context: Ctx) -> None:
@@ -784,6 +796,13 @@ async def on_message(update: Update, context: Ctx) -> None:
     """Route a plain message to the action the user is in the middle of."""
     state = get_state(context)
     if state is None:
+        text = update.effective_message.text or ""  # type: ignore[union-attr]
+        if is_owner(context, update.effective_user.id) and clean_order_id(text) and len(text.split()) == 1:  # type: ignore[union-attr]
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "🧾 Nothing is waiting for an Order ID (the bot may have restarted), so nothing was "
+                "added. To add balance: /addbal. To register a payment you added already: "
+                "/regbin ORDER_ID USER_ID.")
+            return
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "👋 Send /start to open the shop menu."
         )

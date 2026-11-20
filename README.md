@@ -193,7 +193,7 @@ earned: they still see 📊 Earnings and can use `/withdraw`.
 | `/cancel` | everyone | Cancel what you're doing |
 | `/withdraw` | owner, admins | Withdraw earnings to Binance |
 | `/pull` | owner, admins | Take products out of your stock, picked at random, as many as you choose (owner: `/pull ID` for an admin's) |
-| `/addbal ID AMOUNT` | owner | Add balance to a user (counts as a deposit). `/addbal ID AMOUNT ORDER_ID` also registers that Binance Pay payment, so it can't be added again |
+| `/addbal ID AMOUNT` | owner | Add balance to a user (counts as a deposit). `/addbal ID AMOUNT ORDER_ID` also registers that Binance Pay payment, so it can't be added again. Send `/addbal` alone and the bot asks for the ID, the amount and then (with automatic deposits) the Order ID, which is optional: **⏭ Skip** adds it without one |
 | `/regbin ORDER_ID [USER_ID]` | owner | Register a Binance Pay payment you added by hand: it can't be added again |
 | `/modifybal ID` | owner | Show a user's balance and set a new one |
 | `/addadmin ID` / `/removeadmin ID` | owner | Give / remove the admin panel |

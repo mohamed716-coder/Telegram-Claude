@@ -9,23 +9,32 @@ from __future__ import annotations
 import csv
 import functools
 import io
+import logging
+import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
 from ..binance import clean_order_id
 from ..db import BalanceChanged, PaymentApproved, PaymentUsed, PaymentWaiting, ShopError
 from .autopay import client_of, look_up_registered, payment_record
 from .common import (
+    GREEN,
+    RED,
     Ctx,
+    answer,
+    btn,
     cancel_kb,
     cfg_of,
     clear_state,
     csv_safe,
     db_of,
     esc,
+    get_state,
     is_owner,
     markup,
     menu_btn,
@@ -35,6 +44,7 @@ from .common import (
     parse_amount,
     parse_int,
     set_state,
+    short,
     state_handler,
     sync_commands,
     user_html,
@@ -42,6 +52,7 @@ from .common import (
 )
 
 Handler = Callable[[Update, Ctx], Awaitable[None]]
+log = logging.getLogger("shopbot.owner")
 STATUS_TEXT_LIMIT = 50  # users listed in the /status message; the CSV has everyone
 
 
@@ -187,11 +198,90 @@ async def ask_add_balance_amount(update: Update, context: Ctx, target: int) -> N
         update,
         f"💰 <b>Add balance</b>\n👤 {user_html(row)}\n💳 Current balance: {money(row['balance'])}"
         f"{_not_started_note(row)}\n\nSend the amount to add, e.g. <code>50</code> or <code>12.50</code>."
-        + ("\n\nFor a Binance Pay payment, put its Order ID after the amount, e.g. "
-           "<code>10 412345678901234567</code>: then it can't be added again automatically."
+        + ("\nNext you can give the Binance Pay Order ID of the payment, or skip it."
            if client_of(context) is not None else ""),
         cancel_kb(),
     )
+
+
+def single_order_id(text: str) -> Optional[str]:
+    """An Order ID sent on its own (also as '#…' or 'Order ID: …'), else None: an amount or a
+    word next to it must never become part of the ID (clean_order_id joins what it's given)."""
+    value = re.sub(r"(?i)^\s*order\s*id\s*:?\s*", "", text or "").strip()
+    return clean_order_id(value) if len(value.split()) == 1 else None
+
+
+def _skip_kb(context: Ctx, state: dict) -> Any:
+    who = short(user_name(db_of(context).get_user(state["target"])), 16)
+    return markup([[btn(f"⏭ Skip: add {money(state['amount'])} to {who}", f"abk:{state['nonce']}", GREEN)],
+                   [btn("❌ Cancel", "cancel", RED)]])
+
+
+async def ask_order_id(update: Update, context: Ctx, target: int, amount: int, note: str = "") -> None:
+    """The amount is known: ask for the Binance Pay Order ID it's for. It's optional:
+    ⏭ Skip adds the balance without one."""
+    # The Skip button is valid for exactly this question, not for a later one.
+    state = set_state(context, "owner_order_id", target=target, amount=amount, nonce=secrets.token_hex(4))
+    who = user_html(db_of(context).get_user(target))
+    if note:  # the Order ID sent was refused
+        text = (note + f"\n\nSend another Order ID, or press ⏭ Skip to add {money(amount)} to {who} "
+                "without one.")
+    else:
+        text = (f"🧾 <b>Order ID (optional)</b>\n👤 {who}\n💵 Amount: <b>{money(amount)}</b> (not added yet)"
+                "\n\nIf this is for a Binance Pay payment, send its Order ID: then that payment can't be "
+                "added again automatically. If not, press ⏭ Skip.")
+    await reply(update, text, _skip_kb(context, state))
+
+
+@state_handler("owner_order_id")
+async def on_owner_order_id(update: Update, context: Ctx, state: dict) -> None:
+    if not is_owner(context, update.effective_user.id):  # type: ignore[union-attr]
+        clear_state(context)
+        return
+    text = await need_text(update)
+    if text is None:
+        return
+    order_id = single_order_id(text)
+    parts = text.split()
+    if order_id is None and len(parts) == 2:  # the amount and the Order ID, either way round
+        for amount_text, id_text in ((parts[0], parts[1]), (parts[1], parts[0])):
+            amount, found = parse_amount(amount_text), single_order_id(id_text)
+            if amount is None or found is None:
+                continue
+            if amount != state["amount"]:
+                await reply(update, f"⚠️ The amount here is <b>{money(state['amount'])}</b>, not "
+                                    f"{money(amount)}. Send only the Order ID, or press Cancel and send "
+                                    "/addbal again for another amount.", _skip_kb(context, state))
+                return
+            order_id = found
+    if order_id is None:
+        await reply(update, f"⚠️ <code>{esc(short(text.strip(), 40))}</code> isn't a Binance Pay Order ID. "
+                            "Send only the Order ID (e.g. <code>412345678901234567</code>), or press ⏭ Skip "
+                            f"to add {money(state['amount'])} without one.", _skip_kb(context, state))
+        return
+    clear_state(context)
+    await do_add_balance(update, context, state["target"], state["amount"], order_id, prompt=True)
+
+
+async def cb_skip_order_id(update: Update, context: Ctx) -> None:
+    """⏭ Skip: add the balance asked about without an Order ID."""
+    query = update.callback_query
+    if not is_owner(context, query.from_user.id):  # type: ignore[union-attr]
+        await answer(query, "Only the owner can do that.", show_alert=True)
+        return
+    nonce = (query.data or "").split(":", 1)[-1]  # type: ignore[union-attr]
+    state = get_state(context)
+    if not (isinstance(state, dict) and state.get("name") == "owner_order_id" and state.get("nonce") == nonce):
+        await answer(query, "This has expired. Before adding again, check the balance with /modifybal.",
+                     show_alert=True)
+        return
+    clear_state(context)  # before adding: a second press finds nothing to add
+    await answer(query)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramError as exc:
+        log.info("Could not remove the Skip button: %s", exc)
+    await do_add_balance(update, context, state["target"], state["amount"], None, prompt=True)
 
 
 async def ask_new_balance(update: Update, context: Ctx, target: int) -> None:
@@ -254,10 +344,10 @@ async def do_add_balance(
         done = db.manual_deposit(target, amount, cfg.seller_auto_threshold * 100, order_id)
     except (PaymentUsed, PaymentWaiting, PaymentApproved) as exc:
         text = "⚠️ Nothing was added: " + _not_registrable(context, exc, order_id or "", target)
-        if prompt:
-            set_state(context, "owner_amount", action="addbal", target=target)
-            text += "\n\nSend the amount again (with another Order ID, or none), or press Cancel."
-        await reply(update, text, cancel_kb() if prompt else None)
+        if prompt:  # asked again: another Order ID, or none
+            await ask_order_id(update, context, target, amount, note=text)
+        else:
+            await reply(update, text)
         return False
     except ShopError as exc:
         await reply(update, f"⚠️ {esc(exc)}")
@@ -272,11 +362,14 @@ async def do_add_balance(
         text += f"\n⭐ They reached {cfg.seller_auto_threshold}$ in deposits and are now a seller."
     if done.registered is not None:
         text += _registered_text(context, done.registered, amount)
-    elif client_of(context) is not None:
+    elif client_of(context) is not None and not prompt:  # the prompt asked for it already
         text += (f"\n\n💡 For a Binance Pay payment, send <code>/regbin ORDER_ID {target}</code> "
                  "too: then it can't be added again automatically.")
     text += _not_started_note(row)
-    await reply(update, text)
+    try:  # added already: the customer is told whatever happens to this reply
+        await reply(update, text)
+    except TelegramError as exc:
+        log.warning("Could not confirm the balance added to %s: %s", target, exc)
     if done.registered is not None:
         await _tell_closed(context, done.registered.closed)
     message = (
@@ -401,7 +494,7 @@ async def on_owner_amount(update: Update, context: Ctx, state: dict) -> None:
         first, rest = text.split(None, 1)  # the amount, then an Order ID
         amount = parse_amount(first)
         if amount is not None:
-            order_id = clean_order_id(rest)
+            order_id = single_order_id(rest)
             if order_id is None:
                 await reply(update, f"⚠️ <code>{esc(rest)}</code> isn't a Binance Pay Order ID. Send the "
                                     "amount, then the Order ID, e.g. <code>10 412345678901234567</code>.")
@@ -411,6 +504,9 @@ async def on_owner_amount(update: Update, context: Ctx, state: dict) -> None:
         return
     clear_state(context)
     if state["action"] == "addbal":
+        if order_id is None and client_of(context) is not None:  # ask for it: it's optional
+            await ask_order_id(update, context, state["target"], amount)
+            return
         await do_add_balance(update, context, state["target"], amount, order_id, prompt=True)
     else:
         await do_set_balance(update, context, state["target"], amount, state.get("shown"))

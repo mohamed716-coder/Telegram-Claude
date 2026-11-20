@@ -374,23 +374,41 @@ def test_regbin_input_is_checked(tmp_path):
     run(tmp_path, scenario)
 
 
-def test_the_add_balance_prompt_takes_an_order_id_after_the_amount(tmp_path):
+def test_add_balance_asks_for_the_order_id_after_the_amount_and_it_is_optional(tmp_path):
     async def scenario(t: ShopTest) -> None:
-        with_binance(t, FakeBinance(pay(amount="10")))
+        with_binance(t, FakeBinance(pay(amount="10"), pay(order_id=OTHER, tx="P_OTHER", amount="7")))
         register(t, ALICE)
         await t.send(OWNER, "/addbal")
         calls = await t.send(OWNER, str(ALICE["id"]))
-        assert "put its Order ID after the amount" in owner_texts(calls)[0]
-        calls = await t.send(OWNER, "10 not-an-id")
-        assert "isn't a Binance Pay Order ID" in owner_texts(calls)[0] and balance(t, ALICE) == 0
-        calls = await t.send(OWNER, f"10 {ORDER}")  # still asked: send it again
-        assert "Added <b>10.00$</b>" in owner_texts(calls)[0] and "registered as added" in owner_texts(calls)[0]
+        assert "Next you can give the Binance Pay Order ID of the payment, or skip it." in owner_texts(calls)[0]
+        calls = await t.send(OWNER, "10")
+        shown = owner_texts(calls)[0]
+        assert "Order ID (optional)" in shown and "Amount: <b>10.00$</b> (not added yet)" in shown
+        assert "<b>Alice</b>" in shown
+        assert t.button(calls, "⏭ Skip: add 10.00$ to Alice").startswith("abk:")
+        assert t.button(calls, "Cancel") == "cancel"
+        assert balance(t, ALICE) == 0  # nothing yet
+        calls = await t.send(OWNER, "not-an-id")
+        shown = owner_texts(calls)[0]
+        assert "isn't a Binance Pay Order ID" in shown and "press ⏭ Skip to add 10.00$ without one" in shown
+        assert t.has_button(calls, "⏭ Skip: add 10.00$") and balance(t, ALICE) == 0
+        calls = await t.send(OWNER, ORDER)
+        shown = owner_texts(calls)[0]
+        assert "Added <b>10.00$</b>" in shown and "registered as added" in shown
         assert balance(t, ALICE) == 1000 and t.db.binance_payment(ORDER)["user_id"] == ALICE["id"]
-        # Without an Order ID while automatic deposits are on: a tip.
+        # Skipped: added without one, and no tip about /regbin (it was asked).
         await t.send(OWNER, f"/addbal {ALICE['id']}")
-        calls = await t.send(OWNER, "5")
-        assert f"/regbin ORDER_ID {ALICE['id']}" in owner_texts(calls)[0]
-        assert balance(t, ALICE) == 1500
+        await t.send(OWNER, "5")
+        calls = await t.press(OWNER, t.button(await t.send(OWNER, "nope"), "⏭ Skip: add 5.00$"))
+        shown = owner_texts(calls)
+        assert "Added <b>5.00$</b>" in shown[-1] and "/regbin" not in shown[-1]
+        assert balance(t, ALICE) == 1500 and t.db.payment_records("nope") == []
+        assert "5.00$</b> was added to your balance" in texts(calls, ALICE)[-1]
+        # Both in one message: no question.
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        calls = await t.send(OWNER, f"7 {OTHER}")
+        assert "Added <b>7.00$</b>" in owner_texts(calls)[0] and "registered as added" in owner_texts(calls)[0]
+        assert balance(t, ALICE) == 2200
 
     run(tmp_path, scenario)
 
@@ -403,12 +421,49 @@ def test_a_refused_order_id_in_the_prompt_asks_again(tmp_path):
         await t.send(OWNER, f"/addbal {ALICE['id']} 10 {ORDER}")
         await t.send(OWNER, "/addbal")
         await t.send(OWNER, str(BOB["id"]))
-        calls = await t.send(OWNER, f"10 {ORDER}")  # Alice's, a typo
+        await t.send(OWNER, "10")
+        calls = await t.send(OWNER, ORDER)  # Alice's, a typo
         shown = owner_texts(calls)[0]
-        assert "Nothing was added" in shown and "Send the amount again" in shown
-        assert t.button(calls, "Cancel") == "cancel"
-        calls = await t.send(OWNER, f"10 {OTHER}")
+        assert "Nothing was added" in shown and "Send another Order ID, or press ⏭ Skip to add 10.00$ to <b>Bob</b>" in shown
+        assert t.has_button(calls, "⏭ Skip: add 10.00$") and balance(t, BOB) == 0
+        calls = await t.send(OWNER, OTHER)
         assert "Added <b>10.00$</b>" in owner_texts(calls)[0] and balance(t, BOB) == 1000
+        # A refusal, then Skip: added without an Order ID.
+        await t.send(OWNER, f"/addbal {BOB['id']}")
+        await t.send(OWNER, "3")
+        calls = await t.send(OWNER, ORDER)
+        calls = await t.press(OWNER, t.button(calls, "⏭ Skip: add 3.00$"))
+        assert "Added <b>3.00$</b>" in owner_texts(calls)[-1] and balance(t, BOB) == 1300
+
+    run(tmp_path, scenario)
+
+
+def test_the_skip_button_works_once_and_only_for_its_own_question(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        alices = t.button(await t.send(OWNER, "10"), "⏭ Skip: add 10.00$")
+        calls = await t.send(OWNER, f"/addbal {BOB['id']}")  # a new question replaces it
+        assert "⚠️ Add balance stopped: 10.00$ for Alice was not added." in owner_texts(calls)
+        bobs = t.button(await t.send(OWNER, "20"), "⏭ Skip: add 20.00$")
+        calls = await t.press(OWNER, alices)
+        assert "This has expired" in t.alert(calls) and balance(t, ALICE) == 0
+        calls = await t.press(ALICE, bobs)
+        assert "Only the owner can do that." in t.alert(calls)
+        calls = await t.press(OWNER, bobs)
+        assert "Added <b>20.00$</b>" in owner_texts(calls)[-1] and balance(t, BOB) == 2000
+        calls = await t.press(OWNER, bobs)  # a second press
+        assert "This has expired" in t.alert(calls) and "/modifybal" in t.alert(calls)
+        assert balance(t, BOB) == 2000
+        # Cancelled: nothing to skip to.
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        skip = t.button(await t.send(OWNER, "4"), "⏭ Skip: add 4.00$")
+        calls = await t.press(OWNER, "cancel")
+        assert not [x for x in owner_texts(calls) if "stopped" in x]  # cancelled on purpose: no warning
+        calls = await t.press(OWNER, skip)
+        assert "This has expired" in t.alert(calls) and balance(t, ALICE) == 0
 
     run(tmp_path, scenario)
 
@@ -419,21 +474,107 @@ def test_amounts_written_with_a_dollar_sign_still_work(tmp_path):
         register(t, ALICE)
         await t.send(OWNER, f"/addbal {ALICE['id']}")
         calls = await t.send(OWNER, "10 $")
-        assert "Added <b>10.00$</b>" in owner_texts(calls)[0]
-        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 5 $")
+        calls = await t.press(OWNER, t.button(calls, "⏭ Skip: add 10.00$"))
+        assert "Added <b>10.00$</b>" in owner_texts(calls)[-1]
+        calls = await t.send(OWNER, f"/addbal {ALICE['id']} 5 $")  # typed in full: no question
         assert "Added <b>5.00$</b>" in owner_texts(calls)[0]
         assert balance(t, ALICE) == 1500 and t.db.payment_records("$") == []
 
     run(tmp_path, scenario)
 
 
-def test_the_add_balance_prompt_mentions_order_ids_only_with_automatic_deposits(tmp_path):
+def test_without_automatic_deposits_add_balance_doesnt_ask_for_an_order_id(tmp_path):
     async def scenario(t: ShopTest) -> None:
         register(t, ALICE)
         calls = await t.send(OWNER, f"/addbal {ALICE['id']}")
         assert "Order ID" not in owner_texts(calls)[0]
+        calls = await t.send(OWNER, "10")
+        assert "Added <b>10.00$</b>" in owner_texts(calls)[0] and balance(t, ALICE) == 1000
+
+    run(tmp_path, scenario)
+
+
+def test_an_amount_or_a_word_next_to_the_order_id_never_becomes_part_of_it(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="10"), pay(order_id=OTHER, tx="P_OTHER", amount="15")))
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 10)
+        await t.send(ALICE, ORDER)  # added automatically
+        assert balance(t, ALICE) == 1000
+        # The amount and the Order ID together at the Order ID question: read as both, so a used
+        # payment is still refused (not glued into "10466...").
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        await t.send(OWNER, "10")
+        calls = await t.send(OWNER, f"10 {ORDER}")
+        assert "Nothing was added" in owner_texts(calls)[0] and "was used already" in owner_texts(calls)[0]
+        calls = await t.send(OWNER, f"{ORDER}\n10")  # either way round
+        assert "Nothing was added" in owner_texts(calls)[0] and balance(t, ALICE) == 1000
+        # Another amount than the one asked about: refused, nothing added.
+        calls = await t.send(OWNER, f"15 {OTHER}")
+        assert "The amount here is <b>10.00$</b>, not 15.00$" in owner_texts(calls)[0]
+        assert t.db.payment_records(OTHER) == [] and balance(t, ALICE) == 1000
+        # Words after a transaction ID, or several IDs: send only the Order ID.
+        for text in ("P_OTHER ok", f"{OTHER} {ORDER} 10"):
+            calls = await t.send(OWNER, text)
+            assert "Send only the Order ID" in owner_texts(calls)[0], text
+        assert t.db.conn.execute("SELECT COUNT(*) FROM binance_payments").fetchone()[0] == 1
+        # The matching amount with a good Order ID is fine.
+        calls = await t.send(OWNER, f"10 {OTHER}")
+        assert "Added <b>10.00$</b>" in owner_texts(calls)[0]
+        assert t.db.binance_payment(OTHER)["user_id"] == ALICE["id"] and balance(t, ALICE) == 2000
+        # At the amount step too: "AMOUNT ORDER_ID extra" isn't one ID.
+        await t.send(OWNER, f"/addbal {BOB['id']}")
+        calls = await t.send(OWNER, f"5 {ORDER} 5")
+        assert "isn't a Binance Pay Order ID" in owner_texts(calls)[0] and balance(t, BOB) == 0
+        # "Order ID: ..." and "#..." still work.
+        calls = await t.send(OWNER, "5")
+        calls = await t.send(OWNER, "Order ID: 466000199987322889")
+        assert "Added <b>5.00$</b>" in owner_texts(calls)[0]
+        assert t.db.registered_payment("466000199987322889")["user_id"] == BOB["id"]
+
+    run(tmp_path, scenario)
+
+
+def test_leaving_the_order_id_question_says_nothing_was_added(tmp_path):
+    async def scenario(t: ShopTest) -> None:
         with_binance(t, FakeBinance())
-        calls = await t.send(OWNER, f"/addbal {ALICE['id']}")
-        assert "put its Order ID after the amount" in owner_texts(calls)[0]
+        register(t, ALICE)
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        await t.send(OWNER, "10")
+        calls = await t.press(OWNER, "menu")
+        assert "⚠️ Add balance stopped: 10.00$ for Alice was not added." in owner_texts(calls)
+        assert balance(t, ALICE) == 0
+        # After a restart the question is gone: an Order ID sent then adds nothing, and says so.
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        await t.send(OWNER, "10")
+        t.app.user_data[OWNER_ID].pop("state")  # what a restart forgets
+        calls = await t.send(OWNER, ORDER)
+        assert "Nothing is waiting for an Order ID (the bot may have restarted)" in owner_texts(calls)[0]
+        assert balance(t, ALICE) == 0 and t.db.payment_records(ORDER) == []
+        calls = await t.send(ALICE, ORDER)  # a customer still gets the usual answer
+        assert "Send /start to open the shop menu." in texts(calls, ALICE)[0]
+
+    run(tmp_path, scenario)
+
+
+def test_the_customer_is_told_even_if_the_confirmation_to_the_owner_fails(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        from telegram.error import TimedOut
+
+        from test_shop import inject_failure
+
+        with_binance(t, FakeBinance())
+        register(t, ALICE)
+        await t.send(OWNER, f"/addbal {ALICE['id']}")
+        skip = t.button(await t.send(OWNER, "10"), "⏭ Skip: add 10.00$")
+        inject_failure(t, lambda method, params: method == "sendMessage" and params.get("chat_id") == OWNER_ID
+                       and "Added <b>10.00$</b>" in params.get("text", ""), error=TimedOut)
+        calls = await t.press(OWNER, skip)
+        assert balance(t, ALICE) == 1000
+        assert "10.00$</b> was added to your balance" in texts(calls, ALICE)[-1]
+        assert "Something went wrong" not in "\n".join(owner_texts(calls))
+        calls = await t.press(OWNER, skip)
+        assert "check the balance with /modifybal" in t.alert(calls) and balance(t, ALICE) == 1000
 
     run(tmp_path, scenario)
