@@ -6,12 +6,14 @@ for it when it's missing (``/ban`` → "Send the user's Telegram ID").
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import functools
 import io
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -20,8 +22,9 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from ..binance import clean_order_id
-from ..db import BalanceChanged, PaymentApproved, PaymentUsed, PaymentWaiting, ShopError
-from .autopay import client_of, look_up_registered, payment_record
+from ..db import BalanceChanged, PaymentUsed, PaymentWaiting, ShopError
+from .autopay import client_of, find_for_owner, paid_text, payment_record
+from .money import doubt_text, listed_text, own_count
 from .common import (
     GREEN,
     RED,
@@ -212,24 +215,30 @@ def single_order_id(text: str) -> Optional[str]:
 
 
 def _skip_kb(context: Ctx, state: dict) -> Any:
+    if not state.get("skip", True):  # after a refused Order ID: another one, or Cancel
+        return cancel_kb()
     who = short(user_name(db_of(context).get_user(state["target"])), 16)
     return markup([[btn(f"⏭ Skip: add {money(state['amount'])} to {who}", f"abk:{state['nonce']}", GREEN)],
                    [btn("❌ Cancel", "cancel", RED)]])
 
 
-async def ask_order_id(update: Update, context: Ctx, target: int, amount: int, note: str = "") -> None:
+async def ask_order_id(update: Update, context: Ctx, target: int, amount: int, note: str = "",
+                       *, skip: bool = True) -> None:
     """The amount is known: ask for the Binance Pay Order ID it's for. It's optional:
-    ⏭ Skip adds the balance without one."""
+    ⏭ Skip adds the balance without one, but not right after an Order ID was refused
+    (that payment may be the one this money is for)."""
     # The Skip button is valid for exactly this question, not for a later one.
-    state = set_state(context, "owner_order_id", target=target, amount=amount, nonce=secrets.token_hex(4))
+    state = set_state(context, "owner_order_id", target=target, amount=amount, nonce=secrets.token_hex(4),
+                      skip=skip)
     who = user_html(db_of(context).get_user(target))
     if note:  # the Order ID sent was refused
-        text = (note + f"\n\nSend another Order ID, or press ⏭ Skip to add {money(amount)} to {who} "
-                "without one.")
+        text = note + ("\n\nSend another Order ID, or press Cancel." if not skip else
+                       f"\n\nSend another Order ID, or press ⏭ Skip to add {money(amount)} to {who} "
+                       "without one.")
     else:
         text = (f"🧾 <b>Order ID (optional)</b>\n👤 {who}\n💵 Amount: <b>{money(amount)}</b> (not added yet)"
                 "\n\nIf this is for a Binance Pay payment, send its Order ID: then that payment can't be "
-                "added again automatically. If not, press ⏭ Skip.")
+                "added again. If it isn't one, press ⏭ Skip.")
     await reply(update, text, _skip_kb(context, state))
 
 
@@ -256,11 +265,12 @@ async def on_owner_order_id(update: Update, context: Ctx, state: dict) -> None:
             order_id = found
     if order_id is None:
         await reply(update, f"⚠️ <code>{esc(short(text.strip(), 40))}</code> isn't a Binance Pay Order ID. "
-                            "Send only the Order ID (e.g. <code>412345678901234567</code>), or press ⏭ Skip "
-                            f"to add {money(state['amount'])} without one.", _skip_kb(context, state))
+                            "Send only the Order ID (e.g. <code>412345678901234567</code>)"
+                            + (f", or press ⏭ Skip to add {money(state['amount'])} without one."
+                               if state.get("skip", True) else "."), _skip_kb(context, state))
         return
     clear_state(context)
-    await do_add_balance(update, context, state["target"], state["amount"], order_id, prompt=True)
+    await check_order_id(update, context, "addbal", order_id, state["target"], state["amount"], prompt=True)
 
 
 async def cb_skip_order_id(update: Update, context: Ctx) -> None:
@@ -271,7 +281,8 @@ async def cb_skip_order_id(update: Update, context: Ctx) -> None:
         return
     nonce = (query.data or "").split(":", 1)[-1]  # type: ignore[union-attr]
     state = get_state(context)
-    if not (isinstance(state, dict) and state.get("name") == "owner_order_id" and state.get("nonce") == nonce):
+    if not (isinstance(state, dict) and state.get("name") == "owner_order_id" and state.get("nonce") == nonce
+            and state.get("skip", True)):
         await answer(query, "This has expired. Before adding again, check the balance with /modifybal.",
                      show_alert=True)
         return
@@ -300,7 +311,7 @@ async def ask_new_balance(update: Update, context: Ctx, target: int) -> None:
 
 
 def _not_registrable(context: Ctx, exc: ShopError, order_id: str, target: Optional[int]) -> str:
-    """Why this payment can't be registered as added by hand (PaymentUsed/Waiting/Approved)."""
+    """Why this payment can't be registered as added by hand (PaymentUsed, PaymentWaiting)."""
     db = db_of(context)
     if isinstance(exc, PaymentUsed):
         return f"Order ID <code>{esc(order_id)}</code> was used already.\n{payment_record(context, exc.row)}"
@@ -313,13 +324,7 @@ def _not_registrable(context: Ctx, exc: ShopError, order_id: str, target: Option
             text += (f"\nIf it's their payment and you added it by hand, send "
                      f"/regbin {esc(order_id)} {request['user_id']}: that closes the request.")
         return text
-    approved = exc.request  # type: ignore[attr-defined]
-    whose = (f" ({money(approved['amount'])} for {user_html(db.get_user(approved['user_id']))})"
-             if approved is not None else "")
-    return (f"Order ID <code>{esc(order_id)}</code> was in request #{exc.row['approved_in']}{whose}, "  # type: ignore[attr-defined]
-            "which you approved: it may be part of that. If you're sure it isn't, add the balance "
-            f"without the Order ID, then send /regbin {esc(order_id)}"
-            + (f" {target}" if target else "") + ".")
+    return esc(str(exc))
 
 
 async def _tell_closed(context: Ctx, closed: Any) -> None:
@@ -335,17 +340,18 @@ async def _tell_closed(context: Ctx, closed: Any) -> None:
 
 async def do_add_balance(
     update: Update, context: Ctx, target: int, amount: int, order_id: Optional[str] = None,
-    *, prompt: bool = False,
+    *, prompt: bool = False, payment: Any = None,
 ) -> bool:
-    """Add balance by hand (/addbal). False if nothing was added; with ``prompt`` (from the
-    Add balance prompt) the owner is asked again."""
+    """Add balance by hand (/addbal). ``payment``: what Binance has for ``order_id``. False
+    if nothing was added; with ``prompt`` (from the Add balance prompt) the owner is asked
+    for another Order ID."""
     db, cfg = db_of(context), cfg_of(context)
     try:
-        done = db.manual_deposit(target, amount, cfg.seller_auto_threshold * 100, order_id)
-    except (PaymentUsed, PaymentWaiting, PaymentApproved) as exc:
+        done = db.manual_deposit(target, amount, cfg.seller_auto_threshold * 100, order_id, payment)
+    except (PaymentUsed, PaymentWaiting) as exc:
         text = "⚠️ Nothing was added: " + _not_registrable(context, exc, order_id or "", target)
-        if prompt:  # asked again: another Order ID, or none
-            await ask_order_id(update, context, target, amount, note=text)
+        if prompt and get_state(context) is None:  # asked again: another Order ID (no Skip)
+            await ask_order_id(update, context, target, amount, note=text, skip=False)
         else:
             await reply(update, text)
         return False
@@ -361,7 +367,7 @@ async def do_add_balance(
     if became_seller:
         text += f"\n⭐ They reached {cfg.seller_auto_threshold}$ in deposits and are now a seller."
     if done.registered is not None:
-        text += _registered_text(context, done.registered, amount)
+        text += _registered_text(context, done.registered)
     elif client_of(context) is not None and not prompt:  # the prompt asked for it already
         text += (f"\n\n💡 For a Binance Pay payment, send <code>/regbin ORDER_ID {target}</code> "
                  "too: then it can't be added again automatically.")
@@ -455,8 +461,10 @@ async def _run_target_command(update: Update, context: Ctx, action: str) -> None
         if amount is None or (action == "addbal" and amount <= 0):
             await reply(update, f"⚠️ <code>{esc(args[1])}</code> isn't a valid amount. Example: /{action} {target} 25")
             return
-        if action == "addbal":
-            await do_add_balance(update, context, target, amount, order_id)
+        if action == "addbal" and order_id:
+            await check_order_id(update, context, "addbal", order_id, target, amount)
+        elif action == "addbal":
+            await do_add_balance(update, context, target, amount)
         else:
             await do_set_balance(update, context, target, amount)
         return
@@ -506,8 +514,10 @@ async def on_owner_amount(update: Update, context: Ctx, state: dict) -> None:
     if state["action"] == "addbal":
         if order_id is None and client_of(context) is not None:  # ask for it: it's optional
             await ask_order_id(update, context, state["target"], amount)
-            return
-        await do_add_balance(update, context, state["target"], amount, order_id, prompt=True)
+        elif order_id is not None:
+            await check_order_id(update, context, "addbal", order_id, state["target"], amount, prompt=True)
+        else:
+            await do_add_balance(update, context, state["target"], amount, prompt=True)
     else:
         await do_set_balance(update, context, state["target"], amount, state.get("shown"))
 
@@ -543,15 +553,37 @@ REGBIN_HELP = (
 )
 
 
-def _registered_text(context: Ctx, done: Any, amount: Optional[int] = None) -> str:
+def _registered_text(context: Ctx, done: Any) -> str:
     text = (f"\n🧾 Order ID <code>{esc(done.payment['order_id'])}</code> is registered as added: "
             "it can't be added again.")
-    if done.payment["approved_in"] is not None:
-        text += f"\nℹ️ It was in request #{done.payment['approved_in']}, which you approved."
     text += "".join(f"\n🧾 Request #{request_id} was waiting with it: closed." for request_id in done.closed)
-    if look_up_registered(context, done.payment["order_id"], amount):
-        text += "\n🔎 Asking Binance for its details ..."
     return text
+
+
+async def do_register(update: Update, context: Ctx, order_id: str, user_id: Optional[int],
+                      payment: Any = None) -> None:
+    """/regbin: record a payment as added by hand (``payment``: what Binance has for it)."""
+    db = db_of(context)
+    try:
+        done = db.register_payment(order_id, user_id, payment)
+    except PaymentUsed as exc:
+        await reply(update, f"ℹ️ Order ID <code>{esc(order_id)}</code> can't be added again already, "
+                            f"nothing changed.\n{payment_record(context, exc.row)}")
+        return
+    except PaymentWaiting as exc:
+        await reply(update, "⚠️ Nothing was registered: " + _not_registrable(context, exc, order_id, user_id))
+        return
+    except ShopError as exc:
+        await reply(update, f"⚠️ {esc(exc)}")
+        return
+    whose = ""
+    if user_id is not None and user_id != cfg_of(context).owner_id:
+        whose = f"\n👤 Paid by {user_html(db.get_user(user_id))}"
+    try:
+        await reply(update, "✅ Done." + whose + _registered_text(context, done))
+    except TelegramError as exc:
+        log.warning("Could not confirm the registered payment %s: %s", order_id, exc)
+    await _tell_closed(context, done.closed)
 
 
 @owner_command
@@ -573,24 +605,189 @@ async def cmd_regbin(update: Update, context: Ctx) -> None:
             await reply(update, f"⚠️ <code>{esc(args[1])}</code> isn't a valid user ID. "
                                 f"Example: /regbin {order_id} 123456789")
             return
-    db = db_of(context)
+    await check_order_id(update, context, "regbin", order_id, user_id)
+
+
+# ------------------------------------- an Order ID typed by the owner, checked first
+CHECK_VALID_FOR = 600  # seconds a "this payment?" confirmation can be pressed
+
+
+async def check_order_id(update: Update, context: Ctx, kind: str, order_id: str,
+                         target: Optional[int], amount: int = 0, *, prompt: bool = False) -> None:
+    """Before a payment the owner names is recorded as added by hand (``kind``: "addbal"
+    adds ``amount`` to ``target`` for it, "regbin" only registers it): with automatic
+    deposits on, Binance is asked for it first (in the background, like a customer's
+    check), so it's recorded under both its IDs and the owner sees what it is (amount,
+    time, payer, and why it may have been added already) before confirming. Without a key
+    there's nothing to ask. ``prompt``: from the Add balance prompt, which waits meanwhile."""
+    if client_of(context) is None:
+        await _unchecked(update, context, kind, order_id, target, amount, prompt=prompt)
+        return
+    nonce = secrets.token_hex(4)
+    if prompt:  # the question waits for the answer: Cancel or another command stops it
+        set_state(context, "owner_checking", nonce=nonce, target=target, amount=amount)
     try:
-        done = db.register_payment(order_id, user_id)
-    except PaymentUsed as exc:
-        await reply(update, f"ℹ️ Order ID <code>{esc(order_id)}</code> can't be added again already, "
-                            f"nothing changed.\n{payment_record(context, exc.row)}")
+        await reply(update, f"🔎 Checking Order ID <code>{esc(order_id)}</code> with Binance ...",
+                    cancel_kb() if prompt else None)
+    except TelegramError as exc:  # the check still runs: its answer is what counts
+        log.info("Could not say an Order ID is being checked: %s", exc)
+    # Not Application.create_task, like a payment check: a stop ends it (app.py).
+    task = asyncio.get_running_loop().create_task(
+        _check_for_owner(update, context, kind, order_id, target, amount, nonce if prompt else None),
+        name=f"shopbot:binance:owner:{order_id}")
+    tasks = context.bot_data.setdefault("binance_tasks", set())  # keep a reference
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+def _checking(context: Ctx, nonce: str) -> bool:
+    """The Add balance prompt still waits for this check."""
+    state = get_state(context)
+    return isinstance(state, dict) and state.get("name") == "owner_checking" and state.get("nonce") == nonce
+
+
+@state_handler("owner_checking")
+async def on_owner_checking(update: Update, context: Ctx, state: dict) -> None:
+    await reply(update, "🔎 Still checking that Order ID with Binance: one moment, or press Cancel.", cancel_kb())
+
+
+async def _unchecked(update: Update, context: Ctx, kind: str, order_id: str, target: Optional[int],
+                     amount: int, *, prompt: bool) -> None:
+    """Without automatic deposits: recorded as typed (only an Order ID of digits is taken)."""
+    if kind == "addbal":
+        await do_add_balance(update, context, target, amount, order_id, prompt=prompt)  # type: ignore[arg-type]
+    else:
+        await do_register(update, context, order_id, target)
+
+
+async def _check_for_owner(update: Update, context: Ctx, kind: str, order_id: str,
+                           target: Optional[int], amount: int, nonce: Optional[str]) -> None:
+    db, cfg = db_of(context), cfg_of(context)
+    verb = "added" if kind == "addbal" else "registered"
+    try:
+        payment, why, lasting = await find_for_owner(context, order_id)
+    except asyncio.CancelledError:  # the bot is stopping
+        raise
+    except Exception:
+        log.exception("Checking an Order ID for the owner failed")
+        payment, why, lasting = None, "something went wrong while asking Binance: send it again", False
+    if nonce is not None:  # from the prompt: only if it still waits for this answer
+        if not _checking(context, nonce):
+            return  # cancelled, or the owner moved on (and was told nothing was added)
+        clear_state(context)
+    try:
+        skip = False  # after a refusal, ⏭ Skip could add a payment added already
+        ids = [order_id, *((payment.order_id, payment.transaction_id) if payment is not None else ())]
+        problem = db.payment_problem(ids, target or cfg.owner_id)  # what the bot knows itself
+        if problem is not None:
+            text = f"⚠️ Nothing was {verb}: " + _not_registrable(context, problem, order_id, target)
+        elif payment is not None:
+            await _ask_to_confirm(update, context, kind, order_id, target, amount, payment)
+            return
+        else:
+            text = f"⚠️ Nothing was {verb}: {esc(why)}."
+            if lasting and kind == "addbal":  # without the Order ID, earlier payments are held back
+                skip = not db.unlinked_payments(order_id)
+                text += ("\nMeanwhile the balance can be added without the Order ID: payments made "
+                         "before it are then held back for you to decide.")
+            elif lasting:
+                text += "\nSend it again once Binance answers."
+        if kind == "addbal" and nonce is not None:  # another Order ID, or Skip if that's safe
+            await ask_order_id(update, context, target, amount, note=text, skip=skip)  # type: ignore[arg-type]
+        else:
+            await reply(update, text)
+    except Exception:  # a background task: nobody else would hear of it
+        log.exception("Handling an Order ID for the owner failed")
+        try:  # it may have been added, or not
+            await reply(update, f"⚠️ Something went wrong with Order ID <code>{esc(order_id)}</code>. "
+                                + ("Check the balance with /modifybal before you send it again."
+                                   if kind == "addbal" else "Please send it again."))
+        except TelegramError:
+            pass
+
+
+def _doubt_lines(context: Ctx, payment: Any, target: int) -> tuple[list[str], set[tuple[str, Any]]]:
+    """Why a payment about to be added by hand may have been added already (Database
+    .hand_doubts), as lines, and what they are (to see if anything new turns up)."""
+    db = db_of(context)
+    doubts, early = db.hand_doubts(payment, target)
+    held = set(db.held_by(db.payment_records(
+        *[value for value in (payment.order_id, payment.transaction_id) if value])))
+    lines = []
+    if doubts:
+        lines.append("⚠️ May be added already: after it was paid, " + listed_text(
+            [doubt_text(context, row, target, row["id"] if row["id"] in held else None) for row in doubts],
+            count=own_count(doubts, target)) + ".")
+    if early:
+        lines.append("⚠️ May be added already: it was paid before automatic checking started, "
+                     "when deposits came with receipts.")
+    # Every one, also those only counted ("and N more"): a new one is never confirmed unseen.
+    keys = {("doubt", row["id"]) for row in doubts} | ({("early", 0)} if early else set())
+    return lines, keys
+
+
+async def _ask_to_confirm(update: Update, context: Ctx, kind: str, order_id: str,
+                          target: Optional[int], amount: int, payment: Any) -> None:
+    db, cfg = db_of(context), cfg_of(context)
+    pending = context.user_data.setdefault("payment_checks", {})  # type: ignore[union-attr]
+    for key in [key for key, entry in pending.items() if time.monotonic() - entry["at"] > CHECK_VALID_FOR]:
+        pending.pop(key, None)
+    lines = ["🔎 <b>Binance has this payment</b>", paid_text(payment)]
+    warned: set[tuple[str, Any]] = set()
+    whom = target if kind == "addbal" else (target if target and target != cfg.owner_id else None)
+    user = db.get_user(whom) if whom else None
+    if whom and (user is None or not user["started"]):
+        lines.append(f"⚠️ User <code>{whom}</code> has never used the bot: is the ID right?")
+    if kind == "addbal":
+        if payment.currency not in cfg.binance_coins or payment.amount * 100 != amount:
+            lines.append(f"⚠️ That's not the <b>{money(amount)}</b> you're adding.")
+        doubts, warned = _doubt_lines(context, payment, target)  # type: ignore[arg-type]
+        lines += doubts
+        lines.append(f"\nAdd <b>{money(amount)}</b> to {_who(user, target)} for this payment?")  # type: ignore[arg-type]
+        label = f"⚠️ Add {money(amount)} anyway" if warned else f"✅ Add {money(amount)}"
+    else:
+        whose = f" for {_who(user, whom)}" if whom else ""
+        lines.append(f"\nRegister it as added by hand{whose}? Then it can't be added again.")
+        label = "✅ Register"
+    nonce = secrets.token_hex(4)
+    pending[nonce] = {"kind": kind, "order_id": order_id, "target": target, "amount": amount,
+                      "payment": payment, "warned": warned, "at": time.monotonic()}
+    await reply(update, "\n".join(lines), markup([[btn(label, f"pyc:{nonce}", GREEN),
+                                                   btn("❌ Cancel", f"pyx:{nonce}", RED)]]))
+
+
+async def cb_payment_confirm(update: Update, context: Ctx) -> None:
+    """✅ on "Binance has this payment": add (or register) it, as shown."""
+    query = update.callback_query
+    if not is_owner(context, query.from_user.id):  # type: ignore[union-attr]
+        await answer(query, "Only the owner can do that.", show_alert=True)
         return
-    except PaymentWaiting as exc:
-        await reply(update, "⚠️ Nothing was registered: " + _not_registrable(context, exc, order_id, user_id))
+    confirm = (query.data or "").startswith("pyc:")  # type: ignore[union-attr]
+    nonce = (query.data or "").split(":", 1)[-1]  # type: ignore[union-attr]
+    entry = context.user_data.get("payment_checks", {}).pop(nonce, None)  # type: ignore[union-attr]
+    if entry is None or time.monotonic() - entry["at"] > CHECK_VALID_FOR:
+        await answer(query, "This has expired: send the Order ID again.", show_alert=True)
         return
-    except ShopError as exc:
-        await reply(update, f"⚠️ {esc(exc)}")
+    await answer(query)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramError as exc:
+        log.info("Could not remove the confirm buttons: %s", exc)
+    if not confirm:
+        await reply(update, "❌ Cancelled: nothing was " + ("added." if entry["kind"] == "addbal" else "registered."))
         return
-    whose = ""
-    if user_id is not None and user_id != cfg_of(context).owner_id:
-        whose = f"\n👤 Paid by {user_html(db.get_user(user_id))}"
-    await reply(update, "✅ Done." + whose + _registered_text(context, done))
-    await _tell_closed(context, done.closed)
+    if entry["kind"] == "addbal":
+        # Nothing new may have turned up since it was shown: checked right before adding,
+        # with nothing awaited in between.
+        _, now = _doubt_lines(context, entry["payment"], entry["target"])
+        if not now <= entry["warned"]:
+            await reply(update, "⚠️ Nothing was added: something new may be about this payment. Send the "
+                                "Order ID again to see it.")
+            return
+        await do_add_balance(update, context, entry["target"], entry["amount"], entry["order_id"],
+                             payment=entry["payment"])
+    else:
+        await do_register(update, context, entry["order_id"], entry["target"], entry["payment"])
 
 
 # ------------------------------------------------------------- shop status

@@ -263,25 +263,37 @@ Set it up once:
 - A request marked ❗ has an Order ID Binance didn't confirm as a new payment to you (a
   typo, someone else's payment, or Binance couldn't be asked). Approve it only if you find
   the payment in your Binance app and haven't added it already: the request shows what was
-  added since it was made.
+  added around then (by hand, with receipts, or with requests).
 - The bot can't tell which payment you approve such a request for, so it never adds a
   payment by itself that you may have added already: one made before you decided a ❗
-  request, or while that customer's ❗ request waits, or before balance you added to that
-  customer with `/addbal`. Such a payment comes to you instead, with a ⚠️ line saying why.
-  So does a payment that was in a request you already decided (e.g. rejected for its
-  amount, or approved for the other payment it showed).
-- A request with a "⚠️ May be added already" or "⚠️ Added since this request was made" line
+  request, or while that customer's ❗ request waits, or before balance you added by hand to
+  anyone. Such a payment comes to you instead, with a ⚠️ line saying why. So does a payment
+  that was in a request you rejected (e.g. for its amount).
+- A request with a "⚠️ May be added already" or "⚠️ Added since …" line
   isn't approved by ✅ Approve: the bot shows why once more and offers **⚠️ Approve
   anyway**, which approves only if nothing new turned up meanwhile.
 - When a ❗ request's payment is then added automatically (Binance listed it late, or could
   be reached again), that request is closed by itself and you're told.
 - **A payment you add by hand** (the customer wrote to you): add it with
   `/addbal ID AMOUNT ORDER_ID`, or register it afterwards with `/regbin ORDER_ID USER_ID`.
-  Then it's never added again automatically (a request naming it needs ⚠️ Approve anyway),
-  and the bot tells you what Binance has for it. A payment waiting with that customer's
-  request is settled with it (the request is closed); with anyone else's, decide that
-  request first.
-- Only payments made after the key was added, and in the last 48 hours, are found. Only
+  The bot asks Binance first and shows you the payment (amount, time, payer) to confirm, and
+  records both its IDs: it's never added again, automatically or with a request. If it may
+  have been added already (the same reasons as below), the screen says why and only
+  **⚠️ Add anyway** adds it. A payment waiting with that customer's request is settled with
+  it (the request is closed); with anyone else's, decide that request first. While Binance
+  refuses the key, nothing is added with an Order ID: add the balance without one.
+- Balance you add by hand (with or without an Order ID, or with `/modifybal`) holds back
+  every payment made before it, for everyone: they come to you instead of being added.
+- A request whose payment was added already (or is kept for another waiting request) can't
+  be approved: its ⛔ line says why. Approving a request adds every payment it shows. A
+  payment in a request you rejected goes to you again when anyone sends it.
+- A receipt still waiting from before the key was added lists what was added around then
+  for that customer (or for a Binance payment of the same amount), like a ❗ request.
+- Records of older versions: Order IDs kept with leading zeros are read without them. A
+  payment an older version recorded only by Binance's transaction ID is shown on any ❗
+  request that may be it, and without Binance an Order ID that may be it isn't taken.
+- Payments of the last 48 hours are found; one made before the key was added goes to you
+  (it may have come with a receipt), never straight onto a balance. Only
   USDT counts by default (1 USDT = 1$); to take USDC too, add `BINANCE_COINS=USDT,USDC` to
   `~/Telegram-Claude/.env` on the server.
 - **To turn it off:** set the `BINANCE_API_KEY` secret to `off` and re-run: deposits use

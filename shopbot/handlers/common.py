@@ -689,7 +689,7 @@ async def pre_handler(update: Update, context: Ctx) -> None:
                 log.info("Could not send the discard warning to %s: %s", chat.id, exc)
         cancelled = (update.callback_query is not None and update.callback_query.data == "cancel") or (
             update.callback_query is None and (update.effective_message.text or "").startswith("/cancel"))  # type: ignore[union-attr]
-        if old and old.get("name") == "owner_order_id" and not cancelled:
+        if old and old.get("name") in ("owner_order_id", "owner_checking") and not cancelled:
             who = user_name(db_of(context).get_user(old["target"]))
             try:
                 await context.bot.send_message(

@@ -48,6 +48,7 @@ COMMANDS = [
 #   plr:<item>  send a pulled product that may not have arrived again
 #   dck  check a Binance Order ID again (autopay.py)
 #   abk:<nonce>  /addbal: add the balance without an Order ID (⏭ Skip)
+#   pyc:<nonce> / pyx:<nonce>  add (or register) / cancel a payment the owner named, as Binance has it
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
 #   an:<nonce> / anc[:<nonce>] / ans:<job>  send / cancel / stop an announcement (owner)
 #   menu/cancel/noop/myid  general (myid: show your Telegram ID)
@@ -92,6 +93,7 @@ CALLBACKS = [
     (r"^dck$", autopay.cb_check_again),
     (r"^(dok|dokx|dno):", money.cb_deposit_decide),
     (r"^abk:", owner.cb_skip_order_id),
+    (r"^(pyc|pyx):", owner.cb_payment_confirm),
     (r"^ea$", money.cb_earnings),
     (r"^ew$", money.cb_withdraw),
     (r"^wall$", money.cb_withdraw_all),

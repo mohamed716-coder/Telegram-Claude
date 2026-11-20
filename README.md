@@ -159,17 +159,35 @@ Binance Pay to Binance ID **850940840**. Then:
 If a request ever doesn't reach the owner (or the message gets deleted), `/pending` sends
 every waiting request again with its buttons.
 
-**A payment the owner added by hand** (the customer sent the money and wrote to him):
-`/addbal ID AMOUNT ORDER_ID` adds the balance and registers the payment's Order ID in one
-go, or `/regbin ORDER_ID` (optionally `/regbin ORDER_ID USER_ID`) registers it afterwards.
-Either way that payment can never be added again automatically, and the customer is told
-it was already added; a request that names it needs **⚠️ Approve anyway**. With a Binance
-key the bot then looks the payment up and tells the owner what Binance has (amount, coin,
-time), with a ⚠️ if it isn't what he added or the bot knew it under its other ID. If the
-payment is waiting with that customer's request (and is the only one it holds), registering
-it for them closes the request and tells them; with anyone else's request, or one that
-holds more payments, decide the request first. A payment from a request you approved isn't
-added by hand with its Order ID (it may be part of that approval).
+**No payment is ever added twice.** Every way money is added for a Binance payment checks
+both of its IDs (the Order ID the payer sees and Binance's transaction ID):
+
+- **By hand** (the customer sent the money and wrote to the owner): `/addbal ID AMOUNT
+  ORDER_ID` adds the balance and registers the payment in one go, or `/regbin ORDER_ID`
+  (optionally `/regbin ORDER_ID USER_ID`) registers it afterwards. With a Binance key the
+  bot asks Binance first and shows what it has (amount, coin, time, payer) with
+  **✅ Add** / **✅ Register**: nothing is recorded until the owner confirms. If the payment
+  may have been added already (balance added by hand since it was paid, a request you
+  decided that had it, or it was paid before automatic checking started), the screen says
+  why and offers only **⚠️ Add anyway**; if anything new turns up before you press it, send
+  the Order ID again. If Binance can't be asked or doesn't list the ID, or the payment was
+  added already, nothing is added (while Binance refuses the key, add the balance without
+  the Order ID: **⏭ Skip**). Without a key only an Order ID (digits) is taken. Registering
+  a payment that waits with that customer's own request (the only one it holds) closes the
+  request and tells them; with anyone else's request, decide that first.
+- **Balance added by hand** (`/addbal`, with or without an Order ID, **⏭ Skip**, a
+  `/modifybal` raise) may have been any payment made before it, so it holds back every
+  payment made before it, for everyone: those come to the owner with a ⚠️ line instead of
+  being added, the customer's own listed first.
+- **Requests:** approving one adds every payment it shows (the request says so when it
+  shows several). A request whose payment was added already, is kept for another waiting
+  request, or is known only by a transaction ID Binance didn't confirm can't be approved
+  (it says why in a ⛔ line); reject it and, if the customer paid with another payment,
+  add that one by hand with its Order ID. A payment someone else claimed in a request you
+  rejected goes to you again when its payer sends it, saying who had it.
+- **Receipts** (deposits without a key) list what was added for that customer, or for a
+  Binance payment of the same amount, in the week before: then only **⚠️ Approve anyway**
+  approves, so an old receipt sent again isn't added twice by mistake.
 
 **Sellers** get **10% off** every product. Anyone whose total deposits reach **1000$**
 becomes a seller automatically, or the owner can use `/seller ID`.

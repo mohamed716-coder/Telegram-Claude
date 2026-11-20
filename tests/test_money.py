@@ -204,8 +204,14 @@ async def request_deposit(t: ShopTest, who: dict, amount: int,
     return deposits(t, who)[-1]["id"], calls
 
 
-async def approve_deposit(t: ShopTest, deposit_id: int, by: dict = OWNER) -> list[Call]:
-    return await t.press(by, f"dok:{deposit_id}", photo=True)
+async def approve_deposit(t: ShopTest, deposit_id: int, by: dict = OWNER, *, anyway: bool = False) -> list[Call]:
+    """✅ Approve; ``anyway``: the customer deposited in the week before (a receipt lists it,
+    so it isn't approved twice by mistake), so ⚠️ Approve anyway too."""
+    calls = await t.press(by, f"dok:{deposit_id}", photo=True)
+    if anyway:
+        assert "may have been added already" in t.alert(calls), t.alert(calls)
+        calls += await t.press(by, f"dokx:{deposit_id}", photo=True)
+    return calls
 
 
 async def reject_deposit(t: ShopTest, deposit_id: int, by: dict = OWNER) -> list[Call]:
@@ -729,13 +735,13 @@ def test_deposits_of_600_and_400_make_a_seller(tmp_path):
         assert not row_of(t, ALICE)["is_seller"]
         assert CONGRATS not in all_text(calls)
         second, _ = await request_deposit(t, ALICE, 400)
-        calls = await approve_deposit(t, second)
+        calls = await approve_deposit(t, second, anyway=True)  # her first is listed
         user = row_of(t, ALICE)
         assert user["is_seller"] and user["total_deposits"] == 100000
         note = t.last_text(calls, ALICE["id"])
         assert CONGRATS in note and "1000$" in note
         assert "<b>Seller</b>" in note and "<b>10% off</b>" in note
-        (edit,) = edits(calls, OWNER_ID)
+        edit = edits(calls, OWNER_ID)[-1]  # after the one showing her first deposit
         assert "now a Seller" in edit.text
         # The discount really applies.
         calls = await t.send(ALICE, "/start")
@@ -756,7 +762,7 @@ def test_seller_threshold_is_reached_at_exactly_1000(tmp_path):
         await approve_deposit(t, first)
         assert not row_of(t, ALICE)["is_seller"]
         second, _ = await request_deposit(t, ALICE, 1)
-        calls = await approve_deposit(t, second)
+        calls = await approve_deposit(t, second, anyway=True)  # her first is listed
         assert row_of(t, ALICE)["is_seller"]
         assert CONGRATS in t.last_text(calls, ALICE["id"])
 
@@ -784,7 +790,7 @@ def test_removed_seller_is_not_promoted_again(tmp_path):
         assert not row_of(t, ALICE)["is_seller"]
         # More deposits (still above the threshold) don't bring it back.
         dep_id, _ = await request_deposit(t, ALICE, 10)
-        calls = await approve_deposit(t, dep_id)
+        calls = await approve_deposit(t, dep_id, anyway=True)
         user = row_of(t, ALICE)
         assert not user["is_seller"] and user["total_deposits"] == 101000
         assert CONGRATS not in all_text(calls) and "Seller" not in all_text(calls)

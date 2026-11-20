@@ -54,8 +54,10 @@ MAX_ADMINS_LISTED = 25
 NOTE_LINES = 6  # lines of a request's notes shown, each up to NOTE_LINE_CHARS: the message
 NOTE_LINE_CHARS = 160  # must stay within Telegram's 4096 characters
 LISTED = 3  # deposits named in one warning line, then "and N more"
+OWN_LISTED = 10  # or more if they're the customer's own (when the message has room)
 NAME_CHARS = 24  # of another customer's name in a warning line
 TEXT_LIMIT = 4000  # a request's text, in UTF-16 units: Telegram takes 4096 (after HTML)
+CAPTION_LIMIT = 1000  # a receipt's caption: Telegram takes 1024
 CONFIRM_FOR = 120.0  # seconds in which a second ✅ Approve approves a request with a warning
 
 
@@ -200,9 +202,12 @@ def deposit_caption(context: Ctx, deposit: Any) -> str:
     tail = (f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
             f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
             f"🕒 {deposit['created_at']} UTC")
+    limit = CAPTION_LIMIT if deposit["receipt_file_id"] else TEXT_LIMIT
     warnings = _request_warnings(context, deposit).splitlines(keepends=True)
+    if utf16_len(head + "".join(warnings) + tail) > limit:  # fewer of the customer's own
+        warnings = _request_warnings(context, deposit, compact=True).splitlines(keepends=True)
     cut = False
-    while warnings and utf16_len(head + "".join(warnings) + tail) > TEXT_LIMIT:
+    while warnings and utf16_len(head + "".join(warnings) + tail) > limit:
         warnings.pop()  # never more than Telegram takes, or the owner gets nothing
         cut = True
     return head + "".join(warnings) + ("⚠️ (more warnings: too long to show)\n" if cut else "") + tail
@@ -212,10 +217,18 @@ def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _listed(parts: list[str], sep: str = "; ") -> str:
-    """The first LISTED parts, then "and N more"."""
-    shown = sep.join(parts[:LISTED])
-    return shown + (f"{sep}and {len(parts) - LISTED} more" if len(parts) > LISTED else "")
+def listed_text(parts: list[str], sep: str = "; ", count: int = LISTED) -> str:
+    """The first ``count`` parts (LISTED, or more), then "and N more"."""
+    count = max(count, LISTED)
+    shown = sep.join(parts[:count])
+    return shown + (f"{sep}and {len(parts) - count} more" if len(parts) > count else "")
+
+
+def own_count(rows: list[Any], user_id: int) -> int:
+    """How many of these deposits are the customer's own (up to OWN_LISTED): those are all
+    shown (they come first), as the one that may be this very payment is most likely among
+    them; other customers' are cut to LISTED."""
+    return min(OWN_LISTED, sum(1 for row in rows if row["user_id"] == user_id))
 
 
 def _whose(context: Ctx, row: Any, user_id: int) -> str:
@@ -224,9 +237,14 @@ def _whose(context: Ctx, row: Any, user_id: int) -> str:
     return f" for {esc(_short(user_name(db_of(context).get_user(row['user_id'])), NAME_CHARS))}"
 
 
-def _doubt(context: Ctx, row: Any, user_id: int, held_before: Any = None) -> str:
+def doubt_text(context: Ctx, row: Any, user_id: int, held_before: Any = None) -> str:
     """A deposit that may be about a payment (see Database.request_warnings), as it is now."""
     whose = _whose(context, row, user_id)
+    if row["method"] == "raise":
+        return f"you raised a balance by {money(row['amount'])} with /modifybal{whose} ({row['created_at']} UTC)"
+    if row["receipt_file_id"]:
+        state = {"approved": "you approved it", "rejected": "you rejected it"}.get(row["status"], "it's waiting")
+        return f"a receipt for {money(row['amount'])} came{whose} (request #{row['id']}, {state})"
     if row["id"] == held_before or row["method"] == "binance" and not row["unverified"]:
         verb = {"approved": "you approved", "rejected": "you rejected"}.get(row["status"], "was closed")
         return f"it was in request #{row['id']}{whose}, which {verb}"
@@ -234,6 +252,8 @@ def _doubt(context: Ctx, row: Any, user_id: int, held_before: Any = None) -> str
         return f"you added {money(row['amount'])} by hand{whose} ({row['created_at']} UTC)"
     if row["status"] == "pending":
         return f"request #{row['id']}{whose} is waiting, with an Order ID Binance didn't confirm"
+    if row["status"] == "closed":  # its Order ID was added another way (by hand, or with a request)
+        return f"request #{row['id']}{whose} was closed, with an Order ID Binance didn't confirm"
     return f"you {row['status']} request #{row['id']}{whose}, whose Order ID Binance didn't confirm"
 
 
@@ -242,6 +262,8 @@ def _added(context: Ctx, row: Any, user_id: int) -> str:
     whose = _whose(context, row, user_id)
     if row["method"] == "manual":
         return f"{money(row['amount'])} by hand{whose} ({row['created_at']} UTC)"
+    if row["method"] == "raise":
+        return f"{money(row['amount'])} raised with /modifybal{whose} ({row['created_at']} UTC)"
     if row["method"] == "binance_auto":
         return (f"{money(row['amount'])} automatically{whose}, Order ID "
                 f"<code>{esc(row['order_id'] or '')}</code> ({row['decided_at']} UTC)")
@@ -262,8 +284,9 @@ def _used(context: Ctx, row: Any, user_id: int) -> str:
     return f"you registered it as added by hand{whose} ({row['created_at']} UTC)"
 
 
-def _request_warnings(context: Ctx, deposit: Any) -> str:
-    """What the owner should know before approving a Binance request, as it is now."""
+def _request_warnings(context: Ctx, deposit: Any, compact: bool = False) -> str:
+    """What the owner should know before approving a Binance request, as it is now.
+    ``compact``: LISTED deposits a line, also of the customer's own (to fit a caption)."""
     text = ""
     held, since, elsewhere = db_of(context).request_warnings(deposit["id"])
     left = db_of(context).still_unconfirmed(deposit) if deposit["unverified"] else []
@@ -271,31 +294,49 @@ def _request_warnings(context: Ctx, deposit: Any) -> str:
         left = [value for value in left if value not in {order_id for order_id, _ in elsewhere}]
     if left is None or left:
         ids = [f"<code>{esc(value)}</code>" for value in left or []]
-        text += (f"❗ Binance didn't confirm Order ID {_listed(ids, ', ')} as a new payment to you"
+        text += (f"❗ Binance didn't confirm Order ID {listed_text(ids, ', ')} as a new payment to you"
                  if ids else "❗ Binance didn't confirm this request's Order ID as a new payment to you")
         text += (". Approve only if you find the payment in your Binance app and haven't added it "
                  "already (each automatic deposit sent you a 💳 message).\n")
     if deposit["status"] != "pending":
         return text
+    block = db_of(context).approval_block(deposit["id"])
+    if block:
+        text = f"⛔ <b>Can't be approved:</b> {esc(block)}\n" + text
+    kept = [p for p in db_of(context).deposit_payments(deposit["id"]) if p["status"] == "owner"]
+    if not block and len(kept) > 1:
+        text += (f"ℹ️ ✅ Approve adds {money(deposit['amount'])} and marks all {len(kept)} payments it "
+                 "shows as added.\n")
     for row in db_of(context).request_used(deposit["id"]):
         text += (f"⚠️ Order ID <code>{esc(row['order_id'])}</code> was added already: "
                  f"{_used(context, row, deposit['user_id'])}.\n")
+    for order_id, rows in db_of(context).request_unlinked(deposit["id"]):
+        recorded = listed_text([f"<code>{esc(row['order_id'])}</code> ({row['created_at']} UTC)"
+                                for row in rows], ", ")
+        text += (f"⚠️ May be added already: an older version recorded payments by Binance's transaction "
+                 f"ID only ({recorded}). If one of them has Order ID <code>{esc(order_id)}</code> in your "
+                 "Binance app, it was added already.\n")
     for order_id, other in elsewhere:
         text += (f"⚠️ Binance has Order ID <code>{esc(order_id)}</code> as a payment kept for request "
-                 f"#{other['id']}{_whose(context, other, deposit['user_id'])}, which is waiting: "
-                 "approving this request takes that payment for this customer.\n")
+                 f"#{other['id']}{_whose(context, other, deposit['user_id'])}, which is waiting: this "
+                 "request was sent with it too.\n")
     for payment, doubts, early in held:
         if early:
             text += (f"⚠️ May be added already: <code>{esc(payment['order_id'])}</code> was paid "
                      "before automatic checking started, when deposits came with receipts.\n")
         if doubts:
+            holders = {payment["held_before"], payment["approved_in"], payment["deposit_id"]} - {deposit["id"], None}
             text += (f"⚠️ May be added already: after <code>{esc(payment['order_id'])}</code> was paid, "
-                     + _listed([_doubt(context, row, deposit["user_id"], payment["held_before"])
-                                for row in doubts]) + ".\n")
-    if since:  # what's shown is worked out only for those listed
-        listed = [_added(context, row, deposit["user_id"]) for row in since[:LISTED]]
-        more = f"; and {len(since) - LISTED} more" if len(since) > LISTED else ""
-        text += "⚠️ Added since this request was made: " + "; ".join(listed) + more + ".\n"
+                     + listed_text([doubt_text(context, row, deposit["user_id"],
+                                               row["id"] if row["id"] in holders else None)
+                                    for row in doubts],
+                                   count=LISTED if compact else own_count(doubts, deposit["user_id"])) + ".\n")
+    if since:  # what's shown is worked out only for those listed (a week of anyone's)
+        count = LISTED if compact else max(LISTED, own_count(since, deposit["user_id"]))
+        parts = [_added(context, row, deposit["user_id"]) for row in since[:count]]
+        more = f"; and {len(since) - count} more" if len(since) > count else ""
+        start = db_of(context).unverified_start(deposit)
+        text += f"⚠️ Added since {start} UTC: " + "; ".join(parts) + more + ".\n"
     return text
 
 
@@ -394,11 +435,20 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         await answer(query, "Only the owner can do that.", show_alert=True)
         return
     db, cfg = db_of(context), cfg_of(context)
+    if approve and db.approval_block(deposit_id):  # it would add a payment added already
+        await answer(query, "⛔ This request can't be approved: its ⛔ line says why.", show_alert=True)
+        deposit = db.get_deposit(deposit_id)
+        if deposit is not None:  # ✅ stays: it checks again, and approves once nothing blocks it
+            await _edit_request(update, deposit_caption(context, deposit),
+                                markup([[btn("✅ Approve", f"dok:{deposit_id}", GREEN),
+                                         btn("❌ Reject", f"dno:{deposit_id}", RED)]]))
+        return
     warned = context.bot_data.setdefault("approve_warned", {})  # request id -> (when, what)
-    shown = {row["id"] for row in db.approval_warnings(deposit_id, LISTED)} if approve else set()
+    shown = db.approval_warnings(deposit_id) if approve else set()
     if shown:
         # ✅ Approve never approves with a warning (a double tap must not confirm it), and
-        # "Approve anyway" only what was shown, not long ago: anything new is shown first.
+        # "Approve anyway" only what was shown (each warning, of its kind), not long ago:
+        # anything new is shown first.
         at, seen = warned.get(deposit_id, (None, set()))
         if not (query.data.startswith("dokx:") and at is not None
                 and time.monotonic() - at <= CONFIRM_FOR and shown <= seen):

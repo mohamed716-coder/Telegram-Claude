@@ -120,7 +120,7 @@ def _payment(raw: dict) -> Optional[Payment]:
     order_id = str(raw.get("orderId") or "")
     return Payment(
         order_id=order_id.lstrip("0") if order_id.isdigit() else order_id,  # as clean_order_id
-        transaction_id=str(raw.get("transactionId") or ""),
+        transaction_id=str(raw.get("transactionId") or "").upper(),  # one spelling, as typed IDs
         order_type=str(raw.get("orderType") or ""),
         amount=amount,
         currency=str(raw.get("currency") or "").upper(),
