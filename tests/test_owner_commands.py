@@ -1473,3 +1473,23 @@ def test_bot_profile_sets_the_menu_even_if_the_description_fails(tmp_path):
         assert defaults and defaults[0].params["commands"][0]["command"] == "start"
 
     run(tmp_path, scenario)
+
+
+def test_a_command_menu_telegram_timed_out_on_is_set_at_the_next_start(tmp_path):
+    from telegram.error import TimedOut
+
+    from test_shop import inject_failure
+
+    async def scenario(t: ShopTest) -> None:
+        failing = {"on": True}
+        inject_failure(t, lambda method, params: failing["on"] and method == "setMyCommands", error=TimedOut)
+        calls = await t.send(OWNER, "/start")
+        assert [c for c in calls if c.method == "setMyCommands" and c.get("failed")]
+        assert "Welcome Owner" in t.last_text(calls)  # the panel all the same
+        failing["on"] = False
+        calls = await t.send(OWNER, "/start")
+        assert {"pull", "regbin"} <= set(scoped_commands(calls, OWNER_ID) or [])
+        calls = await t.send(OWNER, "/start")
+        assert scoped_commands(calls, OWNER_ID) is None  # once it worked, not again
+
+    run(tmp_path, scenario)

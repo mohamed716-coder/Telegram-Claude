@@ -560,8 +560,8 @@ def _commands(pairs: list[tuple[str, str]]) -> list[BotCommand]:
     return [BotCommand(name, description) for name, description in pairs]
 
 
-async def sync_commands(context: Ctx, user_id: int) -> None:
-    """Show the right command list in this user's chat menu."""
+async def sync_commands(context: Ctx, user_id: int) -> bool:
+    """Show the right command list in this user's chat menu. False if Telegram refused."""
     role = role_of(context, user_id)
     try:
         if role == OWNER:
@@ -576,6 +576,8 @@ async def sync_commands(context: Ctx, user_id: int) -> None:
             await context.bot.delete_my_commands(scope=BotCommandScopeChat(user_id))
     except TelegramError as exc:
         log.info("Could not set commands for %s: %s", user_id, exc)
+        return False
+    return True
 
 
 PROFILE_SETTING = "bot_profile"
@@ -688,8 +690,8 @@ async def cmd_start(update: Update, context: Ctx) -> None:
     user_id = update.effective_user.id  # type: ignore[union-attr]
     synced: set[int] = context.bot_data.setdefault("commands_synced", set())
     if user_id not in synced and role_of(context, user_id) != USER:
-        await sync_commands(context, user_id)
-        synced.add(user_id)
+        if await sync_commands(context, user_id):  # else the next /start tries again
+            synced.add(user_id)
     await send_panel(update, context, new=True)
 
 
