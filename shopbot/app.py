@@ -62,8 +62,9 @@ async def _post_stop(app: Application) -> None:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.wait([task], timeout=2)
-    # A payment check started while stopping isn't awaited by Application.stop(): let it
-    # finish (it usually takes seconds) before its connection to Binance is closed.
+    # Payment checks aren't Application tasks (a stop would wait for those without a
+    # limit): let them finish (it usually takes seconds) before Binance's connection is
+    # closed, then end any still running.
     checks = [t for t in asyncio.all_tasks()
               if t.get_name().startswith("shopbot:binance:") and not t.done()]
     if checks:

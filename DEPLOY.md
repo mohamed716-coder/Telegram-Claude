@@ -270,8 +270,9 @@ Set it up once:
   customer with `/addbal`. Such a payment comes to you instead, with a ⚠️ line saying why.
   So does a payment that was in a request you already decided (e.g. rejected for its
   amount, or approved for the other payment it showed).
-- A request with a ⚠️ line isn't approved by ✅ Approve: the bot shows why once more and
-  offers **⚠️ Approve anyway**, which approves only if nothing new turned up meanwhile.
+- A request with a "⚠️ May be added already" or "⚠️ Added since this request was made" line
+  isn't approved by ✅ Approve: the bot shows why once more and offers **⚠️ Approve
+  anyway**, which approves only if nothing new turned up meanwhile.
 - When a ❗ request's payment is then added automatically (Binance listed it late, or could
   be reached again), that request is closed by itself and you're told.
 - Only payments made after the key was added, and in the last 48 hours, are found. Only

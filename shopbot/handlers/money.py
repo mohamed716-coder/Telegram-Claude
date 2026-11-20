@@ -45,6 +45,7 @@ from .common import (
     try_show,
     user_html,
     user_name,
+    utf16_len,
 )
 
 log = logging.getLogger("shopbot.money")
@@ -53,6 +54,8 @@ MAX_ADMINS_LISTED = 25
 NOTE_LINES = 6  # lines of a request's notes shown, each up to NOTE_LINE_CHARS: the message
 NOTE_LINE_CHARS = 160  # must stay within Telegram's 4096 characters
 LISTED = 3  # deposits named in one warning line, then "and N more"
+NAME_CHARS = 24  # of another customer's name in a warning line
+TEXT_LIMIT = 4000  # a request's text, in UTF-16 units: Telegram takes 4096 (after HTML)
 CONFIRM_FOR = 120.0  # seconds in which a second ✅ Approve approves a request with a warning
 
 
@@ -186,18 +189,23 @@ def deposit_caption(context: Ctx, deposit: Any) -> str:
     if len(lines) > NOTE_LINES:
         lines = lines[:NOTE_LINES - 1] + [f"... and {len(lines) - NOTE_LINES + 1} more"]
     notes = "".join(f"• {esc(_short(line, NOTE_LINE_CHARS))}\n" for line in lines)
-    return (
+    head = (
         f"💳 <b>Deposit request #{deposit['id']}</b>\n"
         f"👤 {user_html(user)}\n"
         f"💵 Amount: <b>{money(deposit['amount'])}</b>\n"
         + (f"🧾 Binance Order ID: <code>{esc(order)}</code>\n" if order else "")
         + found
         + (f"⚠️ Not added automatically:\n{notes}" if notes else "")
-        + _request_warnings(context, deposit)
-        + f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
-        f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
-        f"🕒 {deposit['created_at']} UTC"
     )
+    tail = (f"💰 Current balance: {money(user['balance'])}\n"  # type: ignore[index]
+            f"📥 Total deposits: {money(user['total_deposits'])}\n"  # type: ignore[index]
+            f"🕒 {deposit['created_at']} UTC")
+    warnings = _request_warnings(context, deposit).splitlines(keepends=True)
+    cut = False
+    while warnings and utf16_len(head + "".join(warnings) + tail) > TEXT_LIMIT:
+        warnings.pop()  # never more than Telegram takes, or the owner gets nothing
+        cut = True
+    return head + "".join(warnings) + ("⚠️ (more warnings: too long to show)\n" if cut else "") + tail
 
 
 def _short(text: str, limit: int) -> str:
@@ -213,7 +221,7 @@ def _listed(parts: list[str], sep: str = "; ") -> str:
 def _whose(context: Ctx, row: Any, user_id: int) -> str:
     if row["user_id"] == user_id:
         return ""
-    return f" for {esc(user_name(db_of(context).get_user(row['user_id'])))}"
+    return f" for {esc(_short(user_name(db_of(context).get_user(row['user_id'])), NAME_CHARS))}"
 
 
 def _doubt(context: Ctx, row: Any, user_id: int, held_before: Any = None) -> str:
@@ -266,9 +274,10 @@ def _request_warnings(context: Ctx, deposit: Any) -> str:
             text += (f"⚠️ May be added already: after <code>{esc(payment['order_id'])}</code> was paid, "
                      + _listed([_doubt(context, row, deposit["user_id"], payment["held_before"])
                                 for row in doubts]) + ".\n")
-    if since:
-        text += ("⚠️ Added since this request was made: "
-                 + _listed([_added(context, row, deposit["user_id"]) for row in since]) + ".\n")
+    if since:  # what's shown is worked out only for those listed
+        listed = [_added(context, row, deposit["user_id"]) for row in since[:LISTED]]
+        more = f"; and {len(since) - LISTED} more" if len(since) > LISTED else ""
+        text += "⚠️ Added since this request was made: " + "; ".join(listed) + more + ".\n"
     return text
 
 
@@ -368,7 +377,7 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         return
     db, cfg = db_of(context), cfg_of(context)
     warned = context.bot_data.setdefault("approve_warned", {})  # request id -> (when, what)
-    shown = {row["id"] for row in db.approval_warnings(deposit_id)} if approve else set()
+    shown = {row["id"] for row in db.approval_warnings(deposit_id, LISTED)} if approve else set()
     if shown:
         # ✅ Approve never approves with a warning (a double tap must not confirm it), and
         # "Approve anyway" only what was shown, not long ago: anything new is shown first.
@@ -394,6 +403,8 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         status = f"✅ <b>Approved</b> — new balance {money(user['balance'])}"
         if decision.became_seller:
             status += "\n⭐ Reached the seller threshold: now a Seller."
+        status += "".join(f"\n🧾 Request #{request_id} was waiting with this payment: closed."
+                          for request_id in decision.closed)
     else:
         status = "❌ <b>Rejected</b>"
     await _edit_request(update, deposit_caption(context, deposit) + "\n\n" + status)

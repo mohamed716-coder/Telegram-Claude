@@ -27,8 +27,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application
 
-from ..binance import (BinanceError, BinanceKeyError, BinancePay, BinanceUnavailable, Payment, check,
-                       clean_order_id)
+from ..binance import (BinanceError, BinanceKeyError, BinancePay, BinanceStopping, BinanceUnavailable,
+                       Payment, check, clean_order_id)
 from ..db import PaymentInDoubt, PaymentUsed, ShopError
 from .common import (
     BLUE,
@@ -61,6 +61,9 @@ TRIES = 2  # failed checks of one deposit before the owner decides
 UNREACHABLE_TRIES = 2  # checks of one deposit while Binance can't be reached, before the owner
 UNREACHABLE_FOR = 60.0  # decides; they must span this many seconds (short outages pass)
 OWNER_ALERT_GAP = 6 * 3600  # seconds between two "automatic deposits don't work" alerts
+CHECK_DEADLINE = 90.0  # seconds one check may ask Binance (a long search takes ~40)
+RESTARTED = ("⚠️ The bot restarted while checking your payment. Please start again from "
+             "💳 Add Balance in a minute.")
 
 
 def client_of(context: Ctx) -> Optional[BinancePay]:
@@ -158,8 +161,13 @@ async def verify(update: Update, context: Ctx, state: dict) -> None:
     checking.add(user_id)
     try:
         reply = await _Reply.start(update, context, state["order_id"], new)
-        context.application.create_task(_check(update, context, state, reply),
-                                        name=f"shopbot:binance:{user_id}")
+        # Not Application.create_task: a stop waits for those without a limit, while
+        # _post_stop gives checks a bounded time and then ends them (app.py).
+        task = asyncio.get_running_loop().create_task(_check(update, context, state, reply),
+                                                      name=f"shopbot:binance:{user_id}")
+        tasks = context.bot_data.setdefault("binance_tasks", set())  # keep a reference
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
     except BaseException:
         checking.discard(user_id)
         raise
@@ -202,8 +210,7 @@ async def _check(update: Update, context: Ctx, state: dict, reply: _Reply) -> No
         await _check_payment(update, context, state, reply)
     except asyncio.CancelledError:  # the bot is stopping and couldn't wait any longer
         try:
-            await reply("⚠️ The bot restarted while checking your payment. Please start again "
-                        "from 💳 Add Balance in a minute.", markup([[menu_btn()]]))
+            await reply(RESTARTED, markup([[menu_btn()]]))
         finally:
             raise
     except Exception:  # never leave the customer at "Checking ..."
@@ -231,8 +238,17 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         return
     since = max(db.binance_auto_since(), int(time.time() * 1000) - cfg.binance_max_age_hours * 3_600_000)
     try:
-        payment = await client.find(order_id, since)
+        try:
+            async with asyncio.timeout(CHECK_DEADLINE):
+                payment = await client.find(order_id, since)
+        except TimeoutError:  # e.g. every host hangs: like an outage
+            raise BinanceUnavailable("Binance took too long to answer") from None
     except BinanceUnavailable as exc:  # for now: the network, maintenance, too many requests
+        if isinstance(exc, BinanceStopping) or getattr(client, "closed", False):
+            # Not an outage: the bot is restarting (a request it cut off fails like the
+            # network would), and it forgets this deposit.
+            await reply(RESTARTED, markup([[menu_btn()]]))
+            return
         log.warning("Couldn't check a payment with Binance: %s", exc)
         await _unreachable(update, context, state, reply, exc)
         return

@@ -62,6 +62,10 @@ class BinanceUnavailable(BinanceError):
     """Binance can't be reached right now (network, maintenance, too many requests)."""
 
 
+class BinanceStopping(BinanceUnavailable):
+    """The bot is stopping: the client was closed (Binance itself may be answering)."""
+
+
 @dataclass(frozen=True)
 class Payment:
     order_id: str  # what the payer sees as "Order ID" ("" if Binance didn't send one)
@@ -142,6 +146,11 @@ class BinancePay:
         self._cache: dict[tuple[int, int], tuple[float, list[Payment]]] = {}
 
     @property
+    def closed(self) -> bool:
+        """close() was called: the bot is stopping."""
+        return self._closed
+
+    @property
     def offset_ms(self) -> int:
         """Binance's clock minus this computer's, in ms, as last measured (Binance answers
         -1021 when they differ by more than it allows; until then this is 0)."""
@@ -156,7 +165,7 @@ class BinancePay:
 
     def _client(self) -> httpx.AsyncClient:
         if self._closed:
-            raise BinanceUnavailable("the bot is stopping")
+            raise BinanceStopping("the bot is stopping")
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=20.0)
         return self._http

@@ -1025,10 +1025,16 @@ def test_a_request_settled_by_an_automatic_deposit_stops_counting(tmp_path):
         await choose(t, BOB, 5)  # nor is anyone else's
         assert "Payment received!" in texts(await t.send(BOB, "466000199987322999"), BOB)[-1]
         # Settled without being named: its other unconfirmed Order ID was added for her.
-        t.db.conn.execute("UPDATE deposits SET status = 'rejected', order_id = NULL,"
+        # While it waits, it holds up nobody ...
+        t.db.conn.execute("UPDATE deposits SET status = 'pending', order_id = NULL,"
                           " unconfirmed = ? WHERE id = ?", (OTHER, request["id"]))
         assert t.db.still_unconfirmed(t.db.get_deposit(request["id"])) == []
         assert t.db.payment_doubts(("466000199987322777",), t.db._paid_at(pay()), BOB["id"]) == []
+        # ... but once decided it always counts: it may have been decided for any payment.
+        t.db.conn.execute("UPDATE deposits SET status = 'approved', decided_at = ? WHERE id = ?",
+                          (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), request["id"]))
+        doubts = t.db.payment_doubts(("466000199987322777",), t.db._paid_at(pay()), BOB["id"])
+        assert [r["id"] for r in doubts] == [request["id"]]
 
     run(tmp_path, scenario)
 
@@ -1126,6 +1132,176 @@ def test_a_payment_made_before_automatic_checking_started_goes_to_the_owner(tmp_
         (request,) = t.db.pending_deposits()
         calls = await t.press(OWNER, f"dok:{request['id']}")
         assert "may have been added already" in t.alert(calls) and balance(t, ALICE) == 0
+
+    run(tmp_path, scenario)
+
+
+def test_a_decided_request_keeps_holding_payments_after_its_order_id_is_added(tmp_path):
+    # Request #1 (❗: X not listed yet) is approved for the payment Y the owner found in the
+    # app. Later X is added for Alice through another request: #1 may still have been for Y.
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance(pay(order_id=OTHER, amount="5", tx="P_OTHER")))
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # X: not listed yet
+        await t.send(ALICE, OTHER)  # 5 USDT: wrong amount
+        (first,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{first['id']}")  # approved for Y, which he found in the app
+        y = "466000199987322777"
+        fake.payments += [pay(amount="25"), pay(order_id=y, amount="25", tx="P_Y")]
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)  # X, now listed: in doubt because of #1
+        (second,) = t.db.pending_deposits()
+        await t.press(OWNER, f"dok:{second['id']}")
+        await t.press(OWNER, f"dokx:{second['id']}")  # X is another payment: approved too
+        assert balance(t, ALICE) == 5000
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, y)  # Y, the one #1 was approved for
+        assert "Sent to the owner" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 5000
+
+    run(tmp_path, scenario)
+
+
+def test_approving_a_payment_closes_the_requests_waiting_with_it(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)  # not listed yet: request #1 names exactly this payment
+        (first,) = t.db.pending_deposits()
+        fake.payments.append(pay(amount="25"))
+        await choose(t, ALICE, 24)  # listed now, but sent with another amount: #2 holds it
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)
+        second = t.db.pending_deposits()[-1]
+        calls = await t.press(OWNER, f"dok:{second['id']}")  # her own #1 names it: no warning
+        assert balance(t, ALICE) == 2400
+        assert f"Request #{first['id']} was waiting with this payment: closed." in t.last_text(calls, OWNER["id"])
+        assert t.db.get_deposit(first["id"])["status"] == "closed" and t.db.pending_deposits() == []
+
+    run(tmp_path, scenario)
+
+
+def test_two_customers_waiting_with_one_order_id_is_for_the_owner_to_settle(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        await t.send(ALICE, ORDER)  # not listed yet: request #1 names exactly this payment
+        (alices,) = t.db.pending_deposits()
+        fake.payments.append(pay(amount="25"))
+        await choose(t, BOB, 25)
+        calls = await t.send(BOB, ORDER)  # Bob sends the same Order ID
+        assert "Sent to the owner" in texts(calls, BOB)[-1] and balance(t, BOB) == 0
+        assert f"request #{alices['id']} for Alice is waiting" in request_text(calls)
+        assert t.db.get_deposit(alices["id"])["status"] == "pending"
+
+    run(tmp_path, scenario)
+
+
+def test_unrelated_deposits_between_the_presses_dont_hold_up_approve_anyway(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, "466000199987322888")
+        await t.send(ALICE, "466000199987322889")
+        (request,) = t.db.pending_deposits()
+        await t.send(OWNER, f"/addbal {ALICE['id']} 5")
+        calls = await t.press(OWNER, f"dok:{request['id']}")
+        assert "may have been added already" in t.alert(calls)
+        for n in range(3):  # other customers keep paying other amounts meanwhile
+            fake.payments.append(pay(order_id=f"46600019998735550{n}", amount="3", tx=f"P_C{n}", minutes_ago=-5))
+            await choose(t, BOB, 3)
+            assert "Payment received!" in texts(await t.send(BOB, f"46600019998735550{n}"), BOB)[-1]
+        assert "Bob" not in t.last_text(calls)
+        await t.press(OWNER, f"dokx:{request['id']}")
+        assert balance(t, ALICE) == 3000
+
+    run(tmp_path, scenario)
+
+
+def test_a_check_cut_off_by_the_stop_says_the_bot_restarted(tmp_path):
+    class Stopping(FakeBinance):
+        async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
+            raise binance_module.BinanceStopping("the bot is stopping")
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, Stopping())
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        t.app.user_data[ALICE["id"]]["state"]["unreachable"] = [time.monotonic() - 120]  # an outage before
+        calls = await t.send(ALICE, ORDER)
+        assert "restarted while checking" in t.last_text(calls, ALICE["id"])
+        assert t.db.pending_deposits() == [] and owner_texts(calls) == []
+
+    run(tmp_path, scenario)
+
+
+def test_a_request_the_stop_cut_off_mid_flight_says_the_bot_restarted(tmp_path):
+    class CutOff(FakeBinance):
+        closed = False
+
+        async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
+            self.closed = True  # close() ended the request: it fails like the network
+            raise BinanceUnavailable("network: ReadError")
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, CutOff())
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "restarted while checking" in t.last_text(calls, ALICE["id"])
+        assert "unreachable" not in t.app.user_data[ALICE["id"]]["state"]
+
+    run(tmp_path, scenario)
+
+
+def test_approve_anyway_compares_what_the_request_shows(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        fake = with_binance(t, FakeBinance())
+        register(t, ALICE)
+        register(t, BOB)
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, "466000199987322888")
+        await t.send(ALICE, "466000199987322889")
+        (request,) = t.db.pending_deposits()
+        for n in range(3):  # her own deposits since: listed first
+            await t.send(OWNER, f"/addbal {ALICE['id']} {n + 1}")
+        calls = await t.press(OWNER, f"dok:{request['id']}")
+        assert "may have been added already" in t.alert(calls)
+        # Bob's 25$ is of the same amount, but ranked after her own three: not shown
+        fake.payments.append(pay(order_id=OTHER, amount="25", tx="P_OTHER", minutes_ago=-5))
+        await choose(t, BOB, 25)
+        assert "Payment received!" in texts(await t.send(BOB, OTHER), BOB)[-1]
+        await t.press(OWNER, f"dokx:{request['id']}")  # what's shown didn't change
+        assert balance(t, ALICE) == 600 + 2500
+
+    run(tmp_path, scenario)
+
+
+def test_long_names_dont_make_a_request_too_long_to_send(tmp_path):
+    from shopbot.handlers.common import utf16_len
+    from shopbot.handlers.money import deposit_caption
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="25")))
+        register(t, ALICE)
+        others = [{"id": 3001 + n, "is_bot": False, "first_name": "🦄" * 64, "last_name": "𝓩" * 64,
+                   "username": f"u{n}"} for n in range(8)]
+        for user in others:
+            register(t, user)
+            t.db.create_review_request(user["id"], 1000, f"4660001999876{user['id']:05d}", "x", [])
+        await choose(t, ALICE, 25)
+        await t.send(ALICE, ORDER)
+        request = t.db.pending_deposits()[-1]
+        caption = deposit_caption(t.app, t.db.get_deposit(request["id"]))
+        assert utf16_len(caption) <= 4096 and "is waiting" in caption
+        assert "🦄" * 25 not in caption  # names are shortened in warnings
 
     run(tmp_path, scenario)
 
@@ -1369,13 +1545,8 @@ def test_a_check_that_hangs_past_the_stop_is_ended_and_says_so(tmp_path, monkeyp
 
     monkeypatch.setattr(app_module, "CHECKS_TIMEOUT", 0.01)
 
-    class Hanging(FakeBinance):
-        async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
-            await asyncio.sleep(3600)  # still connecting when the bot stops
-            return None
-
     async def scenario(t: ShopTest) -> None:
-        with_binance(t, Hanging())
+        with_binance(t, Hanging())  # still connecting when the bot stops
         register(t, ALICE)
         await choose(t, ALICE, 25)
         settle = t.settle
@@ -1393,6 +1564,54 @@ def test_a_check_that_hangs_past_the_stop_is_ended_and_says_so(tmp_path, monkeyp
         assert "restarted while checking" in t.last_text(t.tg.calls[mark:], ALICE["id"])
         assert started.cancelled()
         assert not [x for x in asyncio.all_tasks() if x.get_name().startswith("shopbot:binance:")]
+
+    run(tmp_path, scenario)
+
+
+class Hanging(FakeBinance):
+    """Binance that never answers (every host hangs)."""
+
+    async def find(self, wanted: str, since_ms: int) -> Optional[Payment]:
+        await asyncio.sleep(3600)
+        return None
+
+
+def test_a_stop_doesnt_wait_without_limit_for_a_check_started_before_it(tmp_path, monkeypatch):
+    from shopbot import app as app_module
+
+    monkeypatch.setattr(app_module, "CHECKS_TIMEOUT", 0.01)
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, Hanging())
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        settle = t.settle
+
+        async def quick() -> None:
+            await asyncio.sleep(0.01)
+
+        t.settle = quick  # type: ignore[method-assign]
+        await t.send(ALICE, ORDER)  # the check starts while the bot runs
+        mark = len(t.tg.calls)
+        await asyncio.wait_for(t.app.stop(), timeout=5)  # doesn't wait for it ...
+        await app_module._post_stop(t.app)  # ... this does, for a bounded time, then ends it
+        t.settle = settle  # type: ignore[method-assign]
+        assert "restarted while checking" in t.last_text(t.tg.calls[mark:], ALICE["id"])
+        await t.app.start()  # for the harness, which stops it at the end
+
+    run(tmp_path, scenario)
+
+
+def test_a_check_binance_never_answers_ends_as_an_outage(tmp_path, monkeypatch):
+    monkeypatch.setattr(autopay_module, "CHECK_DEADLINE", 0.05)
+
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, Hanging())
+        register(t, ALICE)
+        await choose(t, ALICE, 25)
+        calls = await t.send(ALICE, ORDER)
+        assert "can't be reached right now" in t.last_text(calls, ALICE["id"])
+        assert t.has_button(calls, "Check again") and t.db.pending_deposits() == []
 
     run(tmp_path, scenario)
 
