@@ -216,9 +216,12 @@ def _whose(context: Ctx, row: Any, user_id: int) -> str:
     return f" for {esc(user_name(db_of(context).get_user(row['user_id'])))}"
 
 
-def _doubt(context: Ctx, row: Any, user_id: int) -> str:
-    """A deposit that may be about a payment (see Database.payment_doubts), as it is now."""
+def _doubt(context: Ctx, row: Any, user_id: int, held_before: Any = None) -> str:
+    """A deposit that may be about a payment (see Database.request_warnings), as it is now."""
     whose = _whose(context, row, user_id)
+    if row["id"] == held_before or row["method"] == "binance" and not row["unverified"]:
+        verb = {"approved": "you approved", "rejected": "you rejected"}.get(row["status"], "was closed")
+        return f"it was in request #{row['id']}{whose}, which {verb}"
     if row["method"] == "manual":
         return f"you added {money(row['amount'])} by hand{whose} ({row['created_at']} UTC)"
     if row["status"] == "pending":
@@ -234,14 +237,20 @@ def _added(context: Ctx, row: Any, user_id: int) -> str:
     if row["method"] == "binance_auto":
         return (f"{money(row['amount'])} automatically{whose}, Order ID "
                 f"<code>{esc(row['order_id'] or '')}</code> ({row['decided_at']} UTC)")
-    return f"{money(row['amount'])}{whose} with request #{row['id']} ({row['decided_at']} UTC)"
+    if row["receipt_file_id"]:
+        return f"{money(row['amount'])}{whose} with a receipt, request #{row['id']} ({row['decided_at']} UTC)"
+    paid = [p for p in db_of(context).deposit_payments(row["id"]) if p["status"] == "credited" and p["currency"]]
+    payment = (f", Order ID <code>{esc(paid[0]['order_id'])}</code> of {esc(paid[0]['raw_amount'])} "
+               f"{esc(paid[0]['currency'])}" if paid else "")
+    return f"{money(row['amount'])}{whose} with request #{row['id']}{payment} ({row['decided_at']} UTC)"
 
 
 def _request_warnings(context: Ctx, deposit: Any) -> str:
     """What the owner should know before approving a Binance request, as it is now."""
     text = ""
-    if deposit["unverified"]:
-        ids = [f"<code>{esc(value)}</code>" for value in (deposit["unconfirmed"] or "").split()]
+    left = db_of(context).still_unconfirmed(deposit) if deposit["unverified"] else []
+    if left is None or left:
+        ids = [f"<code>{esc(value)}</code>" for value in left or []]
         text += (f"❗ Binance didn't confirm Order ID {_listed(ids, ', ')} as a new payment to you"
                  if ids else "❗ Binance didn't confirm this request's Order ID as a new payment to you")
         text += (". Approve only if you find the payment in your Binance app and haven't added it "
@@ -249,9 +258,14 @@ def _request_warnings(context: Ctx, deposit: Any) -> str:
     if deposit["status"] != "pending":
         return text
     held, since = db_of(context).request_warnings(deposit["id"])
-    for payment, doubts in held:
-        text += (f"⚠️ May be added already: after <code>{esc(payment['order_id'])}</code> was paid, "
-                 + _listed([_doubt(context, row, deposit["user_id"]) for row in doubts]) + ".\n")
+    for payment, doubts, early in held:
+        if early:
+            text += (f"⚠️ May be added already: <code>{esc(payment['order_id'])}</code> was paid "
+                     "before automatic checking started, when deposits came with receipts.\n")
+        if doubts:
+            text += (f"⚠️ May be added already: after <code>{esc(payment['order_id'])}</code> was paid, "
+                     + _listed([_doubt(context, row, deposit["user_id"], payment["held_before"])
+                                for row in doubts]) + ".\n")
     if since:
         text += ("⚠️ Added since this request was made: "
                  + _listed([_added(context, row, deposit["user_id"]) for row in since]) + ".\n")
@@ -343,7 +357,7 @@ async def _edit_request(update: Update, text: str, keyboard: Any = None) -> None
 
 async def cb_deposit_decide(update: Update, context: Ctx) -> None:
     query = update.callback_query
-    approve = query.data.startswith("dok:")
+    approve = query.data.startswith(("dok:", "dokx:"))
     try:
         (deposit_id,) = callback_ints(query.data, 1)
     except ValueError:
@@ -353,16 +367,20 @@ async def cb_deposit_decide(update: Update, context: Ctx) -> None:
         await answer(query, "Only the owner can do that.", show_alert=True)
         return
     db, cfg = db_of(context), cfg_of(context)
-    warned = context.bot_data.setdefault("approve_warned", {})  # request id -> when warned
-    if approve and db.approval_warnings(deposit_id):
-        at = warned.get(deposit_id)
-        if at is None or time.monotonic() - at > CONFIRM_FOR:  # first press: say why, first
-            warned[deposit_id] = time.monotonic()
-            await answer(query, "⚠️ This may have been added already: see the ⚠️ lines of the "
-                         "request. Press ✅ Approve again within 2 minutes to approve anyway.",
-                         show_alert=True)
-            await _edit_request(update, deposit_caption(context, db.get_deposit(deposit_id)),
-                                _decision_keyboard("dok", "dno", deposit_id))
+    warned = context.bot_data.setdefault("approve_warned", {})  # request id -> (when, what)
+    shown = {row["id"] for row in db.approval_warnings(deposit_id)} if approve else set()
+    if shown:
+        # ✅ Approve never approves with a warning (a double tap must not confirm it), and
+        # "Approve anyway" only what was shown, not long ago: anything new is shown first.
+        at, seen = warned.get(deposit_id, (None, set()))
+        if not (query.data.startswith("dokx:") and at is not None
+                and time.monotonic() - at <= CONFIRM_FOR and shown <= seen):
+            warned[deposit_id] = (time.monotonic(), shown)
+            await answer(query, "⚠️ This may have been added already: read the ⚠️ lines of the "
+                         "request, then press ⚠️ Approve anyway if you're sure.", show_alert=True)
+            await _edit_request(update, deposit_caption(context, db.get_deposit(deposit_id)), markup([[
+                btn("⚠️ Approve anyway", f"dokx:{deposit_id}", GREEN),
+                btn("❌ Reject", f"dno:{deposit_id}", RED)]]))
             return
     warned.pop(deposit_id, None)
     try:

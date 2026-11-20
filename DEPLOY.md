@@ -267,9 +267,13 @@ Set it up once:
 - The bot can't tell which payment you approve such a request for, so it never adds a
   payment by itself that you may have added already: one made before you decided a ❗
   request, or while that customer's ❗ request waits, or before balance you added to that
-  customer with `/addbal`. Such a payment comes to you instead, with a ⚠️ line saying why,
-  and approving it takes a second press. A payment that was in a request you already
-  decided (e.g. rejected for its amount) comes back to you too.
+  customer with `/addbal`. Such a payment comes to you instead, with a ⚠️ line saying why.
+  So does a payment that was in a request you already decided (e.g. rejected for its
+  amount, or approved for the other payment it showed).
+- A request with a ⚠️ line isn't approved by ✅ Approve: the bot shows why once more and
+  offers **⚠️ Approve anyway**, which approves only if nothing new turned up meanwhile.
+- When a ❗ request's payment is then added automatically (Binance listed it late, or could
+  be reached again), that request is closed by itself and you're told.
 - Only payments made after the key was added, and in the last 48 hours, are found. Only
   USDT counts by default (1 USDT = 1$); to take USDC too, add `BINANCE_COINS=USDT,USDC` to
   `~/Telegram-Claude/.env` on the server.

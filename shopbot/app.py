@@ -57,9 +57,11 @@ async def _watch_token(app: Application) -> None:
 
 
 async def _post_stop(app: Application) -> None:
-    task = app.bot_data.pop("token_watch", None)
-    if task is not None:
-        task.cancel()
+    for name in ("token_watch", "binance_check"):  # the start-up key check closes its client
+        task = app.bot_data.pop(name, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait([task], timeout=2)
     # A payment check started while stopping isn't awaited by Application.stop(): let it
     # finish (it usually takes seconds) before its connection to Binance is closed.
     checks = [t for t in asyncio.all_tasks()
@@ -74,6 +76,11 @@ async def _post_stop(app: Application) -> None:
     if late:
         log.warning("%s payment check(s) were cut off by the stop", len(late))
         await asyncio.wait(late, timeout=5)  # their answer, while the bot can still send it
+        late = [t for t in late if not t.done()]  # e.g. still connecting to Binance
+        for t in late:
+            t.cancel()  # they tell the customer the bot restarted
+        if late:
+            await asyncio.wait(late, timeout=5)
     # Broadcasts notice the stop within a second and save how far they got.
     busy = [t for t in app.bot_data.get("broadcast_tasks", ()) if not t.done()]
     if busy:

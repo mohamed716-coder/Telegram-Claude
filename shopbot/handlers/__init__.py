@@ -40,7 +40,7 @@ COMMANDS = [
 #   sh:<label>:<page>  shop       sb:<label>:<qty>  quantity      sq:<label>  other qty
 #   sc:<label>:<qty>:<nonce>  confirm purchase      mo:<page> / mov:<order>  my orders
 #   lb/ln/lp/lr/ld/ldy/lx  labels (lx = disable/enable)   ap/apd/apc  add product
-#   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dno  deposits
+#   mp/mi/mv/mr/mry/mu/ma  my products               dp/da/dc/dsend/dok/dokx/dno  deposits
 #   dck  check a Binance Order ID again (autopay.py)
 #   ea/ew/wall/wok/wno  earnings & withdrawals      pq  pending requests (owner)
 #   an:<nonce> / anc[:<nonce>] / ans:<job>  send / cancel / stop an announcement (owner)
@@ -78,7 +78,7 @@ CALLBACKS = [
     (r"^dc$", money.cb_deposit_custom),
     (r"^dsend$", money.cb_deposit_send),
     (r"^dck$", autopay.cb_check_again),
-    (r"^(dok|dno):", money.cb_deposit_decide),
+    (r"^(dok|dokx|dno):", money.cb_deposit_decide),
     (r"^ea$", money.cb_earnings),
     (r"^ew$", money.cb_withdraw),
     (r"^wall$", money.cb_withdraw_all),

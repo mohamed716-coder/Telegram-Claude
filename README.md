@@ -136,9 +136,9 @@ Binance Pay to Binance ID **850940840**. Then:
   When Binance shows a payment with that Order ID, coin and amount, the balance is added at
   once. If not, the owner gets a ⚠️ message and the bot asks for the Order ID again; if the
   second try fails too, the deposit goes to the owner to **Approve** / **Reject**. An Order
-  ID can only ever be used once. A deposit also goes straight to the owner when Binance
-  can't be asked (the key is refused, or Binance can't be reached for a few minutes), or
-  when the owner may have decided on that payment by hand already.
+  ID can only ever be used once. A deposit also goes to the owner when Binance can't be
+  asked (the key is refused, or Binance still can't be reached when the customer checks
+  again a minute later), or when the owner may have decided on that payment by hand already.
 - **Without a key:** send a **photo of the receipt** and press **Confirm**. The owner gets
   the receipt with **Approve** / **Reject** buttons; on approval the balance is added.
 

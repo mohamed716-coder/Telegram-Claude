@@ -16,6 +16,7 @@ Binance is asked in the background, so the bot keeps answering everyone meanwhil
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from decimal import Decimal
@@ -199,6 +200,12 @@ async def _check(update: Update, context: Ctx, state: dict, reply: _Reply) -> No
     user_id = update.effective_user.id  # type: ignore[union-attr]
     try:
         await _check_payment(update, context, state, reply)
+    except asyncio.CancelledError:  # the bot is stopping and couldn't wait any longer
+        try:
+            await reply("⚠️ The bot restarted while checking your payment. Please start again "
+                        "from 💳 Add Balance in a minute.", markup([[menu_btn()]]))
+        finally:
+            raise
     except Exception:  # never leave the customer at "Checking ..."
         log.exception("Checking a Binance payment failed")
         await reply("⚠️ Something went wrong while checking. Please press 🔄 Check again.",
@@ -237,6 +244,7 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         await _to_owner(update, context, state, reply, f"{order_id}: not checked ({why})")
         return
     db.note_binance_clock(getattr(client, "offset_ms", 0))  # to compare Binance's times with ours
+    state.pop("unreachable", None)  # Binance answered: an outage is over
     if payment is None:
         await _failed(
             update, context, state, reply,
@@ -272,7 +280,9 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         log.info("Payment %s may be decided already (deposits %s): the owner decides", order_id,
                  ", ".join(str(r["id"]) for r in exc.requests))
         state["found"].append(payment)  # kept for the owner's decision (the request says why)
-        await _to_owner(update, context, state, reply, f"{order_id}: may have been added already")
+        await _to_owner(update, context, state, reply,
+                        f"{order_id}: paid before automatic checking started" if exc.early and not exc.requests
+                        else f"{order_id}: may have been added already")
         return
     except ShopError as exc:
         _done(context, state)
@@ -287,11 +297,13 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
                  f"so you're now a <b>Seller</b> with <b>{cfg.seller_discount_percent}% off</b> "
                  "all products.")
     await reply(text, markup([[btn("🛍 Shop", "sh:0:0", GREEN), menu_btn()]]))
+    closed = "".join(f"\n🧾 Request #{request_id} was waiting with this payment: closed."
+                     for request_id in decision.closed)
     await notify(context, cfg.owner_id,
                  f"💳 <b>Deposit added automatically</b>\n👤 {user_html(user)}\n"
                  f"💵 +{money(deposit['amount'])} ({esc(_paid(payment))}"
                  f"{', from ' + esc(payment.payer) if payment.payer else ''})\n"
-                 f"🧾 Order ID <code>{esc(payment.order_id or payment.transaction_id)}</code>")
+                 f"🧾 Order ID <code>{esc(payment.order_id or payment.transaction_id)}</code>" + closed)
 
 
 async def _already_used(update: Update, context: Ctx, state: dict, reply: _Reply, row: Any) -> None:
@@ -302,10 +314,12 @@ async def _already_used(update: Update, context: Ctx, state: dict, reply: _Reply
         return
     request = db_of(context).get_deposit(row["deposit_id"]) if row["status"] == "owner" else None
     if request is not None and request["status"] != "pending":
-        # Kept for a request the owner decided already (e.g. rejected for its amount):
-        # it can't be added automatically, so the owner looks at it again.
+        # Kept for a request decided without adding it (rejected for its amount, approved
+        # for another payment it held, closed): never added automatically; the owner
+        # decides again, told which request had it.
+        verb = {"approved": "you approved", "rejected": "you rejected"}.get(request["status"], "was closed")
         await _to_owner(update, context, state, reply,
-                        f"{state['order_id']}: was in request #{request['id']}, which you {request['status']}")
+                        f"{state['order_id']}: was in request #{request['id']}, which {verb}")
         return
     _done(context, state)
     await reply(_used_text(row), markup([[menu_btn()]]))

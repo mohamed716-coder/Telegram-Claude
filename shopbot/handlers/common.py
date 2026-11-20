@@ -38,7 +38,7 @@ OWNER, ADMIN, USER = "owner", "admin", "user"
 MAX_DB_INT = 2**63 - 1
 
 # Callback prefixes that must NOT end the action in progress (see pre_handler).
-KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "dck", "wall", "dok", "dno", "wok", "wno", "noop"}
+KEEP_STATE_PREFIXES = {"apd", "apc", "dsend", "dck", "wall", "dok", "dokx", "dno", "wok", "wno", "noop"}
 
 BOT_DESCRIPTION = "🛍 Welcome to the shop!\n\nPress /start to start the shop."
 BOT_SHORT_DESCRIPTION = "🛍 Send /start to start the shop."
