@@ -259,6 +259,22 @@ async def test_custom_texts_with_line_6(app):
     )
 
 
+async def test_any_line_tag(app):
+    await set_response(app, "setresponseaft", "a: <line_4>\nb: <line_6>\nmissing: [<line_20>]")
+    app.relay.update = answer_with_line6("• PROCESSED: 10 + 0 / 10")
+    await send(app, OWNER, "/kd hi")
+    assert app.bot.edits[-1][2] == (
+        "a: l4\nb: • PROCESSED: 10 + 0 / 10\nmissing: []" + footer("Unknown")
+    )
+
+
+def test_line_of_edges():
+    from kdbot.bot import line_of
+
+    assert line_of("a\nb", 1) == "a"
+    assert line_of("a\nb", 0) == "" and line_of("a\nb", 3) == ""
+
+
 async def test_zero_texts_when_nothing_was_processed(app):
     await set_response(app, "setresponse0bef", "starting…")
     await set_response(app, "setresponse0aft", "failed: <line_6>")
