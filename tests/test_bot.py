@@ -10,8 +10,9 @@ OWNER, ADMIN2, USER = 1, 2, 42
 
 
 class FakeMsg:
-    def __init__(self, text):
+    def __init__(self, text, buttons=None):
         self.text = text
+        self.buttons = buttons
         self.deleted = False
 
     async def edit(self, text):
@@ -34,13 +35,33 @@ class FakeEvent:
         return self._sender
 
     async def reply(self, text, **kw):
-        msg = FakeMsg(text)
+        msg = FakeMsg(text, kw.get("buttons"))
         self.replies.append(msg)
         return msg
 
     @property
     def last(self):
         return self.replies[-1].text
+
+
+class FakeButtonPress:
+    """An admin tapping one of the inline buttons under a bot message."""
+
+    def __init__(self, uid, data, username=None):
+        self.sender_id = uid
+        self.data = data
+        self.answers = []
+        self.edited = None
+        self._sender = SimpleNamespace(first_name="Bob", last_name=None, username=username)
+
+    async def get_sender(self):
+        return self._sender
+
+    async def answer(self, text=None, **kw):
+        self.answers.append(text)
+
+    async def edit(self, text, **kw):
+        self.edited = text
 
 
 def target_msg(text):
@@ -105,6 +126,21 @@ async def send(app, uid, text, username=None):
 async def make_code(app, args="25 0", uid=OWNER):
     ev = await send(app, uid, f"/code {args}")
     return re.findall(r"ANONYMOUS-[A-Za-z0-9]{11}", ev.replies[0].text)
+
+
+async def press(app, msg, label, uid=OWNER):
+    """Tap the button called `label` under the bot's message `msg`."""
+    [button] = [b for row in msg.buttons for b in row if b.text == label]
+    ev = FakeButtonPress(uid, button.type.data)  # the bytes Telegram sends back on a tap
+    await app.handle_button(ev)
+    return ev
+
+
+async def set_response(app, name, text, command="/kd"):
+    """Send /<name> with `text` below it, then tap which command it's for."""
+    ev = await send(app, OWNER, f"/{name}\n{text}" if text else f"/{name}")
+    assert "Which command" in ev.last
+    return await press(app, ev.replies[-1], command)
 
 
 def footer(user):
@@ -211,8 +247,8 @@ async def test_edit_updates_the_same_message_with_footer(app):
 
 
 async def test_custom_texts_with_line_6(app):
-    await send(app, OWNER, "/setresponsebef\nplease wait")
-    await send(app, OWNER, "/setresponseaft\nhey, thanks for using our service\n<line_6>\nhave a good day")
+    await set_response(app, "setresponsebef", "please wait")
+    await set_response(app, "setresponseaft", "hey, thanks for using our service\n<line_6>\nhave a good day")
     app.relay.first = answer_with_line6("• PROCESSED: 3 + 0 / 10")
     app.relay.update = answer_with_line6("• PROCESSED: 10 + 0 / 10")
     await send(app, OWNER, "/kd hi")  # this user has no @username
@@ -224,9 +260,9 @@ async def test_custom_texts_with_line_6(app):
 
 
 async def test_zero_texts_when_nothing_was_processed(app):
-    await send(app, OWNER, "/setresponse0bef\nstarting…")
-    await send(app, OWNER, "/setresponse0aft\nfailed: <line_6>")
-    await send(app, OWNER, "/setresponseaft\nnot used here")
+    await set_response(app, "setresponse0bef", "starting…")
+    await set_response(app, "setresponse0aft", "failed: <line_6>")
+    await set_response(app, "setresponseaft", "not used here")
     app.relay.first = answer_with_line6("• PROCESSED: 0 + 10 / 10")
     app.relay.update = answer_with_line6("• PROCESSED: 0 + 10 / 10")
     await send(app, OWNER, "/kd hi", username="bob")
@@ -234,13 +270,41 @@ async def test_zero_texts_when_nothing_was_processed(app):
     assert app.bot.edits[-1][2] == "failed: • PROCESSED: 0 + 10 / 10" + footer("@bob")
 
 
+async def test_each_command_has_its_own_texts(app):
+    await set_response(app, "setresponsebef", "zz text", command="/zz")
+    await send(app, OWNER, "/zz hi")
+    await send(app, OWNER, "/kd hi")  # nothing set for /kd: the target bot's message as it is
+    assert [t for _, t in app.bot.sent] == ["zz text", "answer"]
+    assert app.store.get_setting("setresponsebef:zz") == "zz text"
+    assert app.store.get_setting("setresponsebef:kd") is None
+
+
+async def test_all_commands_button(app):
+    ev = await set_response(app, "setresponseaft", "same for all", command="All commands")
+    assert "/kd /ko /zz" in ev.edited
+    for c in ("kd", "ko", "zz"):
+        assert app.store.get_setting(f"setresponseaft:{c}") == "same for all"
+
+
 async def test_setresponse_is_admin_only_and_can_be_reset(app):
     assert (await send(app, USER, "/setresponseaft\nhi")).replies == []
-    assert app.store.get_setting("setresponseaft") is None
-    assert "Saved" in (await send(app, OWNER, "/setresponseaft\nhi\n<line_6>")).last
-    assert app.store.get_setting("setresponseaft") == "hi\n<line_6>"
-    assert "reset" in (await send(app, OWNER, "/setresponseaft")).last
-    assert app.store.get_setting("setresponseaft") is None
+    ev = await set_response(app, "setresponseaft", "hi\n<line_6>")
+    assert "Saved /setresponseaft for /kd" in ev.edited
+    assert app.store.get_setting("setresponseaft:kd") == "hi\n<line_6>"
+    ev = await set_response(app, "setresponseaft", "")
+    assert "reset for /kd" in ev.edited
+    assert app.store.get_setting("setresponseaft:kd") is None
+
+
+async def test_buttons_are_admin_only_and_single_use(app):
+    question = (await send(app, OWNER, "/setresponsebef\nhello")).replies[-1]
+    stranger = await press(app, question, "/kd", uid=USER)
+    assert stranger.answers == ["Only admins can do this."] and stranger.edited is None
+    assert app.store.get_setting("setresponsebef:kd") is None
+    assert "Saved" in (await press(app, question, "/kd")).edited
+    again = await press(app, question, "/zz")
+    assert "expired" in again.answers[0]
+    assert app.store.get_setting("setresponsebef:zz") is None
 
 
 async def test_sends_new_message_if_edit_fails(app):
