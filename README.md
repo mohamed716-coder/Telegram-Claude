@@ -73,7 +73,8 @@ The bot then asks which command it's for, with buttons: **/kd**, **/zz**, **/ko*
 | `/setresponse0bef` | First answer, when line 6 is `• PROCESSED: 0 + 10 / 10` |
 | `/setresponse0aft` | After the edit, when line 6 is `• PROCESSED: 0 + 10 / 10` (footer added) |
 
-- `<line_6>` is replaced by line 6 of the target bot's message; nothing else from it is shown.
+- `<line_4>`, `<line_6>` (any number) are replaced by that line of the target bot's message;
+  nothing else from it is shown. A line that doesn't exist becomes empty.
 - The text is shown exactly as written. It is saved in `data/kdbot.db`, so it survives restarts.
 - Send the command with no text (then tap a command) to reset it: the target bot's
   message is then shown as it is for that command.
@@ -113,10 +114,12 @@ See **[DEPLOY.md](DEPLOY.md)**: on an Ubuntu/Debian server it's `git clone …` 
 | `CODE_PREFIX` | Start of generated codes (default `ANONYMOUS`) |
 | `REPLY_TIMEOUT` | Max seconds to wait for the target bot (default 30) |
 | `SETTLE_SECONDS` | Answer counts as finished after this many quiet seconds (default 3) |
-| `EDIT_WAIT` | After answering, keep watching this many seconds for the target bot to edit its answer and update the user's message too; other users wait in the queue meanwhile (default 20, 0 = off) |
+| `EDIT_WAIT` | After answering, keep watching this many seconds for the target bot to edit its answer and update the user's message too (default 20, 0 = off) |
 
-Requests are handled one at a time, so two users' answers never get mixed up;
-extra requests wait in a queue.
+Several users can use the bot at once. Requests only queue ("In queue…") while an
+earlier one waits for the target bot's *first* reply, so a new message can only
+belong to one request. After that, the next request goes ahead, and edits are
+matched to the right user by message ID, so answers never get mixed up.
 
 ## Safety
 
