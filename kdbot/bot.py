@@ -1,5 +1,6 @@
 """All bot commands: /start, /status, /redeem, the relay commands and admin commands."""
 
+import copy
 import html
 import io
 import logging
@@ -53,6 +54,28 @@ def chunks(lines: list[str], limit: int = MESSAGE_LIMIT) -> list[str]:
     if current:
         out.append(current)
     return out
+
+
+def utf16_len(text: str) -> int:
+    """Telegram measures entity offsets in UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def first_lines(text: str, entities, max_lines: int):
+    """Keep only the first `max_lines` lines of a message, clipping its formatting to match."""
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text, entities
+    text = "\n".join(lines[:max_lines])
+    cut = utf16_len(text)
+    kept = []
+    for e in entities or []:
+        if e.offset >= cut:
+            continue
+        e = copy.copy(e)
+        e.length = min(e.offset + e.length, cut) - e.offset
+        kept.append(e)
+    return text, kept or None
 
 
 def display_name(sender) -> str:
@@ -223,23 +246,41 @@ class BotApp:
 
         status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
         log.info("user %s -> %r", uid, text)
+        answered = False
+
+        async def deliver(replies, is_update: bool) -> None:
+            # Called with the first answer, then again each time the target bot
+            # edits its answer; every call is for this user's request only.
+            nonlocal answered
+            if not answered:
+                answered = True
+                await status.delete()
+            for msg in replies:
+                try:
+                    # Edited versions only show their first few lines (UPDATE_MAX_LINES).
+                    max_lines = getattr(self.cfg, "update_max_lines", 8) if is_update else None
+                    await self.forward_reply(event.chat_id, msg, reply_to=event.id, max_lines=max_lines)
+                except Exception:
+                    log.exception("failed to forward %s %s", "update" if is_update else "reply", msg.id)
+
         try:
-            replies = await self.relay.ask(text)
+            await self.relay.ask(text, deliver)
         except Exception:
             log.exception("relay failed")
-            return await status.edit("Something went wrong, please try again later.")
-        if not replies:
-            return await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
-        await status.delete()
-        for msg in replies:
-            try:
-                await self.forward_reply(event.chat_id, msg, reply_to=event.id)
-            except Exception:
-                log.exception("failed to forward reply %s", msg.id)
+            if not answered:
+                await status.edit("Something went wrong, please try again later.")
+            return
+        if not answered:
+            await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
 
-    async def forward_reply(self, chat, msg: Message, reply_to) -> None:
-        """Re-send one of the target bot's messages to the user, through our bot."""
+    async def forward_reply(self, chat, msg: Message, reply_to, max_lines: int | None = None) -> None:
+        """Re-send one of the target bot's messages to the user, through our bot.
+
+        With `max_lines`, only the first that many lines of the text are sent.
+        """
         text, entities = msg.message or "", msg.entities
+        if max_lines:
+            text, entities = first_lines(text, entities, max_lines)
         if msg.media and msg.file and not msg.web_preview:
             data = io.BytesIO(await self.user.download_media(msg, file=bytes))
             data.name = msg.file.name or f"file{msg.file.ext or ''}"
