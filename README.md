@@ -52,8 +52,9 @@ Owner: @anony6916
 
 ## What users see (`/setresponse…`)
 
-Admins can replace the target bot's message with their own text. Write the text on
-the lines below the command, in the same message:
+Admins can replace the target bot's message with their own text, separately for each
+command (`/kd`, `/zz`, `/ko`). Write the text on the lines below the command, in the
+same message:
 
 ```
 /setresponseaft
@@ -61,6 +62,9 @@ hey, thanks for using our service
 <line_6>
 have a good day
 ```
+
+The bot then asks which command it's for, with buttons: **/kd**, **/zz**, **/ko** or
+**All commands**. Tap one to save it.
 
 | Command | Used for |
 |---|---|
@@ -71,7 +75,8 @@ have a good day
 
 - `<line_6>` is replaced by line 6 of the target bot's message; nothing else from it is shown.
 - The text is shown exactly as written. It is saved in `data/kdbot.db`, so it survives restarts.
-- Send the command with no text to reset it: the target bot's message is then shown as it is.
+- Send the command with no text (then tap a command) to reset it: the target bot's
+  message is then shown as it is for that command.
 
 ## Run it 24/7 on a server
 
