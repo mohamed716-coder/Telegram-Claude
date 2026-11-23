@@ -46,12 +46,16 @@ class FakeEvent:
 class FakeRelay:
     busy = False
 
-    def __init__(self):
+    def __init__(self, update=None):
         self.sent = []
+        self.update = update  # text of a later edit, if any
 
-    async def ask(self, text):
+    async def ask(self, text, deliver):
         self.sent.append(text)
-        return [SimpleNamespace(id=1, message="answer", entities=None, media=None)]
+        await deliver([SimpleNamespace(id=1, message="answer", entities=None, media=None)], False)
+        if self.update is not None:
+            await deliver([SimpleNamespace(id=1, message=self.update, entities=None, media=None)], True)
+        return True
 
 
 class FakeBot:
@@ -172,3 +176,23 @@ async def test_admin_lists(app):
     assert "Bob" in (await send(app, OWNER, "/users")).last
     assert "removed" in (await send(app, OWNER, f"/removepremium {USER}")).last
     assert "needs Premium" in (await send(app, USER, "/kd x")).last
+
+
+async def test_update_only_shows_first_8_lines(app):
+    app.relay.update = "\n".join(["a", "b"] * 6)  # 12 lines
+    await send(app, OWNER, "/kd hi")
+    texts = [t for _, t in app.bot.sent]
+    assert texts == ["answer", "a\nb\na\nb\na\nb\na\nb"]
+
+
+def test_first_lines_clips_formatting():
+    from kdbot.bot import first_lines
+
+    text = "line1\nline2\nline3"
+    bold_all = SimpleNamespace(offset=0, length=len(text))
+    after_cut = SimpleNamespace(offset=12, length=5)
+    out, ents = first_lines(text, [bold_all, after_cut], 2)
+    assert out == "line1\nline2"
+    assert [(e.offset, e.length) for e in ents] == [(0, 11)]
+    assert bold_all.length == len(text)  # original untouched
+    assert first_lines("x\ny", None, 8) == ("x\ny", None)
