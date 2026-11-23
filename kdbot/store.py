@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS users (
     premium_until REAL NOT NULL DEFAULT 0,
     cooldown      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -146,3 +150,19 @@ class Store:
             (user_id, self._clock()),
         )
         return cur.rowcount > 0
+
+    # ---- settings (e.g. the texts set with /setresponse...) ----------------
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def delete_setting(self, key: str) -> bool:
+        return self.db.execute("DELETE FROM settings WHERE key = ?", (key,)).rowcount > 0
