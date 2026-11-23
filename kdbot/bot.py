@@ -4,6 +4,7 @@ import functools
 import html
 import io
 import logging
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -31,8 +32,9 @@ MESSAGE_LIMIT = 4000
 OWNER_TAG = "@anony6916"
 # When line 6 of the target bot's answer is exactly this, the "0" texts are used.
 ZERO_LINE = "• PROCESSED: 0 + 10 / 10"
-# In a /setresponse... text, replaced by line 6 of the target bot's answer.
-LINE6_TAG = "<line_6>"
+# In a /setresponse... text, <line_4>, <line_6> etc. are replaced by that line of the
+# target bot's answer.
+LINE_TAG = re.compile(r"<line_(\d+)>")
 # Admin commands that set what users see. Each text is saved per relay command,
 # under "<admin command>:<relay command>", e.g. "setresponseaft:kd".
 RESPONSE_COMMANDS = ("setresponsebef", "setresponseaft", "setresponse0bef", "setresponse0aft")
@@ -53,7 +55,7 @@ ADMIN_HELP = (
     "/setresponseaft – after the target bot edits its answer\n"
     "/setresponse0bef, /setresponse0aft – the same, when line 6 is "
     f"<code>{html.escape(ZERO_LINE)}</code>\n"
-    "&lt;line_6&gt; in your text = line 6 of the target bot's answer. "
+    "&lt;line_4&gt;, &lt;line_6&gt;… in your text = that line of the target bot's answer. "
     "Send a command with no text to reset it."
 )
 
@@ -83,7 +85,7 @@ def chunks(lines: list[str], limit: int = MESSAGE_LIMIT) -> list[str]:
 def line_of(text: str, n: int) -> str:
     """Line `n` (counting from 1) of `text`, or "" if it has fewer lines."""
     lines = text.split("\n")
-    return lines[n - 1] if len(lines) >= n else ""
+    return lines[n - 1] if 1 <= n <= len(lines) else ""
 
 
 def is_zero(text: str) -> bool:
@@ -92,8 +94,8 @@ def is_zero(text: str) -> bool:
 
 
 def render(template: str, source: str) -> str:
-    """Fill a /setresponse... text in: <line_6> becomes line 6 of the target bot's answer."""
-    return template.replace(LINE6_TAG, line_of(source, 6))
+    """Fill a /setresponse... text in: <line_N> becomes line N of the target bot's answer."""
+    return LINE_TAG.sub(lambda m: line_of(source, int(m.group(1))), template)
 
 
 def footer(username: str | None) -> str:
@@ -311,7 +313,7 @@ class BotApp:
         """What the user sees for one of the target bot's messages: (text, entities, with_media).
 
         A text set with /setresponse... for this relay command replaces the message
-        entirely (only <line_6> is taken from it). Without one, the message is shown
+        entirely (only its <line_N> lines are taken from it). Without one, it's shown
         as the target bot sent it. Edited versions always end with the footer.
         """
         source = msg.message or ""
