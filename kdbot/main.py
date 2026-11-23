@@ -24,7 +24,7 @@ async def run(cfg) -> None:
     os.makedirs(cfg.data_dir, exist_ok=True)
     bot = TelegramClient(os.path.join(cfg.data_dir, "bot"), cfg.api_id, cfg.api_hash, **net)
     store = Store(os.path.join(cfg.data_dir, "kdbot.db"))
-    relay = Relay(user, cfg.target_bot, cfg.reply_timeout, cfg.settle_seconds)
+    relay = Relay(user, cfg.target_bot, cfg.reply_timeout, cfg.settle_seconds, cfg.edit_wait)
 
     await user.connect()
     if not await user.is_user_authorized():
