@@ -4,9 +4,11 @@ import functools
 import html
 import io
 import logging
+import secrets
 import time
 from datetime import datetime, timezone
 
+from telethon import Button
 from telethon.errors import MessageNotModifiedError
 from telethon.tl.custom import Message
 
@@ -31,8 +33,11 @@ OWNER_TAG = "@anony6916"
 ZERO_LINE = "• PROCESSED: 0 + 10 / 10"
 # In a /setresponse... text, replaced by line 6 of the target bot's answer.
 LINE6_TAG = "<line_6>"
-# Admin commands that set what users see; the command name is also the settings key.
+# Admin commands that set what users see. Each text is saved per relay command,
+# under "<admin command>:<relay command>", e.g. "setresponseaft:kd".
 RESPONSE_COMMANDS = ("setresponsebef", "setresponseaft", "setresponse0bef", "setresponse0aft")
+# Callback data of the "which command?" buttons: "setresp:<token>:<relay command or *>".
+BUTTON_PREFIX = "setresp"
 
 ADMIN_HELP = (
     "<b>Admin</b>\n"
@@ -42,7 +47,8 @@ ADMIN_HELP = (
     "/users – premium users\n"
     "/removepremium &lt;user_id&gt;\n"
     "\n"
-    "<b>What users see</b> (write your text on the lines below the command)\n"
+    "<b>What users see</b> (write your text on the lines below the command; "
+    "the bot then asks which command it's for)\n"
     "/setresponsebef – the first answer\n"
     "/setresponseaft – after the target bot edits its answer\n"
     "/setresponse0bef, /setresponse0aft – the same, when line 6 is "
@@ -133,6 +139,8 @@ class BotApp:
             "removepremium": self.cmd_removepremium,
             **{name: functools.partial(self.cmd_setresponse, name) for name in RESPONSE_COMMANDS},
         }
+        # /setresponse... texts waiting for the admin to tap which command they're for.
+        self.pending: dict[str, tuple[str, str]] = {}  # token -> (admin command, text)
 
     def is_admin(self, user_id: int) -> bool:
         return user_id == self.owner_id or user_id in self.cfg.admin_ids
@@ -262,6 +270,7 @@ class BotApp:
             return await self.reply(event, f"⏳ Please wait {wait:.0f}s before the next request.")
         self.cooldown.mark(uid)
 
+        relay_cmd = command.lstrip("/").lower()  # "kd", "zz" or "ko": picks which texts are used
         username = getattr(await event.get_sender(), "username", None)
         status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
         log.info("user %s -> %r", uid, text)
@@ -277,7 +286,7 @@ class BotApp:
                 await status.delete()
             for msg in replies:
                 try:
-                    content = self.response_for(msg, is_update, username)
+                    content = self.response_for(msg, is_update, username, relay_cmd)
                     ours = shown.get(msg.id)
                     if ours is None:
                         shown[msg.id] = await self.show(event.chat_id, msg, *content, reply_to=event.id)
@@ -298,16 +307,16 @@ class BotApp:
         if not answered:
             await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
 
-    def response_for(self, msg: Message, is_update: bool, username: str | None):
+    def response_for(self, msg: Message, is_update: bool, username: str | None, relay_cmd: str):
         """What the user sees for one of the target bot's messages: (text, entities, with_media).
 
-        A text set with /setresponse... replaces the message entirely (only <line_6>
-        is taken from it). Without one, the message is shown as the target bot sent it.
-        Edited versions always end with the USER / Status / Owner footer.
+        A text set with /setresponse... for this relay command replaces the message
+        entirely (only <line_6> is taken from it). Without one, the message is shown
+        as the target bot sent it. Edited versions always end with the footer.
         """
         source = msg.message or ""
-        key = "setresponse" + ("0" if is_zero(source) else "") + ("aft" if is_update else "bef")
-        template = self.store.get_setting(key)
+        name = "setresponse" + ("0" if is_zero(source) else "") + ("aft" if is_update else "bef")
+        template = self.store.get_setting(f"{name}:{relay_cmd}")
         if template is not None:
             text, entities, with_media = render(template, source), None, False
         else:
@@ -356,18 +365,50 @@ class BotApp:
 
     # ---- admin -------------------------------------------------------------
 
-    async def cmd_setresponse(self, key: str, event, args: str) -> None:
-        """/setresponse(0)bef|aft followed by the text on the next lines, or nothing to reset."""
-        if not args:
-            self.store.delete_setting(key)
-            return await self.reply(
-                event, f"↩️ /{key} reset: users see the target bot's message as it is."
-            )
-        self.store.set_setting(key, args)
-        preview = args
-        if key.endswith("aft"):
-            preview += footer(getattr(await event.get_sender(), "username", None))
-        await self.reply(event, f"✅ Saved /{key}. Users will see:\n\n{esc(preview)}")
+    async def cmd_setresponse(self, name: str, event, args: str) -> None:
+        """/setresponse(0)bef|aft with the text on the next lines (or none, to reset).
+
+        Asks with buttons which relay command the text is for; handle_button saves it.
+        """
+        token = secrets.token_hex(4)
+        self.pending[token] = (name, args)
+        buttons = [
+            [Button.inline(f"/{c}", f"{BUTTON_PREFIX}:{token}:{c.lower()}".encode())
+             for c in self.cfg.commands],
+            [Button.inline("All commands", f"{BUTTON_PREFIX}:{token}:*".encode())],
+        ]
+        what = "text" if args else "reset"
+        await event.reply(f"Which command is this /{name} {what} for?", buttons=buttons)
+
+    async def handle_button(self, event) -> None:
+        """An admin tapped /kd, /zz, /ko or All commands under a /setresponse... question."""
+        if not self.is_admin(event.sender_id):
+            return await event.answer("Only admins can do this.", alert=True)
+        try:
+            _, token, choice = event.data.decode().split(":", 2)
+        except ValueError:
+            return await event.answer()
+        if choice != "*" and choice not in self.relay_commands:
+            return await event.answer("Unknown command.", alert=True)
+        pending = self.pending.pop(token, None)
+        if pending is None:
+            return await event.answer("This has expired, please send the command again.", alert=True)
+        name, text = pending
+        targets = [c.lower() for c in self.cfg.commands] if choice == "*" else [choice]
+        for c in targets:
+            if text:
+                self.store.set_setting(f"{name}:{c}", text)
+            else:
+                self.store.delete_setting(f"{name}:{c}")
+        commands = " ".join(f"/{c}" for c in targets)
+        if text:
+            preview = text
+            if name.endswith("aft"):
+                preview += footer(getattr(await event.get_sender(), "username", None))
+            reply = f"✅ Saved /{name} for {commands}. Users will see:\n\n{esc(preview)}"
+        else:
+            reply = f"↩️ /{name} reset for {commands}: users see the target bot's message as it is."
+        await event.edit(reply, parse_mode="html", buttons=None)
 
     async def cmd_code(self, event, args: str) -> None:
         try:
