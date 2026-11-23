@@ -22,13 +22,13 @@ class FakeMsg:
 
 
 class FakeEvent:
-    def __init__(self, uid, text, first_name="Bob"):
+    def __init__(self, uid, text, first_name="Bob", username=None):
         self.sender_id = uid
         self.raw_text = text
         self.chat_id = uid
         self.id = 7
         self.replies = []
-        self._sender = SimpleNamespace(first_name=first_name, last_name=None, username=None)
+        self._sender = SimpleNamespace(first_name=first_name, last_name=None, username=username)
 
     async def get_sender(self):
         return self._sender
@@ -43,27 +43,41 @@ class FakeEvent:
         return self.replies[-1].text
 
 
+def target_msg(text):
+    """A message from the target bot (always id 1, so an update edits the same message)."""
+    return SimpleNamespace(id=1, message=text, entities=None, media=None)
+
+
 class FakeRelay:
     busy = False
 
-    def __init__(self, update=None):
+    def __init__(self):
         self.sent = []
-        self.update = update  # text of a later edit, if any
+        self.first = "answer"  # the target bot's first answer
+        self.update = None  # its text after a later edit, if any
 
     async def ask(self, text, deliver):
         self.sent.append(text)
-        await deliver([SimpleNamespace(id=1, message="answer", entities=None, media=None)], False)
+        await deliver([target_msg(self.first)], False)
         if self.update is not None:
-            await deliver([SimpleNamespace(id=1, message=self.update, entities=None, media=None)], True)
+            await deliver([target_msg(self.update)], True)
         return True
 
 
 class FakeBot:
     def __init__(self):
-        self.sent = []
+        self.sent = []  # (chat, text) of every new message
+        self.edits = []  # (chat, message id, new text)
+        self.next_id = 500
 
     async def send_message(self, chat, text, **kw):
+        self.next_id += 1
         self.sent.append((chat, text))
+        return SimpleNamespace(id=self.next_id, text=text)
+
+    async def edit_message(self, chat, msg, text, **kw):
+        self.edits.append((chat, msg.id, text))
+        return SimpleNamespace(id=msg.id, text=text)
 
 
 @pytest.fixture
@@ -82,8 +96,8 @@ def app(tmp_path, clock):
                   bot_username="MyBot", clock=lambda: clock[0])
 
 
-async def send(app, uid, text):
-    ev = FakeEvent(uid, text)
+async def send(app, uid, text, username=None):
+    ev = FakeEvent(uid, text, username=username)
     await app.handle(ev)
     return ev
 
@@ -93,12 +107,21 @@ async def make_code(app, args="25 0", uid=OWNER):
     return re.findall(r"ANONYMOUS-[A-Za-z0-9]{11}", ev.replies[0].text)
 
 
+def footer(user):
+    return f"\n\nUSER: {user}\nStatus: Premium\nOwner: @anony6916"
+
+
+def answer_with_line6(line6):
+    return "\n".join(["l1", "l2", "l3", "l4", "l5", line6, "l7", "l8", "l9", "l10"])
+
+
 async def test_start_shows_plan_and_commands(app):
     text = (await send(app, USER, "/start")).last
     assert "Plan:</b> Free" in text
     assert "/kd\n/ko\n/zz" in text
     assert "/code" not in text  # admin help hidden from normal users
-    assert "/code" in (await send(app, OWNER, "/start")).last
+    admin_text = (await send(app, OWNER, "/start")).last
+    assert "/code" in admin_text and "/setresponse0aft" in admin_text
 
 
 async def test_code_output(app):
@@ -178,38 +201,53 @@ async def test_admin_lists(app):
     assert "needs Premium" in (await send(app, USER, "/kd x")).last
 
 
-async def test_update_only_shows_first_8_lines(app):
-    app.relay.update = "\n".join(["a", "b"] * 6)  # 12 lines
+# ---- what users see ----------------------------------------------------------
+
+async def test_edit_updates_the_same_message_with_footer(app):
+    app.relay.update = "final answer"
+    await send(app, OWNER, "/kd hi", username="alice")
+    assert app.bot.sent == [(OWNER, "answer")]  # one message only...
+    assert app.bot.edits == [(OWNER, 501, "final answer" + footer("@alice"))]  # ...edited later
+
+
+async def test_custom_texts_with_line_6(app):
+    await send(app, OWNER, "/setresponsebef\nplease wait")
+    await send(app, OWNER, "/setresponseaft\nhey, thanks for using our service\n<line_6>\nhave a good day")
+    app.relay.first = answer_with_line6("• PROCESSED: 3 + 0 / 10")
+    app.relay.update = answer_with_line6("• PROCESSED: 10 + 0 / 10")
+    await send(app, OWNER, "/kd hi")  # this user has no @username
+    assert app.bot.sent == [(OWNER, "please wait")]
+    assert app.bot.edits[-1][2] == (
+        "hey, thanks for using our service\n• PROCESSED: 10 + 0 / 10\nhave a good day"
+        + footer("Unknown")
+    )
+
+
+async def test_zero_texts_when_nothing_was_processed(app):
+    await send(app, OWNER, "/setresponse0bef\nstarting…")
+    await send(app, OWNER, "/setresponse0aft\nfailed: <line_6>")
+    await send(app, OWNER, "/setresponseaft\nnot used here")
+    app.relay.first = answer_with_line6("• PROCESSED: 0 + 10 / 10")
+    app.relay.update = answer_with_line6("• PROCESSED: 0 + 10 / 10")
+    await send(app, OWNER, "/kd hi", username="bob")
+    assert app.bot.sent == [(OWNER, "starting…")]
+    assert app.bot.edits[-1][2] == "failed: • PROCESSED: 0 + 10 / 10" + footer("@bob")
+
+
+async def test_setresponse_is_admin_only_and_can_be_reset(app):
+    assert (await send(app, USER, "/setresponseaft\nhi")).replies == []
+    assert app.store.get_setting("setresponseaft") is None
+    assert "Saved" in (await send(app, OWNER, "/setresponseaft\nhi\n<line_6>")).last
+    assert app.store.get_setting("setresponseaft") == "hi\n<line_6>"
+    assert "reset" in (await send(app, OWNER, "/setresponseaft")).last
+    assert app.store.get_setting("setresponseaft") is None
+
+
+async def test_sends_new_message_if_edit_fails(app):
+    async def broken_edit(*args, **kw):
+        raise RuntimeError("can't edit")
+
+    app.bot.edit_message = broken_edit
+    app.relay.update = "final"
     await send(app, OWNER, "/kd hi")
-    texts = [t for _, t in app.bot.sent]
-    assert texts == ["answer", "a\nb\na\nb\na\nb\na\nb"]
-
-
-def test_first_lines_clips_formatting():
-    from kdbot.bot import first_lines
-
-    text = "line1\nline2\nline3"
-    bold_all = SimpleNamespace(offset=0, length=len(text))
-    after_cut = SimpleNamespace(offset=12, length=5)
-    out, ents = first_lines(text, [bold_all, after_cut], 2)
-    assert out == "line1\nline2"
-    assert [(e.offset, e.length) for e in ents] == [(0, 11)]
-    assert bold_all.length == len(text)  # original untouched
-    assert first_lines("x\ny", None, 8) == ("x\ny", None)
-
-
-async def test_update_adds_retry_note(app):
-    from kdbot.bot import RETRY_NOTE
-
-    lines = ["l1", "l2", "l3", "l4", "l5", "• PROCESSED: 0 + 10 / 10", "l7", "l8", "l9", "l10"]
-    app.relay.update = "\n".join(lines)
-    await send(app, OWNER, "/kd hi")
-    assert app.bot.sent[-1][1].split("\n") == lines[:8] + [RETRY_NOTE]
-
-
-def test_retry_note_only_for_exact_line():
-    from kdbot.bot import add_retry_note
-
-    other = "1\n2\n3\n4\n5\n• PROCESSED: 3 + 7 / 10\n7\n8"
-    assert add_retry_note(other) == other
-    assert add_retry_note("short") == "short"
+    assert [t for _, t in app.bot.sent] == ["answer", "final" + footer("Unknown")]
