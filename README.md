@@ -1,11 +1,14 @@
 # Telegram-Claude
 
-A Telegram bot that relays `/kd` requests through your own account:
+A Telegram bot that relays `/kd`, `/zz` and `/ko` messages through your own account
+to [@KageNoKoroshiBot](https://t.me/KageNoKoroshiBot):
 
 ```
-User ──/kd xxxx──▶ @YourBot ──▶ your account sends "<template with xxxx>" to @TargetBot
-User ◀── @YourBot sends back @TargetBot's answer ◀────────────────────┘
+User ──/kd anything──▶ @YourBot ──▶ your account sends "/kd anything" to @KageNoKoroshiBot
+User ◀── @YourBot sends back @KageNoKoroshiBot's answer ◀──────────────────┘
 ```
+
+The message is passed on exactly as the user typed it (command and text).
 
 Anyone can use your bot, but the target bot only ever sees **your account**.
 The answer (text, formatting, photos, files) is copied back to whoever asked.
@@ -21,7 +24,7 @@ edits are handled: the bot waits until the target goes quiet and sends the final
    ```bash
    python3 -m venv .venv
    .venv/bin/pip install -r requirements.txt
-   cp .env.example .env      # then fill in API_ID, API_HASH, BOT_TOKEN, TARGET_BOT, MESSAGE_TEMPLATE
+   cp .env.example .env      # then fill in API_ID, API_HASH, BOT_TOKEN
    ```
 4. **Log in with your account** (once, on your own computer; it asks for your phone and the code Telegram sends you):
    ```bash
@@ -37,9 +40,8 @@ edits are handled: the bot waits until the target goes quiet and sends the final
 
 | Setting | Meaning |
 |---|---|
-| `TARGET_BOT` | Username of the bot your account messages, e.g. `@some_bot` |
-| `MESSAGE_TEMPLATE` | What your account sends; `{arg}` becomes the user's value. Default `/kd {arg}` |
-| `ARG_PATTERN` | Which values are accepted after `/kd` (regex). Default: letters, digits, `_ . -`, up to 64 |
+| `TARGET_BOT` | Bot your account messages (default `@KageNoKoroshiBot`) |
+| `COMMANDS` | Commands passed through, comma-separated (default `kd,zz,ko`) |
 | `ALLOWED_USERS` | Comma-separated user IDs allowed to use the bot; empty means everyone |
 | `COOLDOWN_SECONDS` | Wait time per user between requests (default 20) |
 | `REPLY_TIMEOUT` | Max seconds to wait for the target bot (default 30) |

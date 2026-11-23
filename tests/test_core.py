@@ -1,29 +1,28 @@
-import re
+from kdbot.core import Cooldown, command_pattern, to_target_text
 
-from kdbot.core import Cooldown, is_valid_arg, parse_command, render_message
-
-
-def test_parse_command():
-    assert parse_command("/kd 1234") == "1234"
-    assert parse_command("/kd@MyBot  abc ") == "abc"
-    assert parse_command("/KD x") == "x"
-    assert parse_command("/kd") == ""
-    assert parse_command("/kdx 1") is None
-    assert parse_command("hello") is None
+PAT = command_pattern(("kd", "zz", "ko"))
 
 
-def test_render_message():
-    assert render_message("/kd {arg}", "42") == "/kd 42"
-    assert render_message("Check {arg} please {arg}", "a") == "Check a please a"
-    assert render_message("braces {} ok {arg}", "1") == "braces {} ok 1"
+def test_passes_message_through_as_is():
+    assert to_target_text("/kd hello world", PAT) == "/kd hello world"
+    assert to_target_text("/zz Any Text 123 !?", PAT) == "/zz Any Text 123 !?"
+    assert to_target_text("/ko line one\nline two", PAT) == "/ko line one\nline two"
+    assert to_target_text("/kd   spaced  ", PAT) == "/kd   spaced  "
 
 
-def test_is_valid_arg():
-    pat = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-    assert is_valid_arg("abc-12.3", pat)
-    assert not is_valid_arg("", pat)
-    assert not is_valid_arg("a b", pat)
-    assert not is_valid_arg("x" * 65, pat)
+def test_strips_own_bot_username():
+    assert to_target_text("/kd@MyRelayBot hello", PAT) == "/kd hello"
+
+
+def test_bare_command():
+    assert to_target_text("/zz", PAT) == "/zz"
+
+
+def test_other_messages_ignored():
+    assert to_target_text("/kdx hello", PAT) is None
+    assert to_target_text("/start", PAT) is None
+    assert to_target_text("hello /kd x", PAT) is None
+    assert to_target_text("kd hello", PAT) is None
 
 
 def test_cooldown():

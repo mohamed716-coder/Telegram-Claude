@@ -9,12 +9,11 @@ from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
 from .config import load_config
-from .core import Cooldown, is_valid_arg, parse_command, render_message
+from .core import Cooldown, command_pattern, to_target_text
 from .relay import Relay
 
 log = logging.getLogger("kdbot")
 
-USAGE = "Usage: /kd <value>\nExample: /kd 12345"
 CAPTION_LIMIT = 1024
 
 
@@ -45,32 +44,32 @@ async def run(cfg) -> None:
     bot = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
     relay = Relay(user, cfg.target_bot, cfg.reply_timeout, cfg.settle_seconds)
     cooldown = Cooldown(cfg.cooldown_seconds)
+    pattern = command_pattern(cfg.commands)
+    usage = "Send " + ", ".join(f"/{c}" for c in cfg.commands) + " followed by your message."
 
     @bot.on(events.NewMessage(pattern=r"(?i)^/(start|help)\b"))
     async def help_cmd(event):
-        await event.reply(USAGE)
+        await event.reply(usage)
 
-    @bot.on(events.NewMessage(pattern=r"(?i)^/kd\b"))
-    async def kd_cmd(event):
-        arg = parse_command(event.raw_text)
-        if arg is None:
+    @bot.on(events.NewMessage(pattern=pattern))
+    async def relay_cmd(event):
+        text = to_target_text(event.raw_text, pattern)
+        if text is None:
             return
         uid = event.sender_id
         if cfg.allowed_users and uid not in cfg.allowed_users:
             return await event.reply("Sorry, you are not allowed to use this bot.")
-        if not arg:
-            return await event.reply(USAGE)
-        if not is_valid_arg(arg, cfg.arg_pattern):
-            return await event.reply("That value is not valid.")
+        if not text.split(maxsplit=1)[1:]:
+            return await event.reply(usage)
         wait = cooldown.remaining(uid)
         if wait:
             return await event.reply(f"Please wait {wait:.0f}s before the next request.")
         cooldown.mark(uid)
 
         status = await event.reply("In queue…" if relay.busy else "Working on it…")
-        log.info("user %s -> %r", uid, arg)
+        log.info("user %s -> %r", uid, text)
         try:
-            replies = await relay.ask(render_message(cfg.message_template, arg))
+            replies = await relay.ask(text)
         except Exception:
             log.exception("relay failed")
             return await status.edit("Something went wrong, please try again later.")

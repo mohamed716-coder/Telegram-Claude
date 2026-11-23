@@ -1,7 +1,6 @@
 """Settings, read from environment variables (or a .env file)."""
 
 import os
-import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -14,8 +13,7 @@ class Config:
     bot_token: str
     session_string: str
     target_bot: str
-    message_template: str
-    arg_pattern: re.Pattern
+    commands: tuple[str, ...]
     allowed_users: frozenset[int]
     cooldown_seconds: float
     reply_timeout: float
@@ -37,9 +35,10 @@ def load_config() -> Config:
         api_hash=_required("API_HASH"),
         bot_token=_required("BOT_TOKEN"),
         session_string=_required("SESSION_STRING"),
-        target_bot=_required("TARGET_BOT"),
-        message_template=os.environ.get("MESSAGE_TEMPLATE", "/kd {arg}"),
-        arg_pattern=re.compile(os.environ.get("ARG_PATTERN", r"[A-Za-z0-9_.-]{1,64}")),
+        target_bot=os.environ.get("TARGET_BOT", "").strip() or "@KageNoKoroshiBot",
+        commands=tuple(
+            c.strip().lstrip("/") for c in os.environ.get("COMMANDS", "kd,zz,ko").split(",") if c.strip()
+        ),
         allowed_users=frozenset(int(x) for x in allowed.replace(" ", "").split(",") if x),
         cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "20")),
         reply_timeout=float(os.environ.get("REPLY_TIMEOUT", "30")),
