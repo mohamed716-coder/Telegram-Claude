@@ -40,8 +40,38 @@ Anyone can use your bot, but the target bot only ever sees **your account**.
 The answer (text, formatting, photos, files) is copied back to whoever asked.
 Multi-message answers and "please wait…" messages that the target bot later
 edits are handled: the bot waits until the target goes quiet and sends the answer.
-If the target bot edits its answer later (within `EDIT_WAIT` seconds), the edited
-version is sent too, showing only its first `UPDATE_MAX_LINES` lines.
+If the target bot edits its answer later (within `EDIT_WAIT` seconds), the user's
+message is edited too, and ends with a footer:
+
+```
+
+USER: @their_username   (or Unknown)
+Status: Premium
+Owner: @anony6916
+```
+
+## What users see (`/setresponse…`)
+
+Admins can replace the target bot's message with their own text. Write the text on
+the lines below the command, in the same message:
+
+```
+/setresponseaft
+hey, thanks for using our service
+<line_6>
+have a good day
+```
+
+| Command | Used for |
+|---|---|
+| `/setresponsebef` | The target bot's first answer |
+| `/setresponseaft` | After the target bot edits its answer (footer added) |
+| `/setresponse0bef` | First answer, when line 6 is `• PROCESSED: 0 + 10 / 10` |
+| `/setresponse0aft` | After the edit, when line 6 is `• PROCESSED: 0 + 10 / 10` (footer added) |
+
+- `<line_6>` is replaced by line 6 of the target bot's message; nothing else from it is shown.
+- The text is shown exactly as written. It is saved in `data/kdbot.db`, so it survives restarts.
+- Send the command with no text to reset it: the target bot's message is then shown as it is.
 
 ## Run it 24/7 on a server
 
@@ -78,8 +108,7 @@ See **[DEPLOY.md](DEPLOY.md)**: on an Ubuntu/Debian server it's `git clone …` 
 | `CODE_PREFIX` | Start of generated codes (default `ANONYMOUS`) |
 | `REPLY_TIMEOUT` | Max seconds to wait for the target bot (default 30) |
 | `SETTLE_SECONDS` | Answer counts as finished after this many quiet seconds (default 3) |
-| `EDIT_WAIT` | After answering, keep watching this many seconds for the target bot to edit its answer and send the edited version too; other users wait in the queue meanwhile (default 20, 0 = off) |
-| `UPDATE_MAX_LINES` | Edited versions only show their first this many lines (default 8, 0 = whole message) |
+| `EDIT_WAIT` | After answering, keep watching this many seconds for the target bot to edit its answer and update the user's message too; other users wait in the queue meanwhile (default 20, 0 = off) |
 
 Requests are handled one at a time, so two users' answers never get mixed up;
 extra requests wait in a queue.
