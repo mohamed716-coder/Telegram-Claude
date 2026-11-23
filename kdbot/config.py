@@ -18,6 +18,7 @@ class Config:
     cooldown_seconds: float
     reply_timeout: float
     settle_seconds: float
+    data_dir: str
 
 
 def _required(name: str) -> str:
@@ -43,4 +44,5 @@ def load_config() -> Config:
         cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "20")),
         reply_timeout=float(os.environ.get("REPLY_TIMEOUT", "30")),
         settle_seconds=float(os.environ.get("SETTLE_SECONDS", "3")),
+        data_dir=os.environ.get("DATA_DIR", "data"),
     )

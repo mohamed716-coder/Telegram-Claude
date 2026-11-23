@@ -77,3 +77,22 @@ async def test_requests_do_not_mix():
     a, b = await asyncio.gather(relay.ask("/kd A"), relay.ask("/kd B"))
     assert [m.text for m in a] == ["answer for /kd A"]
     assert [m.text for m in b] == ["answer for /kd B"]
+
+
+async def test_exits_when_either_client_disconnects():
+    from kdbot.main import run_until_either_disconnects
+
+    class Conn:
+        def __init__(self, lifetime):
+            self.lifetime = lifetime
+            self.disconnected = False
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(self.lifetime)
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    short, forever = Conn(0.05), Conn(3600)
+    await asyncio.wait_for(run_until_either_disconnects(short, forever), 2)
+    assert short.disconnected and forever.disconnected

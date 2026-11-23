@@ -3,6 +3,8 @@
 import asyncio
 import io
 import logging
+import os
+import sys
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -40,8 +42,12 @@ async def forward_reply(bot: TelegramClient, user: TelegramClient, chat, msg: Me
 
 
 async def run(cfg) -> None:
-    user = TelegramClient(StringSession(cfg.session_string), cfg.api_id, cfg.api_hash)
-    bot = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+    # Retry connections forever, so short network problems never stop the bot.
+    net = dict(connection_retries=None, retry_delay=5, auto_reconnect=True)
+    user = TelegramClient(StringSession(cfg.session_string), cfg.api_id, cfg.api_hash, **net)
+    # The bot's login is kept on disk so restarts don't log in again every time.
+    os.makedirs(cfg.data_dir, exist_ok=True)
+    bot = TelegramClient(os.path.join(cfg.data_dir, "bot"), cfg.api_id, cfg.api_hash, **net)
     relay = Relay(user, cfg.target_bot, cfg.reply_timeout, cfg.settle_seconds)
     cooldown = Cooldown(cfg.cooldown_seconds)
     pattern = command_pattern(cfg.commands)
@@ -89,14 +95,29 @@ async def run(cfg) -> None:
     await bot.start(bot_token=cfg.bot_token)
     me = await user.get_me()
     log.info("Running. Relaying as %s to %s", me.username or me.id, cfg.target_bot)
+    await run_until_either_disconnects(user, bot)
+    # Getting here means a connection was lost for good; exit with an error so
+    # Docker/systemd restarts the bot from scratch.
+    raise SystemExit("Lost connection to Telegram; exiting so the bot gets restarted.")
+
+
+async def run_until_either_disconnects(*clients) -> None:
+    tasks = [asyncio.ensure_future(c.run_until_disconnected()) for c in clients]
     try:
-        await bot.run_until_disconnected()
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        await user.disconnect()
+        for task in tasks:
+            task.cancel()
+        for client in clients:
+            await client.disconnect()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
     asyncio.run(run(load_config()))
 
 

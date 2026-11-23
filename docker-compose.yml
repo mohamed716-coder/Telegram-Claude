@@ -1,0 +1,16 @@
+services:
+  kdbot:
+    build: .
+    env_file: .env
+    # Start again after a crash, and when the server reboots
+    restart: unless-stopped
+    volumes:
+      - kdbot-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kdbot-data:

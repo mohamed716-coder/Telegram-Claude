@@ -15,7 +15,11 @@ The answer (text, formatting, photos, files) is copied back to whoever asked.
 Multi-message answers and "please wait…" messages that the target bot later
 edits are handled: the bot waits until the target goes quiet and sends the final version.
 
-## Setup
+## Run it 24/7 on a server
+
+See **[DEPLOY.md](DEPLOY.md)** for step-by-step instructions (Docker on a small VPS).
+
+## Run it on your own computer
 
 1. **Create your bot**: message [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
 2. **Get API keys for your account**: log in at <https://my.telegram.org>, open
