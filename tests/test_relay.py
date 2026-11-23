@@ -34,37 +34,72 @@ class FakeClient:
             await cb(SimpleNamespace(message=SimpleNamespace(id=msg_id, text=text)))
 
 
+async def ask(relay, text):
+    """Run relay.ask and record every delivery as ("first"|"update", [texts])."""
+    got = []
+
+    async def deliver(msgs, is_update):
+        got.append(("update" if is_update else "first", [m.text for m in msgs]))
+
+    ok = await relay.ask(text, deliver)
+    return ok, got
+
+
 async def test_single_reply():
     async def script(c, sent):
         await asyncio.sleep(0.05)
         await c.emit(sent.id + 1, "answer for " + sent.text)
 
-    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1)
-    replies = await relay.ask("/kd 1")
-    assert [m.text for m in replies] == ["answer for /kd 1"]
+    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1, edit_wait=0.2)
+    assert await ask(relay, "/kd 1") == (True, [("first", ["answer for /kd 1"])])
 
 
-async def test_multiple_messages_and_edits():
+async def test_multiple_messages_and_quick_edits():
     async def script(c, sent):
         await c.emit(sent.id - 5, "old message edited - ignored")
         await asyncio.sleep(0.05)
         await c.emit(sent.id + 1, "please wait...")
         await asyncio.sleep(0.05)
-        await c.emit(sent.id + 1, "result: OK")  # edit
+        await c.emit(sent.id + 1, "result: OK")  # edit before the answer settled
         await c.emit(sent.id + 2, "second part")
 
-    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1)
-    replies = await relay.ask("/kd 1")
-    assert [m.text for m in replies] == ["result: OK", "second part"]
+    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1, edit_wait=0.2)
+    assert await ask(relay, "/kd 1") == (True, [("first", ["result: OK", "second part"])])
 
 
-async def test_timeout_returns_empty():
+async def test_late_edit_is_sent_as_update():
+    async def script(c, sent):
+        await asyncio.sleep(0.05)
+        await c.emit(sent.id + 1, "please wait...")
+        await asyncio.sleep(0.3)  # longer than settle: first version is sent already
+        await c.emit(sent.id + 1, "final result")
+        await asyncio.sleep(0.05)
+        await c.emit(sent.id + 1, "final result")  # no visible change - not re-sent
+
+    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1, edit_wait=1)
+    assert await ask(relay, "/kd 1") == (
+        True, [("first", ["please wait..."]), ("update", ["final result"])]
+    )
+
+
+async def test_no_updates_when_edit_wait_off():
+    async def script(c, sent):
+        await asyncio.sleep(0.05)
+        await c.emit(sent.id + 1, "please wait...")
+        await asyncio.sleep(0.3)
+        await c.emit(sent.id + 1, "final result")
+
+    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1, edit_wait=0)
+    assert await ask(relay, "/kd 1") == (True, [("first", ["please wait..."])])
+
+
+async def test_timeout_returns_false():
     async def script(c, sent):
         pass
 
     client = FakeClient(script)
-    relay = Relay(client, "@t", timeout=0.2, settle=0.1)
-    assert await relay.ask("/kd 1") == []
+    relay = Relay(client, "@t", timeout=0.2, settle=0.1, edit_wait=0.2)
+    assert await ask(relay, "/kd 1") == (False, [])
     assert client.handlers == []  # cleaned up
 
 
@@ -73,10 +108,26 @@ async def test_requests_do_not_mix():
         await asyncio.sleep(0.05)
         await c.emit(sent.id + 1, "answer for " + sent.text)
 
-    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1)
-    a, b = await asyncio.gather(relay.ask("/kd A"), relay.ask("/kd B"))
-    assert [m.text for m in a] == ["answer for /kd A"]
-    assert [m.text for m in b] == ["answer for /kd B"]
+    relay = Relay(FakeClient(script), "@t", timeout=2, settle=0.1, edit_wait=0.2)
+    a, b = await asyncio.gather(ask(relay, "/kd A"), ask(relay, "/kd B"))
+    assert a == (True, [("first", ["answer for /kd A"])])
+    assert b == (True, [("first", ["answer for /kd B"])])
+
+
+async def test_late_edits_go_to_the_right_user():
+    """Two users at once; the target bot edits each answer later. Each user only gets their own."""
+    async def script(c, sent):
+        await asyncio.sleep(0.05)
+        await c.emit(sent.id + 1, "wait " + sent.text)
+        await asyncio.sleep(0.3)
+        await c.emit(sent.id + 1, "done " + sent.text)
+
+    client = FakeClient(script)
+    relay = Relay(client, "@t", timeout=2, settle=0.1, edit_wait=0.6)
+    a, b = await asyncio.gather(ask(relay, "/kd A"), ask(relay, "/kd B"))
+    assert a == (True, [("first", ["wait /kd A"]), ("update", ["done /kd A"])])
+    assert b == (True, [("first", ["wait /kd B"]), ("update", ["done /kd B"])])
+    assert client.sent == ["/kd A", "/kd B"]  # B only sent after A was finished
 
 
 async def test_exits_when_either_client_disconnects():
