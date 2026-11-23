@@ -24,6 +24,13 @@ log = logging.getLogger("kdbot")
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4000
 
+# If line 6 of an edited answer is exactly RETRY_LINE, RETRY_NOTE is added as an extra line.
+RETRY_LINE = "• PROCESSED: 0 + 10 / 10"
+RETRY_NOTE = (
+    "Please Retry or use another command , if you see this message after retrying,"
+    " this process can't be done"
+)
+
 ADMIN_HELP = (
     "<b>Admin</b>\n"
     "/code &lt;days&gt; &lt;antispam_seconds&gt; [count]\n"
@@ -76,6 +83,14 @@ def first_lines(text: str, entities, max_lines: int):
         e.length = min(e.offset + e.length, cut) - e.offset
         kept.append(e)
     return text, kept or None
+
+
+def add_retry_note(text: str) -> str:
+    """Add RETRY_NOTE as a new last line when line 6 is exactly RETRY_LINE."""
+    lines = text.split("\n")
+    if len(lines) >= 6 and lines[5].strip() == RETRY_LINE:
+        return f"{text}\n{RETRY_NOTE}"
+    return text
 
 
 def display_name(sender) -> str:
@@ -276,11 +291,13 @@ class BotApp:
     async def forward_reply(self, chat, msg: Message, reply_to, max_lines: int | None = None) -> None:
         """Re-send one of the target bot's messages to the user, through our bot.
 
-        With `max_lines`, only the first that many lines of the text are sent.
+        With `max_lines` (used for edited answers), only the first that many lines
+        of the text are sent, plus RETRY_NOTE when line 6 is RETRY_LINE.
         """
         text, entities = msg.message or "", msg.entities
         if max_lines:
             text, entities = first_lines(text, entities, max_lines)
+            text = add_retry_note(text)
         if msg.media and msg.file and not msg.web_preview:
             data = io.BytesIO(await self.user.download_media(msg, file=bytes))
             data.name = msg.file.name or f"file{msg.file.ext or ''}"
