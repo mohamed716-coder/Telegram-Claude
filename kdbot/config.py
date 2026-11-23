@@ -19,7 +19,6 @@ class Config:
     reply_timeout: float
     settle_seconds: float
     edit_wait: float
-    update_max_lines: int
     data_dir: str
 
 
@@ -67,6 +66,5 @@ def load_config() -> Config:
         reply_timeout=float(os.environ.get("REPLY_TIMEOUT", "30")),
         settle_seconds=float(os.environ.get("SETTLE_SECONDS", "3")),
         edit_wait=float(os.environ.get("EDIT_WAIT", "20")),
-        update_max_lines=int(os.environ.get("UPDATE_MAX_LINES", "8")),
         data_dir=data_dir,
     )
