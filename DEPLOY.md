@@ -113,7 +113,10 @@ docker compose logs -f
 You should see `Running. Relaying as <your username> to @KageNoKoroshiBot`.
 Press **Ctrl+C** to stop watching the logs; the bot keeps running.
 
-Now open your bot in Telegram and try `/kd hello`.
+Now open your bot in Telegram and press **Start**. Because you logged in with
+your account in step 9, you are the admin: you'll see the admin commands, and
+you can try `/kd hello` right away. Generate a code for someone with
+`/code 25 0` and they activate it with `/redeem <code>`.
 
 You can close the terminal: the bot stays up 24/7, including after server reboots.
 
@@ -142,5 +145,7 @@ Run these inside the `Telegram-Claude` folder on the server
 - **If your account gets logged out** (for example you ended the session in
   Telegram → Settings → Devices), the logs say `SESSION_STRING is invalid or expired`.
   Repeat step 9, then `docker compose up -d --force-recreate`.
-- **Keep the cooldown on** (`COOLDOWN_SECONDS` in `.env`) so your account never
-  sends too many messages too fast.
+- **Use anti-spam on codes you give out** (e.g. `/code 30 20`) so your account
+  never sends too many messages too fast.
+- **Back up your codes and users** now and then:
+  `docker compose cp kdbot:/app/data/kdbot.db ./kdbot-backup.db`

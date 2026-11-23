@@ -14,8 +14,8 @@ class Config:
     session_string: str
     target_bot: str
     commands: tuple[str, ...]
-    allowed_users: frozenset[int]
-    cooldown_seconds: float
+    admin_ids: frozenset[int]
+    code_prefix: str
     reply_timeout: float
     settle_seconds: float
     data_dir: str
@@ -30,7 +30,7 @@ def _required(name: str) -> str:
 
 def load_config() -> Config:
     load_dotenv()
-    allowed = os.environ.get("ALLOWED_USERS", "")
+    admins = os.environ.get("ADMIN_IDS", "")
     return Config(
         api_id=int(_required("API_ID")),
         api_hash=_required("API_HASH"),
@@ -40,8 +40,8 @@ def load_config() -> Config:
         commands=tuple(
             c.strip().lstrip("/") for c in os.environ.get("COMMANDS", "kd,zz,ko").split(",") if c.strip()
         ),
-        allowed_users=frozenset(int(x) for x in allowed.replace(" ", "").split(",") if x),
-        cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "20")),
+        admin_ids=frozenset(int(x) for x in admins.replace(" ", "").split(",") if x),
+        code_prefix=os.environ.get("CODE_PREFIX", "ANONYMOUS").strip(),
         reply_timeout=float(os.environ.get("REPLY_TIMEOUT", "30")),
         settle_seconds=float(os.environ.get("SETTLE_SECONDS", "3")),
         data_dir=os.environ.get("DATA_DIR", "data"),

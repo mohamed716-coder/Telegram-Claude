@@ -10,6 +10,32 @@ User ◀── @YourBot sends back @KageNoKoroshiBot's answer ◀─────
 
 The message is passed on exactly as the user typed it (command and text).
 
+## Plans and codes
+
+Only **Premium** users (and admins) can use `/kd`, `/ko` and `/zz`. Premium is
+activated with single-use codes that admins generate.
+
+| Command | Who | What it does |
+|---|---|---|
+| `/start` | everyone | Welcome screen with your plan and the commands |
+| `/status` | everyone | Your plan, Premium time left and expiry date |
+| `/redeem <code>` | everyone | Activate a code (days are added on top of any time you still have) |
+| `/kd` `/ko` `/zz` `<message>` | Premium | Sent to @KageNoKoroshiBot; its answer comes back to you |
+| `/code <days> <antispam_seconds> [count]` | admin | Generate code(s), e.g. `/code 25 0` → `ANONYMOUS-81ja5j9H5R4` |
+| `/codes` | admin | List unused codes |
+| `/delcode <code>` | admin | Delete an unused code |
+| `/users` | admin | List Premium users with time left |
+| `/removepremium <user_id>` | admin | Take Premium away from a user |
+
+- **Admins**: the account you logged in with (`SESSION_STRING`) is always admin;
+  add more with `ADMIN_IDS`. Admins have no limits.
+- **Anti-spam**: the seconds from the code a user redeemed is how long they must
+  wait between requests (`0` = no wait). Redeeming a newer code replaces it.
+- **Notifications**: admins get a message whenever someone redeems a code
+  (open your bot and press Start once so it's allowed to message you).
+- Codes and users are stored in `data/kdbot.db` (a Docker volume on the server),
+  so they survive restarts and updates.
+
 Anyone can use your bot, but the target bot only ever sees **your account**.
 The answer (text, formatting, photos, files) is copied back to whoever asked.
 Multi-message answers and "please wait…" messages that the target bot later
@@ -46,8 +72,8 @@ See **[DEPLOY.md](DEPLOY.md)** for step-by-step instructions (Docker on a small 
 |---|---|
 | `TARGET_BOT` | Bot your account messages (default `@KageNoKoroshiBot`) |
 | `COMMANDS` | Commands passed through, comma-separated (default `kd,zz,ko`) |
-| `ALLOWED_USERS` | Comma-separated user IDs allowed to use the bot; empty means everyone |
-| `COOLDOWN_SECONDS` | Wait time per user between requests (default 20) |
+| `ADMIN_IDS` | Extra admin user IDs, comma-separated (your own account is always admin) |
+| `CODE_PREFIX` | Start of generated codes (default `ANONYMOUS`) |
 | `REPLY_TIMEOUT` | Max seconds to wait for the target bot (default 30) |
 | `SETTLE_SECONDS` | Answer counts as finished after this many quiet seconds (default 3) |
 
@@ -58,8 +84,8 @@ extra requests wait in a queue.
 
 - `SESSION_STRING` gives **full access to your Telegram account**. Never share it
   or commit it; `.env` is already in `.gitignore`.
-- Keep the volume low and the cooldown on: many automated messages from a
-  personal account can get it limited by Telegram.
+- Keep the volume low: many automated messages from a personal account can get
+  it limited by Telegram. Use a non-zero anti-spam value on codes you give out.
 
 ## Tests
 

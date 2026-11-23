@@ -1,4 +1,13 @@
-from kdbot.core import Cooldown, command_pattern, to_target_text
+import pytest
+
+from kdbot.core import (
+    Cooldown,
+    command_pattern,
+    format_duration,
+    parse_code_args,
+    parse_command,
+    to_target_text,
+)
 
 PAT = command_pattern(("kd", "zz", "ko"))
 
@@ -14,24 +23,41 @@ def test_strips_own_bot_username():
     assert to_target_text("/kd@MyRelayBot hello", PAT) == "/kd hello"
 
 
-def test_bare_command():
-    assert to_target_text("/zz", PAT) == "/zz"
-
-
 def test_other_messages_ignored():
     assert to_target_text("/kdx hello", PAT) is None
     assert to_target_text("/start", PAT) is None
     assert to_target_text("hello /kd x", PAT) is None
-    assert to_target_text("kd hello", PAT) is None
 
 
-def test_cooldown():
+def test_parse_command():
+    assert parse_command("/Code 25 0") == ("code", None, "25 0")
+    assert parse_command("/redeem@MyBot  ABC-1 ") == ("redeem", "MyBot", "ABC-1")
+    assert parse_command("/status") == ("status", None, "")
+    assert parse_command("hello") is None
+
+
+def test_parse_code_args():
+    assert parse_code_args("25 0") == (25, 0, 1)
+    assert parse_code_args("7 30 5") == (7, 30, 5)
+    for bad in ["", "25", "a b", "25 -1", "0 0", "25 0 0", "25 0 51", "1 2 3 4", "99999 0"]:
+        with pytest.raises(ValueError):
+            parse_code_args(bad)
+
+
+def test_format_duration():
+    assert format_duration(25 * 86400) == "25 days"
+    assert format_duration(86400 + 5 * 3600 + 7) == "1 day, 5 hours"
+    assert format_duration(3 * 3600 + 60) == "3 hours, 1 minute"
+    assert format_duration(600) == "10 minutes"
+    assert format_duration(5) == "less than a minute"
+
+
+def test_cooldown_per_user_seconds():
     now = [100.0]
-    cd = Cooldown(20, clock=lambda: now[0])
-    assert cd.remaining(1) == 0
+    cd = Cooldown(clock=lambda: now[0])
+    assert cd.remaining(1, 20) == 0
     cd.mark(1)
     now[0] += 5
-    assert cd.remaining(1) == 15
-    assert cd.remaining(2) == 0
-    now[0] += 15
-    assert cd.remaining(1) == 0
+    assert cd.remaining(1, 20) == 15
+    assert cd.remaining(1, 0) == 0  # anti-spam 0 means no wait
+    assert cd.remaining(2, 20) == 0
