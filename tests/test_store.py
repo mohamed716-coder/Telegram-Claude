@@ -79,6 +79,16 @@ def test_users_and_remove(store):
     assert store.premium(42) is None
 
 
+def test_settings(store):
+    assert store.get_setting("setresponseaft") is None
+    store.set_setting("setresponseaft", "a\n<line_6>")
+    store.set_setting("setresponseaft", "new text")
+    assert store.get_setting("setresponseaft") == "new text"
+    assert store.delete_setting("setresponseaft")
+    assert not store.delete_setting("setresponseaft")
+    assert store.get_setting("setresponseaft") is None
+
+
 def test_persists_across_restarts(tmp_path, clock):
     path = str(tmp_path / "p.db")
     s1 = Store(path, clock=lambda: clock[0])
