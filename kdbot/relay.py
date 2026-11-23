@@ -27,7 +27,9 @@ class Relay:
         self.timeout = timeout  # max seconds to wait for the first answer
         self.settle = settle  # an answer/edit is complete once the target bot is quiet this long
         self.edit_wait = edit_wait  # after answering, keep watching for edits this long
-        self._lock = asyncio.Lock()  # one request at a time, so answers never get mixed up
+        # Only one request may be waiting for its *first* answer at a time, so a new
+        # message from the target bot can only belong to that request.
+        self._lock = asyncio.Lock()
         self._entity = None
 
     @property
@@ -37,78 +39,95 @@ class Relay:
     async def ask(self, text: str, deliver: Deliver) -> bool:
         """Send `text` to the target bot and pass its answer to `deliver`.
 
-        Bots often answer with several messages, or send "please wait" and edit
-        it later. We collect messages until the bot is quiet for `settle` seconds
-        and deliver them. Then, for `edit_wait` seconds, every edit (or extra
-        message) is delivered again as an update.
-
-        The lock is held the whole time, including the edit window, so the next
-        user's request is only sent once this one is finished and nothing from the
-        target bot can end up with the wrong user.
+        1. While holding the lock, send the message and collect the target bot's
+           reply messages until it is quiet for `settle` seconds. Holding the lock
+           here means every new message belongs to this request.
+        2. Release the lock (the next user's request can start right away) and
+           deliver the answer.
+        3. For `edit_wait` seconds, watch for edits to *this answer's message IDs
+           only* and deliver each edited version. Other requests' messages have
+           other IDs, so edits can never reach the wrong user.
 
         Returns False if the target bot did not answer within `timeout`.
         """
-        async with self._lock:
-            if self._entity is None:
-                self._entity = await self.client.get_input_entity(self.target)
+        replies: dict[int, Message] = {}
+        changed: set[int] = set()  # ids updated since the last delivery
+        activity = asyncio.Event()
+        # Which of the target bot's messages this request listens to: before the
+        # answer, anything newer than our own message; after it, only its own IDs.
+        scope: dict[str, object] = {"after": None, "own": None}
 
-            replies: dict[int, Message] = {}
-            changed: set[int] = set()  # ids updated since the last delivery
-            activity = asyncio.Event()
+        async def on_update(event):
+            mid = event.message.id
+            own = scope["own"]
+            if own is not None:
+                if mid not in own:
+                    return  # another request's message
+            elif scope["after"] is not None and mid <= scope["after"]:
+                return  # older than our request
+            replies[mid] = event.message
+            changed.add(mid)
+            activity.set()
 
-            async def on_update(event):
-                replies[event.message.id] = event.message
-                changed.add(event.message.id)
-                activity.set()
+        loop = asyncio.get_running_loop()
 
-            new_ev = events.NewMessage(chats=self._entity, incoming=True)
-            edit_ev = events.MessageEdited(chats=self._entity, incoming=True)
-            self.client.add_event_handler(on_update, new_ev)
-            self.client.add_event_handler(on_update, edit_ev)
+        async def wait_activity(limit: float) -> bool:
+            if limit <= 0:
+                return False
             try:
+                await asyncio.wait_for(activity.wait(), limit)
+                return True
+            except asyncio.TimeoutError:
+                return False
+            finally:
+                activity.clear()
+
+        async def settle_down() -> None:
+            while await wait_activity(self.settle):
+                pass
+
+        handlers = []
+        try:
+            # 1. One request at a time until its first answer is in.
+            async with self._lock:
+                if self._entity is None:
+                    self._entity = await self.client.get_input_entity(self.target)
+                handlers = [
+                    events.NewMessage(chats=self._entity, incoming=True),
+                    events.MessageEdited(chats=self._entity, incoming=True),
+                ]
+                for ev in handlers:
+                    self.client.add_event_handler(on_update, ev)
                 sent = await self.client.send_message(self._entity, text)
-                loop = asyncio.get_running_loop()
+                scope["after"] = sent.id
 
-                async def wait_activity(limit: float) -> bool:
-                    if limit <= 0:
-                        return False
-                    try:
-                        await asyncio.wait_for(activity.wait(), limit)
-                        return True
-                    except asyncio.TimeoutError:
-                        return False
-                    finally:
-                        activity.clear()
+                def mine() -> list[int]:
+                    return sorted(i for i in replies if i > sent.id)
 
-                def mine(ids) -> list[int]:
-                    # Only messages sent after our request belong to this user.
-                    return sorted(i for i in ids if i > sent.id)
-
-                async def settle_down() -> None:
-                    while await wait_activity(self.settle):
-                        pass
-
-                # 1. Wait for the first reply, then until the bot goes quiet.
                 deadline = loop.time() + self.timeout
-                while not mine(replies) and await wait_activity(deadline - loop.time()):
+                while not mine() and await wait_activity(deadline - loop.time()):
                     pass
-                if not mine(replies):
+                if not mine():
                     return False
                 await settle_down()
-                delivered = {i: _content(replies[i]) for i in mine(replies)}
+                own = mine()
+                scope["own"] = set(own)  # from now on: only edits to these messages
                 changed.clear()
-                await deliver([replies[i] for i in delivered], False)
 
-                # 2. Keep watching for edits / extra messages and send those too.
-                edit_deadline = loop.time() + self.edit_wait
-                while await wait_activity(edit_deadline - loop.time()) or mine(changed):
-                    await settle_down()
-                    updated = [i for i in mine(changed) if delivered.get(i) != _content(replies[i])]
-                    changed.clear()
-                    if updated:
-                        delivered.update({i: _content(replies[i]) for i in updated})
-                        await deliver([replies[i] for i in updated], True)
-                return True
-            finally:
-                self.client.remove_event_handler(on_update, new_ev)
-                self.client.remove_event_handler(on_update, edit_ev)
+            # 2. Lock released: the next request is already free to go.
+            delivered = {i: _content(replies[i]) for i in own}
+            await deliver([replies[i] for i in own], False)
+
+            # 3. Follow edits to this answer's messages, by message ID.
+            edit_deadline = loop.time() + self.edit_wait
+            while await wait_activity(edit_deadline - loop.time()) or changed:
+                await settle_down()
+                updated = [i for i in sorted(changed) if delivered.get(i) != _content(replies[i])]
+                changed.clear()
+                if updated:
+                    delivered.update({i: _content(replies[i]) for i in updated})
+                    await deliver([replies[i] for i in updated], True)
+            return True
+        finally:
+            for ev in handlers:
+                self.client.remove_event_handler(on_update, ev)
