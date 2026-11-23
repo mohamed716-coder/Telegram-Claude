@@ -1,12 +1,13 @@
 """All bot commands: /start, /status, /redeem, the relay commands and admin commands."""
 
-import copy
+import functools
 import html
 import io
 import logging
 import time
 from datetime import datetime, timezone
 
+from telethon.errors import MessageNotModifiedError
 from telethon.tl.custom import Message
 
 from .core import (
@@ -24,12 +25,14 @@ log = logging.getLogger("kdbot")
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4000
 
-# If line 6 of an edited answer is exactly RETRY_LINE, RETRY_NOTE is added as an extra line.
-RETRY_LINE = "• PROCESSED: 0 + 10 / 10"
-RETRY_NOTE = (
-    "Please Retry or use another command , if you see this message after retrying,"
-    " this process can't be done"
-)
+# Shown at the end of every edited answer.
+OWNER_TAG = "@anony6916"
+# When line 6 of the target bot's answer is exactly this, the "0" texts are used.
+ZERO_LINE = "• PROCESSED: 0 + 10 / 10"
+# In a /setresponse... text, replaced by line 6 of the target bot's answer.
+LINE6_TAG = "<line_6>"
+# Admin commands that set what users see; the command name is also the settings key.
+RESPONSE_COMMANDS = ("setresponsebef", "setresponseaft", "setresponse0bef", "setresponse0aft")
 
 ADMIN_HELP = (
     "<b>Admin</b>\n"
@@ -37,7 +40,15 @@ ADMIN_HELP = (
     "/codes – unused codes\n"
     "/delcode &lt;code&gt;\n"
     "/users – premium users\n"
-    "/removepremium &lt;user_id&gt;"
+    "/removepremium &lt;user_id&gt;\n"
+    "\n"
+    "<b>What users see</b> (write your text on the lines below the command)\n"
+    "/setresponsebef – the first answer\n"
+    "/setresponseaft – after the target bot edits its answer\n"
+    "/setresponse0bef, /setresponse0aft – the same, when line 6 is "
+    f"<code>{html.escape(ZERO_LINE)}</code>\n"
+    "&lt;line_6&gt; in your text = line 6 of the target bot's answer. "
+    "Send a command with no text to reset it."
 )
 
 
@@ -63,34 +74,25 @@ def chunks(lines: list[str], limit: int = MESSAGE_LIMIT) -> list[str]:
     return out
 
 
-def utf16_len(text: str) -> int:
-    """Telegram measures entity offsets in UTF-16 code units."""
-    return len(text.encode("utf-16-le")) // 2
-
-
-def first_lines(text: str, entities, max_lines: int):
-    """Keep only the first `max_lines` lines of a message, clipping its formatting to match."""
+def line_of(text: str, n: int) -> str:
+    """Line `n` (counting from 1) of `text`, or "" if it has fewer lines."""
     lines = text.split("\n")
-    if len(lines) <= max_lines:
-        return text, entities
-    text = "\n".join(lines[:max_lines])
-    cut = utf16_len(text)
-    kept = []
-    for e in entities or []:
-        if e.offset >= cut:
-            continue
-        e = copy.copy(e)
-        e.length = min(e.offset + e.length, cut) - e.offset
-        kept.append(e)
-    return text, kept or None
+    return lines[n - 1] if len(lines) >= n else ""
 
 
-def add_retry_note(text: str) -> str:
-    """Add RETRY_NOTE as a new last line when line 6 is exactly RETRY_LINE."""
-    lines = text.split("\n")
-    if len(lines) >= 6 and lines[5].strip() == RETRY_LINE:
-        return f"{text}\n{RETRY_NOTE}"
-    return text
+def is_zero(text: str) -> bool:
+    """True when line 6 says nothing was processed."""
+    return line_of(text, 6).strip() == ZERO_LINE
+
+
+def render(template: str, source: str) -> str:
+    """Fill a /setresponse... text in: <line_6> becomes line 6 of the target bot's answer."""
+    return template.replace(LINE6_TAG, line_of(source, 6))
+
+
+def footer(username: str | None) -> str:
+    user = f"@{username}" if username else "Unknown"
+    return f"\n\nUSER: {user}\nStatus: Premium\nOwner: {OWNER_TAG}"
 
 
 def display_name(sender) -> str:
@@ -129,6 +131,7 @@ class BotApp:
             "delcode": self.cmd_delcode,
             "users": self.cmd_users,
             "removepremium": self.cmd_removepremium,
+            **{name: functools.partial(self.cmd_setresponse, name) for name in RESPONSE_COMMANDS},
         }
 
     def is_admin(self, user_id: int) -> bool:
@@ -259,9 +262,11 @@ class BotApp:
             return await self.reply(event, f"⏳ Please wait {wait:.0f}s before the next request.")
         self.cooldown.mark(uid)
 
+        username = getattr(await event.get_sender(), "username", None)
         status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
         log.info("user %s -> %r", uid, text)
         answered = False
+        shown: dict[int, object] = {}  # target bot's message id -> our message showing it
 
         async def deliver(replies, is_update: bool) -> None:
             # Called with the first answer, then again each time the target bot
@@ -272,9 +277,14 @@ class BotApp:
                 await status.delete()
             for msg in replies:
                 try:
-                    # Edited versions only show their first few lines (UPDATE_MAX_LINES).
-                    max_lines = getattr(self.cfg, "update_max_lines", 8) if is_update else None
-                    await self.forward_reply(event.chat_id, msg, reply_to=event.id, max_lines=max_lines)
+                    content = self.response_for(msg, is_update, username)
+                    ours = shown.get(msg.id)
+                    if ours is None:
+                        shown[msg.id] = await self.show(event.chat_id, msg, *content, reply_to=event.id)
+                    else:
+                        shown[msg.id] = await self.update_shown(
+                            event.chat_id, ours, msg, *content, reply_to=event.id
+                        )
                 except Exception:
                     log.exception("failed to forward %s %s", "update" if is_update else "reply", msg.id)
 
@@ -288,35 +298,76 @@ class BotApp:
         if not answered:
             await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
 
-    async def forward_reply(self, chat, msg: Message, reply_to, max_lines: int | None = None) -> None:
-        """Re-send one of the target bot's messages to the user, through our bot.
+    def response_for(self, msg: Message, is_update: bool, username: str | None):
+        """What the user sees for one of the target bot's messages: (text, entities, with_media).
 
-        With `max_lines` (used for edited answers), only the first that many lines
-        of the text are sent, plus RETRY_NOTE when line 6 is RETRY_LINE.
+        A text set with /setresponse... replaces the message entirely (only <line_6>
+        is taken from it). Without one, the message is shown as the target bot sent it.
+        Edited versions always end with the USER / Status / Owner footer.
         """
-        text, entities = msg.message or "", msg.entities
-        if max_lines:
-            text, entities = first_lines(text, entities, max_lines)
-            text = add_retry_note(text)
-        if msg.media and msg.file and not msg.web_preview:
+        source = msg.message or ""
+        key = "setresponse" + ("0" if is_zero(source) else "") + ("aft" if is_update else "bef")
+        template = self.store.get_setting(key)
+        if template is not None:
+            text, entities, with_media = render(template, source), None, False
+        else:
+            text, entities, with_media = source, msg.entities, True
+        if is_update:
+            text += footer(username)
+        return text, entities, with_media
+
+    async def show(self, chat, msg: Message, text: str, entities, with_media: bool, reply_to):
+        """Send a new message to the user. Returns the message holding the text (to edit later)."""
+        if with_media and msg.media and msg.file and not msg.web_preview:
             data = io.BytesIO(await self.user.download_media(msg, file=bytes))
             data.name = msg.file.name or f"file{msg.file.ext or ''}"
             caption_fits = len(text) <= CAPTION_LIMIT
-            await self.bot.send_file(
+            sent = await self.bot.send_file(
                 chat,
                 data,
                 caption=text if caption_fits else None,
                 formatting_entities=entities if caption_fits else None,
+                parse_mode=None,
                 voice_note=bool(msg.voice),
                 video_note=bool(msg.video_note),
                 reply_to=reply_to,
             )
-            if caption_fits:
-                return
-        if text:
-            await self.bot.send_message(chat, text, formatting_entities=entities, reply_to=reply_to)
+            if caption_fits or not text:
+                return sent
+        if not text:
+            return None
+        # parse_mode=None: the text is shown exactly as written, never read as markdown.
+        return await self.bot.send_message(
+            chat, text, formatting_entities=entities, parse_mode=None, reply_to=reply_to
+        )
+
+    async def update_shown(self, chat, ours, msg: Message, text: str, entities, with_media: bool,
+                           reply_to):
+        """Edit the message the user already has; send a new one only if it can't be edited."""
+        try:
+            return await self.bot.edit_message(
+                chat, ours, text, formatting_entities=entities, parse_mode=None
+            )
+        except MessageNotModifiedError:  # what the user sees didn't change
+            return ours
+        except Exception:
+            log.warning("could not edit message, sending a new one", exc_info=True)
+            return await self.show(chat, msg, text, entities, with_media, reply_to)
 
     # ---- admin -------------------------------------------------------------
+
+    async def cmd_setresponse(self, key: str, event, args: str) -> None:
+        """/setresponse(0)bef|aft followed by the text on the next lines, or nothing to reset."""
+        if not args:
+            self.store.delete_setting(key)
+            return await self.reply(
+                event, f"↩️ /{key} reset: users see the target bot's message as it is."
+            )
+        self.store.set_setting(key, args)
+        preview = args
+        if key.endswith("aft"):
+            preview += footer(getattr(await event.get_sender(), "username", None))
+        await self.reply(event, f"✅ Saved /{key}. Users will see:\n\n{esc(preview)}")
 
     async def cmd_code(self, event, args: str) -> None:
         try:
