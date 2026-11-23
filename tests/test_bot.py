@@ -196,3 +196,20 @@ def test_first_lines_clips_formatting():
     assert [(e.offset, e.length) for e in ents] == [(0, 11)]
     assert bold_all.length == len(text)  # original untouched
     assert first_lines("x\ny", None, 8) == ("x\ny", None)
+
+
+async def test_update_adds_retry_note(app):
+    from kdbot.bot import RETRY_NOTE
+
+    lines = ["l1", "l2", "l3", "l4", "l5", "• PROCESSED: 0 + 10 / 10", "l7", "l8", "l9", "l10"]
+    app.relay.update = "\n".join(lines)
+    await send(app, OWNER, "/kd hi")
+    assert app.bot.sent[-1][1].split("\n") == lines[:8] + [RETRY_NOTE]
+
+
+def test_retry_note_only_for_exact_line():
+    from kdbot.bot import add_retry_note
+
+    other = "1\n2\n3\n4\n5\n• PROCESSED: 3 + 7 / 10\n7\n8"
+    assert add_retry_note(other) == other
+    assert add_retry_note("short") == "short"
