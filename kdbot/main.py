@@ -42,6 +42,14 @@ async def run(cfg) -> None:
         except Exception:
             log.exception("error while handling %r", event.raw_text)
 
+    # The /kd /zz /ko buttons under a /setresponse... question.
+    @bot.on(events.CallbackQuery(pattern=rb"^setresp:"))
+    async def on_button(event):
+        try:
+            await app.handle_button(event)
+        except Exception:
+            log.exception("error while handling button %r", event.data)
+
     log.info(
         "Running as @%s. Relaying as %s (admin) to %s",
         bot_me.username, me.username or me.id, cfg.target_bot,
