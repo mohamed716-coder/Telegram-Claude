@@ -27,7 +27,7 @@ activated with single-use codes that admins generate.
 | `/users` | admin | List Premium users with time left |
 | `/removepremium <user_id>` | admin | Take Premium away from a user |
 
-- **Admins**: the account you logged in with (`SESSION_STRING`) is always admin;
+- **Admins**: the Telegram account you logged in with is always admin;
   add more with `ADMIN_IDS`. Admins have no limits.
 - **Anti-spam**: the seconds from the code a user redeemed is how long they must
   wait between requests (`0` = no wait). Redeeming a newer code replaces it.
@@ -43,7 +43,7 @@ edits are handled: the bot waits until the target goes quiet and sends the final
 
 ## Run it 24/7 on a server
 
-See **[DEPLOY.md](DEPLOY.md)** for step-by-step instructions (Docker on a small VPS).
+See **[DEPLOY.md](DEPLOY.md)**: on an Ubuntu/Debian server it's `git clone …` then `bash install.sh`.
 
 ## Run it on your own computer
 
@@ -60,7 +60,7 @@ See **[DEPLOY.md](DEPLOY.md)** for step-by-step instructions (Docker on a small 
    ```bash
    .venv/bin/python login.py
    ```
-   Put the printed string in `.env` as `SESSION_STRING`.
+   The login is saved in `data/user_session.txt`, where the bot finds it.
 5. **Run**:
    ```bash
    .venv/bin/python -m kdbot.main
@@ -82,8 +82,8 @@ extra requests wait in a queue.
 
 ## Safety
 
-- `SESSION_STRING` gives **full access to your Telegram account**. Never share it
-  or commit it; `.env` is already in `.gitignore`.
+- Your saved login (`data/user_session.txt`, or `SESSION_STRING` if you set it) gives
+  **full access to your Telegram account**. Never share it; `.env` and `data/` are in `.gitignore`.
 - Keep the volume low: many automated messages from a personal account can get
   it limited by Telegram. Use a non-zero anti-spam value on codes you give out.
 

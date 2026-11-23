@@ -28,7 +28,7 @@ async def run(cfg) -> None:
 
     await user.connect()
     if not await user.is_user_authorized():
-        raise SystemExit("SESSION_STRING is invalid or expired; run `python login.py` again.")
+        raise SystemExit("Your Telegram login is invalid or expired; run login.py again (or install.sh).")
     await bot.start(bot_token=cfg.bot_token)
     me = await user.get_me()
     bot_me = await bot.get_me()

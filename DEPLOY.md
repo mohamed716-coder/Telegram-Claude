@@ -1,151 +1,113 @@
-# Running the bot 24/7
+# Running the bot 24/7 on your VPS
 
-The bot has to run on a computer that is always on and online. The easiest way
-is a small rented Linux server (a "VPS"). Docker keeps the bot running: it
-restarts the bot if it crashes and starts it again when the server reboots.
+The setup script installs everything, asks for your keys, logs in your Telegram
+account and starts the bot. Docker then keeps it running: it restarts the bot
+after a crash and starts it again when the server reboots.
 
-Total time: about 20–30 minutes the first time.
+Works on **Ubuntu or Debian** servers. Total time: about 15 minutes.
 
 ---
 
-## Step 1 – Create your bot (2 min)
+## Before you start: collect 3 things
 
-1. In Telegram, open [@BotFather](https://t.me/BotFather) and send `/newbot`.
-2. Choose a name and a username (must end in `bot`).
-3. BotFather sends you a **token** like `123456789:AAH...`. Save it; this is your `BOT_TOKEN`.
+1. **Bot token** – in Telegram open [@BotFather](https://t.me/BotFather), send
+   `/newbot`, pick a name and a username ending in `bot`. Copy the token it
+   sends you (looks like `123456789:AAH...`).
+2. **API_ID and API_HASH** – open <https://my.telegram.org>, log in with your
+   phone number, click **API development tools**, fill in the form (any name,
+   platform "Other"), and copy **App api_id** (a number) and **App api_hash**
+   (32 letters/digits).
+3. **A GitHub token** (because this repository is private) – on GitHub go to
+   **Settings → Developer settings → Personal access tokens → Fine-grained tokens →
+   Generate new token**. Under *Repository access* pick **Only select repositories →
+   Telegram-Claude**, under *Permissions* set **Contents: Read-only**, and
+   generate it. Copy the token (starts with `github_pat_`).
 
-## Step 2 – Get API keys for your account (3 min)
+## Step 1 – Connect to your VPS
 
-1. Open <https://my.telegram.org> and log in with your phone number
-   (the code arrives in your Telegram app).
-2. Click **API development tools**.
-3. Fill in the form (any app name and short name, platform "Other") and click **Create application**.
-4. Save **App api_id** (a number) and **App api_hash** (a long text). These are
-   your `API_ID` and `API_HASH`.
-
-## Step 3 – Rent a server (5–10 min)
-
-Rent the smallest Linux VPS from any provider (Hetzner, DigitalOcean, Vultr, Contabo,
-Oracle Cloud, …). The bot needs very little:
-
-- **System:** Ubuntu 24.04
-- **Size:** 1 CPU, 1 GB RAM is plenty
-
-After creating it you get an **IP address** and a **root password** (or you
-upload an SSH key during setup).
-
-## Step 4 – Connect to the server
-
-On Windows open **PowerShell**, on Mac/Linux open **Terminal**, and run
-(replace with your server's IP):
+On Windows open **PowerShell**, on Mac open **Terminal**:
 
 ```bash
 ssh root@YOUR_SERVER_IP
 ```
 
-Type `yes` if asked, then the password (it stays invisible while you type).
-Every command from here on is typed **on the server**.
+(If your provider gave you a different username, use it instead of `root`.)
 
-## Step 5 – Install Docker and git
-
-```bash
-curl -fsSL https://get.docker.com | sh
-apt-get install -y git
-```
-
-## Step 6 – Download the bot
+## Step 2 – Download the bot
 
 ```bash
+apt-get update && apt-get install -y git
 git clone -b claude/telegram-bot-dynamic-command-pyuptf https://github.com/mohamed716-coder/Telegram-Claude.git
 cd Telegram-Claude
 ```
 
-If the repository is private, git asks for a username and password: enter your
-GitHub username, and as the password a **personal access token** (GitHub →
-Settings → Developer settings → Personal access tokens → Generate new token,
-with read access to this repository).
+When git asks:
+- **Username:** your GitHub username
+- **Password:** paste the GitHub token (it stays invisible; just paste and press Enter)
 
-## Step 7 – Fill in your settings
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Fill in `API_ID`, `API_HASH` and `BOT_TOKEN` from steps 1 and 2. Leave
-`SESSION_STRING` empty for now. Save with **Ctrl+O**, **Enter**, then exit with **Ctrl+X**.
-
-## Step 8 – Build the bot
+## Step 3 – Run the setup
 
 ```bash
-docker compose build
+bash install.sh
 ```
 
-## Step 9 – Log in with your Telegram account (once)
+It will:
+1. Install Docker (first time only).
+2. Ask for **API_ID**, **API_HASH** and **BOT_TOKEN**. Paste each one and press Enter.
+3. Build the bot (a minute or two).
+4. Log in with **your Telegram account**:
+   - enter your phone number with country code, e.g. `+201001234567`
+   - enter the code Telegram sends to your Telegram app
+   - if you use two-step verification, enter that password
+5. Start the bot and print `Done!`.
 
-```bash
-docker compose run --rm kdbot python login.py
-```
+## Step 4 – Try it
 
-- Enter your phone number with country code, e.g. `+201001234567`.
-- Enter the code Telegram sends to your Telegram app.
-- If you have two-step verification, enter that password too.
+Open your bot in Telegram and press **Start**. You are the admin, so you'll see
+the admin commands. Try:
 
-It prints a long text (your session string). Copy all of it, then:
+- `/kd hello` – goes to @KageNoKoroshiBot from your account; the answer comes back
+- `/code 25 0` – makes a code; another user activates it with `/redeem <code>`
 
-```bash
-nano .env
-```
-
-and paste it after `SESSION_STRING=` (right-click pastes in most terminals).
-Save and exit (**Ctrl+O**, **Enter**, **Ctrl+X**).
-
-> ⚠️ The session string is full access to your Telegram account. Never send it
-> to anyone, and never share the login code Telegram sends you.
-
-## Step 10 – Start it
-
-```bash
-docker compose up -d
-docker compose logs -f
-```
-
-You should see `Running. Relaying as <your username> to @KageNoKoroshiBot`.
-Press **Ctrl+C** to stop watching the logs; the bot keeps running.
-
-Now open your bot in Telegram and press **Start**. Because you logged in with
-your account in step 9, you are the admin: you'll see the admin commands, and
-you can try `/kd hello` right away. Generate a code for someone with
-`/code 25 0` and they activate it with `/redeem <code>`.
-
-You can close the terminal: the bot stays up 24/7, including after server reboots.
+That's it. You can close the terminal; the bot keeps running.
 
 ---
 
 ## Everyday commands
 
-Run these inside the `Telegram-Claude` folder on the server
-(`ssh root@YOUR_SERVER_IP`, then `cd Telegram-Claude`):
+First connect and go into the folder: `ssh root@YOUR_SERVER_IP`, then `cd Telegram-Claude`.
 
 | What | Command |
 |---|---|
-| See if it's running | `docker compose ps` |
-| Watch the logs | `docker compose logs -f --tail 100` |
+| Is it running? | `docker compose ps` |
+| Watch the logs (Ctrl+C to stop watching) | `docker compose logs -f --tail 100` |
 | Restart | `docker compose restart` |
 | Stop | `docker compose down` |
 | Start again | `docker compose up -d` |
-| After changing `.env` | `docker compose up -d --force-recreate` |
-| Update to the newest code | `git pull && docker compose up -d --build` |
+| Change settings | `nano .env`, then `docker compose up -d --force-recreate` |
+| **Update to the newest version** | `git pull && bash install.sh` |
+| Log in with your account again | `bash install.sh --relogin` |
+| Back up codes and users | `docker compose cp kdbot:/app/data/kdbot.db ./kdbot-backup.db` |
+
+## If something goes wrong
+
+- **`git clone` says "Authentication failed"**: the token is wrong or doesn't
+  have access to Telegram-Claude. Make a new one (see "Before you start" step 3).
+- **Logs say "Your Telegram login is invalid or expired"**: you were logged out
+  (for example you ended the session in Telegram → Settings → Devices). Run
+  `bash install.sh --relogin`.
+- **Logs mention `BOT_TOKEN` / "token invalid"**: fix it with `nano .env`, then
+  `docker compose up -d --force-recreate`.
+- **The bot doesn't answer at all**: run `docker compose logs --tail 50` and
+  send me what it shows.
 
 ## Important
 
-- **Run the bot in only one place.** Don't run it on your PC while it's running
-  on the server: using the same session from two places at once can make
-  Telegram log the session out, and both copies would answer every message.
-- **If your account gets logged out** (for example you ended the session in
-  Telegram → Settings → Devices), the logs say `SESSION_STRING is invalid or expired`.
-  Repeat step 9, then `docker compose up -d --force-recreate`.
+- **Run the bot in only one place.** Don't also run it on your PC: using the
+  same Telegram login from two places at once can get it logged out, and both
+  copies would answer every message.
+- **Keep your login private.** `.env` and the bot's data folder give access to
+  your Telegram account and your bot. Never share them, and never share the
+  login code Telegram sends you.
 - **Use anti-spam on codes you give out** (e.g. `/code 30 20`) so your account
   never sends too many messages too fast.
-- **Back up your codes and users** now and then:
-  `docker compose cp kdbot:/app/data/kdbot.db ./kdbot-backup.db`
