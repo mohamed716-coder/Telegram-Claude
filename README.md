@@ -32,7 +32,9 @@ activated with single-use codes that admins generate.
 - **Anti-spam**: the seconds from the code a user redeemed is how long they must
   wait between requests (`0` = no wait). Redeeming a newer code replaces it.
 - **Notifications**: admins get a message whenever someone redeems a code
-  (open your bot and press Start once so it's allowed to message you).
+  (open your bot and press Start once so it's allowed to message you). Whenever
+  anyone other than you uses `/kd`, `/zz` or `/ko`, you get `USER: @their_username`
+  and what they typed after the command.
 - Codes and users are stored in `data/kdbot.db` (a Docker volume on the server),
   so they survive restarts and updates.
 
