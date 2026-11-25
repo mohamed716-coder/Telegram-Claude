@@ -237,6 +237,23 @@ async def test_admin_lists(app):
     assert "needs Premium" in (await send(app, USER, "/kd x")).last
 
 
+async def test_owner_is_told_what_other_users_send(app):
+    [code] = await make_code(app, "25 0")
+    await send(app, USER, f"/redeem {code}")
+    await send(app, USER, "/kd hello 123", username="bob")
+    assert (OWNER, "USER: @bob\nhello 123") in app.bot.sent  # command itself removed
+    await send(app, ADMIN2, "/zz hi there")  # another admin, no @username
+    assert (OWNER, "USER: Unknown\nhi there") in app.bot.sent
+    before = len(app.bot.sent)
+    await send(app, OWNER, "/ko mine")  # the owner's own commands: no notice
+    assert not any(t.startswith("USER:") for _, t in app.bot.sent[before:])
+
+
+async def test_no_notice_when_request_is_refused(app):
+    await send(app, USER, "/kd hello")  # not Premium: nothing is relayed
+    assert not any(t.startswith("USER:") for _, t in app.bot.sent)
+
+
 # ---- what users see ----------------------------------------------------------
 
 async def test_edit_updates_the_same_message_with_footer(app):
