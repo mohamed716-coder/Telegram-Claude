@@ -98,9 +98,12 @@ def render(template: str, source: str) -> str:
     return LINE_TAG.sub(lambda m: line_of(source, int(m.group(1))), template)
 
 
+def user_tag(username: str | None) -> str:
+    return f"@{username}" if username else "Unknown"
+
+
 def footer(username: str | None) -> str:
-    user = f"@{username}" if username else "Unknown"
-    return f"\n\nUSER: {user}\nStatus: Premium\nOwner: {OWNER_TAG}"
+    return f"\n\nUSER: {user_tag(username)}\nStatus: Premium\nOwner: {OWNER_TAG}"
 
 
 def display_name(sender) -> str:
@@ -249,6 +252,13 @@ class BotApp:
             except Exception:  # e.g. that admin never opened the bot
                 log.warning("could not notify admin %s", admin_id)
 
+    async def notify_owner(self, text: str) -> None:
+        """Send `text` to the owner as plain text (exactly as written)."""
+        try:
+            await self.bot.send_message(self.owner_id, text, parse_mode=None)
+        except Exception:  # e.g. the owner never opened the bot
+            log.warning("could not notify the owner")
+
     # ---- relay commands (/kd /ko /zz) ----------------------------------------
 
     async def cmd_relay(self, event) -> None:
@@ -274,6 +284,9 @@ class BotApp:
 
         relay_cmd = command.lstrip("/").lower()  # "kd", "zz" or "ko": picks which texts are used
         username = getattr(await event.get_sender(), "username", None)
+        if uid != self.owner_id:
+            # Tell the owner who used it and what they typed after the command.
+            await self.notify_owner(f"USER: {user_tag(username)}\n{text.split(maxsplit=1)[1]}")
         status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
         log.info("user %s -> %r", uid, text)
         answered = False
