@@ -64,9 +64,9 @@ class FakeButtonPress:
         self.edited = text
 
 
-def target_msg(text):
-    """A message from the target bot (always id 1, so an update edits the same message)."""
-    return SimpleNamespace(id=1, message=text, entities=None, media=None)
+def target_msg(text, mid=1):
+    """A message from the target bot (id 1 by default, so an update edits the same message)."""
+    return SimpleNamespace(id=mid, message=text, entities=None, media=None)
 
 
 class FakeRelay:
@@ -74,6 +74,7 @@ class FakeRelay:
 
     def __init__(self):
         self.sent = []
+        self.batches = []  # every ask_many call: the texts sent together
         self.first = "answer"  # the target bot's first answer
         self.update = None  # its text after a later edit, if any
 
@@ -82,6 +83,12 @@ class FakeRelay:
         await deliver([target_msg(self.first)], False)
         if self.update is not None:
             await deliver([target_msg(self.update)], True)
+        return True
+
+    async def ask_many(self, texts, deliver):
+        self.sent.extend(texts)
+        self.batches.append(list(texts))
+        await deliver([target_msg(f"answer {t}", i) for i, t in enumerate(texts, 1)], False)
         return True
 
 
@@ -457,10 +464,11 @@ async def test_off_all_commands(app):
     assert "/kd test" in app.relay.sent
 
 
-async def test_owner_multiline_splits_into_separate_relays(app):
+async def test_owner_multiline_sends_all_lines_together(app):
     ev = await send(app, OWNER, "/kd hi\nho\nhe")
-    assert app.relay.sent == ["/kd hi", "/kd ho", "/kd he"]
-    assert any("Sent 3 messages" in r.text for r in ev.replies)
+    assert app.relay.batches == [["/kd hi", "/kd ho", "/kd he"]]  # one batch, sent at once
+    assert ev.replies[0].text == "Sending 3 messages…" and ev.replies[0].deleted
+    assert [t for _, t in app.bot.sent] == ["answer /kd hi", "answer /kd ho", "answer /kd he"]
 
 
 async def test_multiline_is_owner_only(app):
@@ -471,9 +479,8 @@ async def test_multiline_is_owner_only(app):
 
 
 async def test_owner_multiline_skips_blank_lines(app):
-    ev = await send(app, OWNER, "/kd hi\n\nhe")
-    assert app.relay.sent == ["/kd hi", "/kd he"]
-    assert any("Sent 2 messages" in r.text for r in ev.replies)
+    await send(app, OWNER, "/kd hi\n\nhe")
+    assert app.relay.batches == [["/kd hi", "/kd he"]]
 
 
 async def test_off_is_owner_only(app):
