@@ -153,6 +153,33 @@ async def test_queue_is_freed_after_first_answer_and_edits_follow_message_ids():
     assert client.handlers == []  # cleaned up
 
 
+async def test_ask_many_sends_all_at_once_and_waits_for_every_answer():
+    timeline = []
+
+    async def script(c, sent):
+        timeline.append(("sent", sent.text))
+        await asyncio.sleep(0.05)
+        rid = c.new_id()
+        timeline.append(("answer", sent.text))
+        await c.emit(rid, "wait " + sent.text)
+        await asyncio.sleep(0.3)
+        await c.emit(rid, "done " + sent.text)
+
+    client = FakeClient(script)
+    relay = Relay(client, "@t", timeout=2, settle=0.1, edit_wait=0.6)
+    got = []
+
+    async def deliver(msgs, is_update):
+        got.append(("update" if is_update else "first", sorted(m.text for m in msgs)))
+
+    assert await relay.ask_many(["/kd hi", "/kd ho", "/kd he"], deliver)
+    # every line went out before any answer came back
+    assert [k for k, _ in timeline[:3]] == ["sent", "sent", "sent"]
+    assert got[0] == ("first", ["wait /kd he", "wait /kd hi", "wait /kd ho"])
+    assert sorted(t for _, msgs in got[1:] for t in msgs) == ["done /kd he", "done /kd hi", "done /kd ho"]
+    assert client.handlers == []
+
+
 async def test_exits_when_either_client_disconnects():
     from kdbot.main import run_until_either_disconnects
 
