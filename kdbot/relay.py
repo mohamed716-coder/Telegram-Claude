@@ -37,11 +37,15 @@ class Relay:
         return self._lock.locked()
 
     async def ask(self, text: str, deliver: Deliver) -> bool:
-        """Send `text` to the target bot and pass its answer to `deliver`.
+        return await self.ask_many([text], deliver)
 
-        1. While holding the lock, send the message and collect the target bot's
-           reply messages until it is quiet for `settle` seconds. Holding the lock
-           here means every new message belongs to this request.
+    async def ask_many(self, texts: list[str], deliver: Deliver) -> bool:
+        """Send all `texts` to the target bot at once and pass the answers to `deliver`.
+
+        1. While holding the lock, send the messages together and collect the target
+           bot's replies until there is at least one per message (or `timeout`), then
+           until it is quiet for `settle` seconds. Holding the lock here means every
+           new message belongs to this request.
         2. Release the lock (the next user's request can start right away) and
            deliver the answer.
         3. For `edit_wait` seconds, watch for edits to *this answer's message IDs
@@ -98,14 +102,17 @@ class Relay:
                 ]
                 for ev in handlers:
                     self.client.add_event_handler(on_update, ev)
-                sent = await self.client.send_message(self._entity, text)
-                scope["after"] = sent.id
+                sent = await asyncio.gather(
+                    *(self.client.send_message(self._entity, t) for t in texts)
+                )
+                first_id = min(m.id for m in sent)
+                scope["after"] = first_id
 
                 def mine() -> list[int]:
-                    return sorted(i for i in replies if i > sent.id)
+                    return sorted(i for i in replies if i > first_id)
 
                 deadline = loop.time() + self.timeout
-                while not mine() and await wait_activity(deadline - loop.time()):
+                while len(mine()) < len(texts) and await wait_activity(deadline - loop.time()):
                     pass
                 if not mine():
                     return False
