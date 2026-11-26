@@ -2,7 +2,7 @@ import re
 
 import pytest
 
-from kdbot.store import DAY, CodeAlreadyUsed, CodeNotFound, Store
+from kdbot.store import DAY, CodeAlreadyUsed, CodeNotFound, NeedsPremium, Store
 
 
 @pytest.fixture
@@ -96,3 +96,40 @@ def test_persists_across_restarts(tmp_path, clock):
     s1.redeem(code, 42)
     s2 = Store(path, clock=lambda: clock[0])
     assert s2.premium(42) is not None
+
+
+def test_credits_on_redeem(store, clock):
+    code = store.create_code(10, 0, 1, "A", credits=500)
+    r = store.redeem(code, 42)
+    assert r.credits == 500
+    assert store.get_credits(42) == 500
+
+
+def test_spend_and_add_credits(store, clock):
+    code = store.create_code(10, 0, 1, "A", credits=100)
+    store.redeem(code, 42)
+    assert store.spend_credits(42, 5)
+    assert store.get_credits(42) == 95
+    assert not store.spend_credits(42, 100)  # not enough
+    assert store.get_credits(42) == 95
+    store.add_credits(42, 10)
+    assert store.get_credits(42) == 105
+
+
+def test_credits_only_code_needs_premium(store, clock):
+    code = store.create_code(0, 0, 1, "A", credits=500)
+    with pytest.raises(NeedsPremium):
+        store.redeem(code, 42)
+    # code not consumed
+    store.redeem(store.create_code(10, 0, 1, "A"), 42)  # get Premium first
+    r = store.redeem(code, 42)
+    assert r.days == 0 and r.credits == 500
+    assert store.get_credits(42) == 500
+
+
+def test_all_users(store):
+    store.redeem(store.create_code(5, 0, 1, "A", credits=100), 42, name="Bob")
+    store.touch_user(43, "Free")
+    rows = store.all_users()
+    assert len(rows) == 1  # only user 42 has premium or credits
+    assert rows[0]["user_id"] == 42
