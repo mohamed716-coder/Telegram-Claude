@@ -21,7 +21,7 @@ from .core import (
     parse_command,
     to_target_text,
 )
-from .store import CodeAlreadyUsed, CodeNotFound, Store
+from .store import CodeAlreadyUsed, CodeNotFound, NeedsPremium, Store
 
 log = logging.getLogger("kdbot")
 
@@ -40,14 +40,18 @@ LINE_TAG = re.compile(r"<line_(\d+)>")
 RESPONSE_COMMANDS = ("setresponsebef", "setresponseaft", "setresponse0bef", "setresponse0aft")
 # Callback data of the "which command?" buttons: "setresp:<token>:<relay command or *>".
 BUTTON_PREFIX = "setresp"
+CREDIT_COST = 5
 
 ADMIN_HELP = (
     "<b>Admin</b>\n"
-    "/code &lt;days&gt; &lt;antispam_seconds&gt; [count]\n"
+    "/code &lt;days&gt; &lt;antispam&gt; &lt;credits&gt; [count]\n"
+    "/code &lt;credits&gt; – credits-only code\n"
     "/codes – unused codes\n"
     "/delcode &lt;code&gt;\n"
+    "/status – all users, credits and on/off state\n"
     "/users – premium users\n"
     "/removepremium &lt;user_id&gt;\n"
+    "/on [/command] · /off [/command]\n"
     "\n"
     "<b>What users see</b> (write your text on the lines below the command; "
     "the bot then asks which command it's for)\n"
@@ -142,6 +146,8 @@ class BotApp:
             "delcode": self.cmd_delcode,
             "users": self.cmd_users,
             "removepremium": self.cmd_removepremium,
+            "on": self.cmd_on,
+            "off": self.cmd_off,
             **{name: functools.partial(self.cmd_setresponse, name) for name in RESPONSE_COMMANDS},
         }
         # /setresponse... texts waiting for the admin to tap which command they're for.
@@ -149,6 +155,9 @@ class BotApp:
 
     def is_admin(self, user_id: int) -> bool:
         return user_id == self.owner_id or user_id in self.cfg.admin_ids
+
+    def is_command_off(self, cmd: str) -> bool:
+        return self.store.get_setting(f"off:{cmd}") is not None
 
     async def reply(self, event, text: str):
         return await event.reply(text, parse_mode="html", link_preview=False)
@@ -184,10 +193,12 @@ class BotApp:
         sender = await event.get_sender()
         first = getattr(sender, "first_name", None) or "there"
         plan = self.plan_name(uid)
+        credits = self.store.get_credits(uid)
         lines = [
             f"👋 Welcome, {esc(first)}!",
             "",
             f"<b>Plan:</b> {plan}",
+            f"<b>Credits:</b> {credits} ({CREDIT_COST} per use)",
             "",
             "<b>Commands:</b>",
             *(f"/{c}" for c in self.cfg.commands),
@@ -200,15 +211,46 @@ class BotApp:
             lines += ["", ADMIN_HELP]
         await self.reply(event, "\n".join(lines))
 
+    def off_commands(self) -> list[str]:
+        return [c for c in self.cfg.commands if self.is_command_off(c)]
+
     async def cmd_status(self, event, args: str) -> None:
         uid = event.sender_id
         if self.is_admin(uid):
-            return await self.reply(event, "<b>Plan:</b> Admin\nUnlimited access, no anti-spam.")
+            now = self.clock()
+            off = self.off_commands()
+            off_text = ", ".join(f"/{c}" for c in off) if off else "none"
+            rows = self.store.all_users()
+            lines = [
+                "<b>Plan:</b> Admin",
+                f"<b>Commands off:</b> {off_text}",
+                "",
+                f"<b>Users ({len(rows)}):</b>",
+            ]
+            for r in rows:
+                active = r["premium_until"] > now
+                if active:
+                    plan = f"Premium ({format_duration(r['premium_until'] - now)} left)"
+                else:
+                    plan = "Expired"
+                lines.append(
+                    f"{esc(r['name'] or '–')} <code>{r['user_id']}</code> – "
+                    f"{plan}, {r['credits']} credits, {r['cooldown']}s"
+                )
+            if not rows:
+                lines.append("No users yet.")
+            for part in chunks(lines):
+                await self.reply(event, part)
+            return
         row = self.store.premium(uid)
         if not row:
             note = "Your Premium has expired." if self.store.had_premium(uid) else "You don't have Premium."
+            credits = self.store.get_credits(uid)
             return await self.reply(
-                event, f"<b>Plan:</b> Free\n{note}\nActivate it with /redeem &lt;code&gt;"
+                event,
+                f"<b>Plan:</b> Free\n{note}\n"
+                f"<b>Credits:</b> {credits}\n"
+                "Activate it with /redeem &lt;code&gt;",
             )
         left = row["premium_until"] - self.clock()
         await self.reply(
@@ -216,7 +258,8 @@ class BotApp:
             "<b>Plan:</b> Premium\n"
             f"<b>Time left:</b> {format_duration(left)}\n"
             f"<b>Expires:</b> {fmt_date(row['premium_until'])}\n"
-            f"<b>Anti-spam:</b> {row['cooldown']}s between requests",
+            f"<b>Anti-spam:</b> {row['cooldown']}s between requests\n"
+            f"<b>Credits:</b> {row['credits']}",
         )
 
     async def cmd_redeem(self, event, args: str) -> None:
@@ -231,19 +274,36 @@ class BotApp:
             return await self.reply(event, "❌ This code is not valid.")
         except CodeAlreadyUsed:
             return await self.reply(event, "❌ This code has already been used.")
-        log.info("user %s redeemed %s (%s days)", uid, code, result.days)
-        await self.reply(
-            event,
-            "✅ <b>Premium activated!</b>\n"
-            f"<b>Added:</b> {result.days} days\n"
-            f"<b>Time left:</b> {format_duration(result.premium_until - self.clock())}\n"
-            f"<b>Expires:</b> {fmt_date(result.premium_until)}\n\n"
-            f"You can now use " + " ".join(f"/{c}" for c in self.cfg.commands),
-        )
-        await self.notify_admins(
-            f"🎟 {esc(name or uid)} (<code>{uid}</code>) redeemed <code>{esc(code)}</code>"
-            f" – {result.days} days, {result.cooldown}s anti-spam"
-        )
+        except NeedsPremium:
+            return await self.reply(
+                event,
+                "❌ This is a credits-only code. You need Premium first.\n"
+                "Redeem a Premium code, then use this one.",
+            )
+        log.info("user %s redeemed %s (%s days, %s credits)", uid, code, result.days, result.credits)
+        if result.days == 0:
+            await self.reply(
+                event,
+                f"✅ <b>{result.credits} credits added!</b>\n"
+                f"<b>Credits:</b> {self.store.get_credits(uid)}",
+            )
+        else:
+            credits_note = f"\n<b>Credits:</b> +{result.credits}" if result.credits else ""
+            await self.reply(
+                event,
+                "✅ <b>Premium activated!</b>\n"
+                f"<b>Added:</b> {result.days} days\n"
+                f"<b>Time left:</b> {format_duration(result.premium_until - self.clock())}\n"
+                f"<b>Expires:</b> {fmt_date(result.premium_until)}"
+                f"{credits_note}\n\n"
+                f"You can now use " + " ".join(f"/{c}" for c in self.cfg.commands),
+            )
+        notify_parts = [f"🎟 {esc(name or uid)} (<code>{uid}</code>) redeemed <code>{esc(code)}</code>"]
+        if result.days:
+            notify_parts.append(f"{result.days} days, {result.cooldown}s anti-spam")
+        if result.credits:
+            notify_parts.append(f"{result.credits} credits")
+        await self.notify_admins(" – ".join(notify_parts))
 
     async def notify_admins(self, text: str) -> None:
         for admin_id in {self.owner_id, *self.cfg.admin_ids}:
@@ -266,23 +326,34 @@ class BotApp:
         text = to_target_text(event.raw_text, self.relay_pattern)
         if text is None:
             return
+        relay_cmd = text.split(maxsplit=1)[0].lstrip("/").lower()
+        if self.is_command_off(relay_cmd) and uid != self.owner_id:
+            return await self.reply(event, f"🔒 /{relay_cmd} is currently off.")
         if self.is_admin(uid):
             wait_s = 0
+            needs_credits = False
         else:
             row = self.store.premium(uid)
             if not row:
                 note = "Your Premium has expired." if self.store.had_premium(uid) else "This command needs Premium."
                 return await self.reply(event, f"🔒 {note}\nActivate it with /redeem &lt;code&gt;")
             wait_s = row["cooldown"]
+            needs_credits = True
         command = text.split(maxsplit=1)[0]
         if len(text.split(maxsplit=1)) < 2:
             return await self.reply(event, f"Usage: {command} &lt;your message&gt;")
         wait = self.cooldown.remaining(uid, wait_s)
         if wait:
             return await self.reply(event, f"⏳ Please wait {wait:.0f}s before the next request.")
+        if needs_credits and not self.store.spend_credits(uid, CREDIT_COST):
+            balance = self.store.get_credits(uid)
+            return await self.reply(
+                event,
+                f"🔒 Not enough credits. You have {balance}, but each use costs {CREDIT_COST}.\n"
+                "Ask for more credits from the owner.",
+            )
         self.cooldown.mark(uid)
 
-        relay_cmd = command.lstrip("/").lower()  # "kd", "zz" or "ko": picks which texts are used
         username = getattr(await event.get_sender(), "username", None)
         if uid != self.owner_id:
             # Tell the owner who used it and what they typed after the command.
@@ -316,10 +387,14 @@ class BotApp:
             await self.relay.ask(text, deliver)
         except Exception:
             log.exception("relay failed")
+            if needs_credits:
+                self.store.add_credits(uid, CREDIT_COST)
             if not answered:
                 await status.edit("Something went wrong, please try again later.")
             return
         if not answered:
+            if needs_credits:
+                self.store.add_credits(uid, CREDIT_COST)
             await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
 
     def response_for(self, msg: Message, is_update: bool, username: str | None, relay_cmd: str):
@@ -427,17 +502,22 @@ class BotApp:
 
     async def cmd_code(self, event, args: str) -> None:
         try:
-            days, cooldown, count = parse_code_args(args)
+            days, cooldown, credits, count = parse_code_args(args)
         except ValueError as e:
             return await self.reply(event, esc(e))
         codes = [
-            self.store.create_code(days, cooldown, event.sender_id, self.cfg.code_prefix)
+            self.store.create_code(days, cooldown, event.sender_id, self.cfg.code_prefix,
+                                   credits=credits)
             for _ in range(count)
         ]
-        log.info("admin %s created %d code(s): %s days, %ss", event.sender_id, count, days, cooldown)
+        log.info("admin %s created %d code(s): %s days, %ss, %s credits",
+                 event.sender_id, count, days, cooldown, credits)
         title = "Code generated:" if count == 1 else f"{count} codes generated:"
-        lines = [f"✅ {title}", *(f"<code>{c}</code>" for c in codes), "",
-                 f"{days} days · {cooldown}s anti-spam · single use"]
+        if days == 0:
+            desc = f"{credits} credits · single use (credits only)"
+        else:
+            desc = f"{days} days · {cooldown}s anti-spam · {credits} credits · single use"
+        lines = [f"✅ {title}", *(f"<code>{c}</code>" for c in codes), "", desc]
         for part in chunks(lines):
             await self.reply(event, part)
 
@@ -446,7 +526,9 @@ class BotApp:
         if not rows:
             return await self.reply(event, "No unused codes.")
         lines = [f"<b>Unused codes ({len(rows)}):</b>"] + [
-            f"<code>{r['code']}</code> – {r['days']}d, {r['cooldown']}s" for r in rows
+            f"<code>{r['code']}</code> – {r['days']}d, {r['cooldown']}s, {r['credits']}cr"
+            if r['days'] else f"<code>{r['code']}</code> – {r['credits']}cr (credits only)"
+            for r in rows
         ]
         for part in chunks(lines):
             await self.reply(event, part)
@@ -467,7 +549,7 @@ class BotApp:
         now = self.clock()
         lines = [f"<b>Premium users ({len(rows)}):</b>"] + [
             f"{esc(r['name'] or '–')} <code>{r['user_id']}</code> – "
-            f"{format_duration(r['premium_until'] - now)} left, {r['cooldown']}s"
+            f"{format_duration(r['premium_until'] - now)} left, {r['cooldown']}s, {r['credits']}cr"
             for r in rows
         ]
         for part in chunks(lines):
@@ -481,3 +563,27 @@ class BotApp:
             await self.reply(event, "Premium removed.")
         else:
             await self.reply(event, "That user doesn't have Premium.")
+
+    async def cmd_on(self, event, args: str) -> None:
+        if event.sender_id != self.owner_id:
+            return await self.reply(event, "🔒 Only the owner can use /on.")
+        cmd = args.lstrip("/").lower().split()[0] if args.strip() else ""
+        if cmd and cmd not in self.relay_commands:
+            return await self.reply(event, f"Unknown command: /{esc(cmd)}")
+        targets = [cmd] if cmd else list(self.cfg.commands)
+        for c in targets:
+            self.store.delete_setting(f"off:{c}")
+        names = " ".join(f"/{c}" for c in targets)
+        await self.reply(event, f"✅ {names} is now ON.")
+
+    async def cmd_off(self, event, args: str) -> None:
+        if event.sender_id != self.owner_id:
+            return await self.reply(event, "🔒 Only the owner can use /off.")
+        cmd = args.lstrip("/").lower().split()[0] if args.strip() else ""
+        if cmd and cmd not in self.relay_commands:
+            return await self.reply(event, f"Unknown command: /{esc(cmd)}")
+        targets = [cmd] if cmd else list(self.cfg.commands)
+        for c in targets:
+            self.store.set_setting(f"off:{c}", "1")
+        names = " ".join(f"/{c}" for c in targets)
+        await self.reply(event, f"🔒 {names} is now OFF for everyone except the owner.")
