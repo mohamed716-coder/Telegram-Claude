@@ -457,6 +457,25 @@ async def test_off_all_commands(app):
     assert "/kd test" in app.relay.sent
 
 
+async def test_owner_multiline_splits_into_separate_relays(app):
+    ev = await send(app, OWNER, "/kd hi\nho\nhe")
+    assert app.relay.sent == ["/kd hi", "/kd ho", "/kd he"]
+    assert any("Sent 3 messages" in r.text for r in ev.replies)
+
+
+async def test_multiline_is_owner_only(app):
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    ev = await send(app, USER, "/kd hi\nho\nhe")
+    assert app.relay.sent == ["/kd hi\nho\nhe"]
+
+
+async def test_owner_multiline_skips_blank_lines(app):
+    ev = await send(app, OWNER, "/kd hi\n\nhe")
+    assert app.relay.sent == ["/kd hi", "/kd he"]
+    assert any("Sent 2 messages" in r.text for r in ev.replies)
+
+
 async def test_off_is_owner_only(app):
     ev = await send(app, ADMIN2, "/off /kd")
     assert "Only the owner" in ev.last
