@@ -123,7 +123,7 @@ async def send(app, uid, text, username=None):
     return ev
 
 
-async def make_code(app, args="25 0", uid=OWNER):
+async def make_code(app, args="25 0 100", uid=OWNER):
     ev = await send(app, uid, f"/code {args}")
     return re.findall(r"ANONYMOUS-[A-Za-z0-9]{11}", ev.replies[0].text)
 
@@ -161,18 +161,18 @@ async def test_start_shows_plan_and_commands(app):
 
 
 async def test_code_output(app):
-    ev = await send(app, OWNER, "/code 25 0")
+    ev = await send(app, OWNER, "/code 25 0 100")
     assert ev.replies[0].text.startswith("✅ Code generated:\n<code>ANONYMOUS-")
-    assert len(await make_code(app, "7 10 5")) == 5
+    assert len(await make_code(app, "7 10 500 5")) == 5
 
 
 async def test_only_admins_can_make_codes(app):
-    assert (await send(app, USER, "/code 25 0")).replies == []
+    assert (await send(app, USER, "/code 25 0 100")).replies == []
     assert len(await make_code(app, uid=ADMIN2)) == 1
 
 
 async def test_code_bad_args(app):
-    assert "Usage" in (await send(app, OWNER, "/code 25")).last
+    assert "Usage" in (await send(app, OWNER, "/code 25 0")).last
 
 
 async def test_free_user_blocked(app):
@@ -182,7 +182,7 @@ async def test_free_user_blocked(app):
 
 
 async def test_redeem_then_use_and_status(app, clock):
-    [code] = await make_code(app, "25 0")
+    [code] = await make_code(app, "25 0 100")
     ev = await send(app, USER, f"/redeem {code}")
     assert "Premium activated" in ev.last
     assert any("redeemed" in t for _, t in app.bot.sent)  # admins notified
@@ -201,7 +201,7 @@ async def test_redeem_then_use_and_status(app, clock):
 
 
 async def test_antispam_from_code(app):
-    [code] = await make_code(app, "25 60")
+    [code] = await make_code(app, "25 60 100")
     await send(app, USER, f"/redeem {code}")
     await send(app, USER, "/kd one")
     ev = await send(app, USER, "/zz two")
@@ -210,7 +210,7 @@ async def test_antispam_from_code(app):
 
 
 async def test_expired(app, clock):
-    [code] = await make_code(app, "1 0")
+    [code] = await make_code(app, "1 0 100")
     await send(app, USER, f"/redeem {code}")
     clock[0] += DAY + 1
     assert "expired" in (await send(app, USER, "/kd hi")).last
@@ -227,7 +227,7 @@ async def test_commands_for_other_bots_ignored(app):
 
 
 async def test_admin_lists(app):
-    [a, b] = await make_code(app, "3 0 2")
+    [a, b] = await make_code(app, "3 0 100 2")
     await send(app, USER, f"/redeem {a}")
     codes = (await send(app, OWNER, "/codes")).last
     assert b in codes and a not in codes
@@ -238,7 +238,7 @@ async def test_admin_lists(app):
 
 
 async def test_owner_is_told_what_other_users_send(app):
-    [code] = await make_code(app, "25 0")
+    [code] = await make_code(app, "25 0 100")
     await send(app, USER, f"/redeem {code}")
     await send(app, USER, "/kd hello 123", username="bob")
     assert (OWNER, "USER: @bob\nhello 123") in app.bot.sent  # command itself removed
@@ -348,3 +348,115 @@ async def test_sends_new_message_if_edit_fails(app):
     app.relay.update = "final"
     await send(app, OWNER, "/kd hi")
     assert [t for _, t in app.bot.sent] == ["answer", "final" + footer("Unknown")]
+
+
+# ---- credits ----------------------------------------------------------------
+
+async def test_credits_deducted_on_use(app):
+    [code] = await make_code(app, "25 0 50")
+    await send(app, USER, f"/redeem {code}")
+    assert app.store.get_credits(USER) == 50
+    await send(app, USER, "/kd hello")
+    assert app.store.get_credits(USER) == 45  # 50 - 5
+
+
+async def test_zero_credits_blocks_use(app):
+    [code] = await make_code(app, "25 0 3")  # only 3 credits, need 5
+    await send(app, USER, f"/redeem {code}")
+    ev = await send(app, USER, "/kd hello")
+    assert "Not enough credits" in ev.last
+    assert app.relay.sent == []
+
+
+async def test_admins_dont_use_credits(app):
+    await send(app, OWNER, "/kd hello")
+    # owner has no credits row, should work fine
+
+
+async def test_credits_refunded_on_no_answer(app):
+    class NoAnswerRelay:
+        busy = False
+        sent = []
+        async def ask(self, text, deliver):
+            self.sent.append(text)
+            return False  # no answer
+    app.relay = NoAnswerRelay()
+    [code] = await make_code(app, "25 0 50")
+    await send(app, USER, f"/redeem {code}")
+    await send(app, USER, "/kd hello")
+    assert app.store.get_credits(USER) == 50  # refunded
+
+
+async def test_credits_only_code(app):
+    [premium_code] = await make_code(app, "25 0 0")
+    await send(app, USER, f"/redeem {premium_code}")
+    assert app.store.get_credits(USER) == 0
+    [credits_code] = await make_code(app, "500")  # credits-only
+    ev = await send(app, USER, f"/redeem {credits_code}")
+    assert "500 credits added" in ev.last
+    assert app.store.get_credits(USER) == 500
+
+
+async def test_credits_only_code_needs_premium(app):
+    [credits_code] = await make_code(app, "500")
+    ev = await send(app, USER, f"/redeem {credits_code}")
+    assert "need Premium first" in ev.last
+    # code should not be consumed
+    ev2 = await send(app, USER, f"/redeem {credits_code}")
+    assert "need Premium first" in ev2.last  # still there, not "already been used"
+
+
+async def test_status_shows_credits(app):
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    status = (await send(app, USER, "/status")).last
+    assert "Credits:</b> 100" in status
+
+
+async def test_admin_status_shows_all_users(app):
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    status = (await send(app, OWNER, "/status")).last
+    assert "Users (1)" in status
+    assert "100 credits" in status
+
+
+# ---- /on /off per command ---------------------------------------------------
+
+async def test_off_blocks_command(app):
+    await send(app, OWNER, "/off /kd")
+    ev = await send(app, OWNER, "/kd hello")  # owner is exempt
+    assert app.relay.sent == ["/kd hello"]
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    ev = await send(app, USER, "/kd test")
+    assert "currently off" in ev.last
+    # /zz should still work
+    ev2 = await send(app, USER, "/zz test")
+    assert "/zz test" in app.relay.sent
+
+
+async def test_on_reenables_command(app):
+    await send(app, OWNER, "/off /kd")
+    await send(app, OWNER, "/on /kd")
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    await send(app, USER, "/kd test")
+    assert "/kd test" in app.relay.sent
+
+
+async def test_off_all_commands(app):
+    await send(app, OWNER, "/off")
+    [code] = await make_code(app, "25 0 100")
+    await send(app, USER, f"/redeem {code}")
+    for cmd in ("kd", "ko", "zz"):
+        ev = await send(app, USER, f"/{cmd} test")
+        assert "currently off" in ev.last
+    await send(app, OWNER, "/on")
+    ev = await send(app, USER, "/kd test")
+    assert "/kd test" in app.relay.sent
+
+
+async def test_off_is_owner_only(app):
+    ev = await send(app, ADMIN2, "/off /kd")
+    assert "Only the owner" in ev.last
