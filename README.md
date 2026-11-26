@@ -17,18 +17,28 @@ activated with single-use codes that admins generate.
 
 | Command | Who | What it does |
 |---|---|---|
-| `/start` | everyone | Welcome screen with your plan and the commands |
-| `/status` | everyone | Your plan, Premium time left and expiry date |
+| `/start` | everyone | Welcome screen with your plan, credits and the commands |
+| `/status` | everyone | Your plan, credits, Premium time left. Admins see all users and on/off state |
 | `/redeem <code>` | everyone | Activate a code (days are added on top of any time you still have) |
-| `/kd` `/ko` `/zz` `<message>` | Premium | Sent to @KageNoKoroshiBot; its answer comes back to you |
-| `/code <days> <antispam_seconds> [count]` | admin | Generate code(s), e.g. `/code 25 0` → `ANONYMOUS-81ja5j9H5R4` |
+| `/kd` `/ko` `/zz` `<message>` | Premium | Sent to @KageNoKoroshiBot; costs 5 credits per use |
+| `/code <days> <antispam_seconds> <credits> [count]` | admin | Generate code(s), e.g. `/code 7 20 5000` |
+| `/code <credits>` | admin | Credits-only code (user must have Premium already) |
 | `/codes` | admin | List unused codes |
 | `/delcode <code>` | admin | Delete an unused code |
-| `/users` | admin | List Premium users with time left |
+| `/users` | admin | List Premium users with time left and credits |
 | `/removepremium <user_id>` | admin | Take Premium away from a user |
+| `/on [/command]` | owner | Turn a command back on (all if none specified) |
+| `/off [/command]` | owner | Turn a command off for everyone except the owner |
 
+- **Credits**: each use of `/kd`, `/zz` or `/ko` costs 5 credits. Everyone starts
+  with 0 credits. If the target bot doesn't answer, the credits are refunded.
+  Admins and the owner don't use credits.
+- **Credits-only codes**: `/code 5000` generates a code that adds 5000 credits
+  without changing the user's days. The user must have active Premium to redeem it.
+- **On/off per command**: `/off /kd` disables `/kd` for everyone except the owner.
+  `/off` with no argument disables all commands. The setting survives restarts.
 - **Admins**: the Telegram account you logged in with is always admin;
-  add more with `ADMIN_IDS`. Admins have no limits.
+  add more with `ADMIN_IDS`. Admins have no limits and don't use credits.
 - **Anti-spam**: the seconds from the code a user redeemed is how long they must
   wait between requests (`0` = no wait). Redeeming a newer code replaces it.
 - **Notifications**: admins get a message whenever someone redeems a code
