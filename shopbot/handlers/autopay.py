@@ -350,7 +350,7 @@ async def _check_payment(update: Update, context: Ctx, state: dict, reply: _Repl
         )
         return
     try:
-        decision = db.credit_binance_payment(user_id, payment, amount * 100,
+        decision = db.credit_binance_payment(user_id, payment, int(amount * 100),
                                              cfg.seller_auto_threshold * 100)
     except PaymentUsed as exc:  # claimed a moment earlier
         await _already_used(update, context, state, reply, exc.row)
@@ -539,7 +539,7 @@ async def _to_owner(update: Update, context: Ctx, state: dict, reply: _Reply, no
         return
     notes = list(state.get("notes", [])) + ([note] if note else [])
     found = [p for p in state.get("found", []) if p.received]
-    deposit = db.create_review_request(user_id, state["amount"] * 100, state["order_id"],
+    deposit = db.create_review_request(user_id, int(state["amount"] * 100), state["order_id"],
                                        "\n".join(notes), found, state.get("tried", []))
     _done(context, state)
     reached = await send_deposit_to_owner(context, deposit)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from decimal import Decimal
 from typing import Any
 
 from telegram import Update
@@ -36,7 +37,6 @@ from .common import (
     need_text,
     notify,
     parse_amount,
-    parse_int,
     role_of,
     set_state,
     show,
@@ -106,7 +106,8 @@ async def cb_deposit_custom(update: Update, context: Ctx) -> None:
     await show(
         update,
         context,
-        "✏️ Send the amount in $ you want to add.\nWhole numbers only, e.g. <code>25</code>",
+        "✏️ Send the amount in $ you want to add, at least 1$.\nDecimals are fine, e.g. <code>25</code> "
+        "or <code>12.50</code>",
         cancel_kb(),
     )
 
@@ -116,17 +117,22 @@ async def on_deposit_amount(update: Update, context: Ctx, state: dict) -> None:
     text = await need_text(update)
     if text is None:
         return
-    amount = parse_int(text)
+    cents = parse_amount(text)
     limit = cfg_of(context).max_custom_deposit
-    if amount is None:
+    if cents is None:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            "✏️ Please send a whole number only (no decimals), e.g. 25."
+            "✏️ Please send an amount like 25 or 12.50 (at most 2 decimals)."
         )
         return
-    if not 1 <= amount <= limit:
+    if not 100 <= cents <= limit * 100:
         await update.effective_message.reply_text(f"✏️ The amount must be between 1 and {limit}.")  # type: ignore[union-attr]
         return
-    await ask_payment(update, context, amount, new=True)
+    await ask_payment(update, context, dollars(cents), new=True)
+
+
+def dollars(cents: int) -> Decimal:
+    """A deposit amount in $: 25 for whole dollars, else with its cents (12.50)."""
+    return Decimal(cents // 100) if cents % 100 == 0 else Decimal(cents).scaleb(-2)
 
 
 async def ask_payment(update: Update, context: Ctx, amount: int, *, new: bool = False) -> None:
@@ -350,7 +356,7 @@ async def cb_deposit_send(update: Update, context: Ctx) -> None:
         return
     db = db_of(context)
     file_id, kind = state["receipt"]
-    deposit = db.create_deposit(query.from_user.id, state["amount"] * 100, file_id, kind)
+    deposit = db.create_deposit(query.from_user.id, int(state["amount"] * 100), file_id, kind)
     # Saved: from here on Telegram errors are best-effort, and the owner hears first.
     clear_state(context)
     await answer(query, "✅ Sent")

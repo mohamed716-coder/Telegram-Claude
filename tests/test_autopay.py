@@ -1962,3 +1962,17 @@ def test_the_key_check_warns_when_the_key_is_not_of_the_binance_id_customers_pay
     assert "restrict the key" not in report
     report = asyncio.run(binance_module.check("k" * 64, "s" * 64, binance_id="123456789"))
     assert "WARNING" not in report
+
+
+def test_a_custom_amount_with_cents_is_added_when_binance_has_exactly_that(tmp_path):
+    async def scenario(t: ShopTest) -> None:
+        with_binance(t, FakeBinance(pay(amount="12.5")))
+        register(t, ALICE)
+        calls = await t.press(ALICE, "dp")
+        calls = await t.press(ALICE, t.button(calls, "Custom"))
+        calls = await t.send(ALICE, "12.50")
+        assert "exactly <b>12.50 USDT</b>" in t.last_text(calls, ALICE["id"])
+        calls = await t.send(ALICE, ORDER)
+        assert "Payment received!" in texts(calls, ALICE)[-1] and balance(t, ALICE) == 1250
+
+    run(tmp_path, scenario)

@@ -142,7 +142,7 @@ order of several is drawn one product at a time (each seller's oldest one goes).
 
 ### 5. Adding balance (💳 Add Balance)
 
-Pick 10 / 20 / 30 / 50 / 100 $ or **Custom** (whole numbers only) and send the money with
+Pick 10 / 20 / 30 / 50 / 100 $ or **Custom** (at least 1$, cents allowed, e.g. 12.50) and send the money with
 Binance Pay to Binance ID **850940840**. Then:
 
 - **With a Binance API key** (automatic, see DEPLOY.md, *Automatic deposits with Binance

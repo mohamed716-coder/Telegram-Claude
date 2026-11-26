@@ -27,7 +27,7 @@ BINANCE_ID = "850940840"
 EXPIRED = "This request has expired"
 OWNER_ONLY = "Only the owner can do that."
 NOT_A_RECEIPT = "Please send the payment receipt as a photo"
-WHOLE_NUMBER = "Please send a whole number only"
+WHOLE_NUMBER = "Please send an amount like 25 or 12.50"
 OUT_OF_RANGE = "The amount must be between 1 and 100000."
 BAD_AMOUNT = "Please send an amount like 25 or 25.50."
 CONGRATS = "Congratulations"
@@ -289,16 +289,16 @@ def test_preset_amount_asks_for_binance_payment_and_receipt(tmp_path, amount):
     run(tmp_path, scenario)
 
 
-def test_custom_amount_rejects_decimals_text_zero_and_too_much(tmp_path):
+def test_custom_amount_rejects_text_too_many_decimals_too_little_and_too_much(tmp_path):
     async def scenario(t: ShopTest):
         calls = await t.press(ALICE, "dp")
         calls = await t.press(ALICE, t.button(calls, "Custom"))
-        assert "Whole numbers only" in t.last_text(calls)
-        for bad in ("12.5", "12,50", "abc", "-5", "1e3", "ten"):
+        assert "at least 1$" in t.last_text(calls) and "12.50" in t.last_text(calls)
+        for bad in ("12.505", "abc", "-5", "1e3", "ten"):
             calls = await t.send(ALICE, bad)
             assert WHOLE_NUMBER in t.last_text(calls), bad
             assert BINANCE_ID not in all_text(calls), bad
-        for bad in ("0", "100001", "5000000"):
+        for bad in ("0", "0.99", "0,5", "100000.01", "100001", "5000000"):
             calls = await t.send(ALICE, bad)
             assert OUT_OF_RANGE in t.last_text(calls), bad
             assert BINANCE_ID not in all_text(calls), bad
@@ -1452,5 +1452,21 @@ def test_withdrawal_decision_is_announced_even_if_editing_the_request_times_out(
         calls = await t.press(OWNER, f"wno:{wd['id']}")
         assert row_of(t, ADMIN)["earnings"] == 3000  # refunded
         assert "was rejected" in all_text(delivered(calls), ADMIN["id"])
+
+    run(tmp_path, scenario)
+
+
+
+def test_custom_amount_with_cents_goes_all_the_way(tmp_path):
+    async def scenario(t: ShopTest):
+        for sent, shown, cents in (("12.5", "12.50", 1250), ("1", "1", 100), ("7,05", "7.05", 705)):
+            calls = await t.press(ALICE, "dp")
+            calls = await t.press(ALICE, t.button(calls, "Custom"))
+            calls = await t.send(ALICE, sent)
+            assert f"Add {shown}$ to your balance" in t.last_text(calls), sent
+            calls = await t.send_photo(ALICE, f"receipt-{cents}")
+            assert f"Receipt received for <b>{shown}$</b>" in t.last_text(calls)
+            await t.press(ALICE, t.button(calls, "Confirm"))
+            assert deposits(t, ALICE)[-1]["amount"] == cents
 
     run(tmp_path, scenario)
