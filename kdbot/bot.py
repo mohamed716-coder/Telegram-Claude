@@ -354,32 +354,27 @@ class BotApp:
             )
         self.cooldown.mark(uid)
 
-        # Owner multi-line: each line becomes a separate relay request.
         body = text.split(maxsplit=1)[1]
-        lines = body.split("\n")
-        if uid == self.owner_id and len(lines) > 1:
-            lines = [l for l in lines if l.strip()]
-            if not lines:
-                return await self.reply(event, f"Usage: {command} &lt;your message&gt;")
-            status = await event.reply(f"Sending {len(lines)} messages…")
-            log.info("owner multi-line %s -> %d lines", relay_cmd, len(lines))
-            for line in lines:
-                await self._relay_one(event, f"{command} {line}", relay_cmd, needs_credits=False)
-            await status.edit(f"✅ Sent {len(lines)} messages.")
-            return
-
         username = getattr(await event.get_sender(), "username", None)
+        lines = [l for l in body.split("\n") if l.strip()]
+        if uid == self.owner_id and len(lines) > 1:
+            # Owner only: every line goes to the target bot as its own command, all at once.
+            texts = [f"{command} {l}" for l in lines]
+            return await self._relay(event, texts, relay_cmd, needs_credits=False, username=username)
+
         if uid != self.owner_id:
             await self.notify_owner(f"USER: {user_tag(username)}\n{body}")
-        await self._relay_one(event, text, relay_cmd, needs_credits=needs_credits, username=username)
+        await self._relay(event, [text], relay_cmd, needs_credits=needs_credits, username=username)
 
-    async def _relay_one(self, event, text: str, relay_cmd: str, *,
-                         needs_credits: bool, username: str | None = None) -> None:
-        """Send one message to the target bot and deliver the answer back."""
-        if username is None:
-            username = getattr(await event.get_sender(), "username", None)
-        status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
-        log.info("user %s -> %r", event.sender_id, text)
+    async def _relay(self, event, texts: list[str], relay_cmd: str, *,
+                     needs_credits: bool, username: str | None) -> None:
+        """Send `texts` to the target bot (together) and deliver the answers back."""
+        if self.relay.busy:
+            label = "In queue…"
+        else:
+            label = f"Sending {len(texts)} messages…" if len(texts) > 1 else "Working on it…"
+        status = await event.reply(label)
+        log.info("user %s -> %r", event.sender_id, texts)
         answered = False
         shown: dict[int, object] = {}
 
@@ -402,7 +397,10 @@ class BotApp:
                     log.exception("failed to forward %s %s", "update" if is_update else "reply", msg.id)
 
         try:
-            await self.relay.ask(text, deliver)
+            if len(texts) == 1:
+                await self.relay.ask(texts[0], deliver)
+            else:
+                await self.relay.ask_many(texts, deliver)
         except Exception:
             log.exception("relay failed")
             if needs_credits:
