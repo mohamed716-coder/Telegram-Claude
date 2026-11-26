@@ -354,18 +354,36 @@ class BotApp:
             )
         self.cooldown.mark(uid)
 
+        # Owner multi-line: each line becomes a separate relay request.
+        body = text.split(maxsplit=1)[1]
+        lines = body.split("\n")
+        if uid == self.owner_id and len(lines) > 1:
+            lines = [l for l in lines if l.strip()]
+            if not lines:
+                return await self.reply(event, f"Usage: {command} &lt;your message&gt;")
+            status = await event.reply(f"Sending {len(lines)} messages…")
+            log.info("owner multi-line %s -> %d lines", relay_cmd, len(lines))
+            for line in lines:
+                await self._relay_one(event, f"{command} {line}", relay_cmd, needs_credits=False)
+            await status.edit(f"✅ Sent {len(lines)} messages.")
+            return
+
         username = getattr(await event.get_sender(), "username", None)
         if uid != self.owner_id:
-            # Tell the owner who used it and what they typed after the command.
-            await self.notify_owner(f"USER: {user_tag(username)}\n{text.split(maxsplit=1)[1]}")
+            await self.notify_owner(f"USER: {user_tag(username)}\n{body}")
+        await self._relay_one(event, text, relay_cmd, needs_credits=needs_credits, username=username)
+
+    async def _relay_one(self, event, text: str, relay_cmd: str, *,
+                         needs_credits: bool, username: str | None = None) -> None:
+        """Send one message to the target bot and deliver the answer back."""
+        if username is None:
+            username = getattr(await event.get_sender(), "username", None)
         status = await event.reply("In queue…" if self.relay.busy else "Working on it…")
-        log.info("user %s -> %r", uid, text)
+        log.info("user %s -> %r", event.sender_id, text)
         answered = False
-        shown: dict[int, object] = {}  # target bot's message id -> our message showing it
+        shown: dict[int, object] = {}
 
         async def deliver(replies, is_update: bool) -> None:
-            # Called with the first answer, then again each time the target bot
-            # edits its answer; every call is for this user's request only.
             nonlocal answered
             if not answered:
                 answered = True
@@ -388,13 +406,13 @@ class BotApp:
         except Exception:
             log.exception("relay failed")
             if needs_credits:
-                self.store.add_credits(uid, CREDIT_COST)
+                self.store.add_credits(event.sender_id, CREDIT_COST)
             if not answered:
                 await status.edit("Something went wrong, please try again later.")
             return
         if not answered:
             if needs_credits:
-                self.store.add_credits(uid, CREDIT_COST)
+                self.store.add_credits(event.sender_id, CREDIT_COST)
             await status.edit(f"No answer within {self.cfg.reply_timeout:.0f}s, please try again.")
 
     def response_for(self, msg: Message, is_update: bool, username: str | None, relay_cmd: str):
