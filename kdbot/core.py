@@ -8,6 +8,7 @@ COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@(\w+))?(?=\s|$)")
 MAX_DAYS = 3650
 MAX_COOLDOWN = 86400
 MAX_CODES_AT_ONCE = 50
+MAX_CREDITS = 1_000_000
 
 
 def parse_command(text: str) -> tuple[str, str | None, str] | None:
@@ -37,20 +38,38 @@ def to_target_text(text: str, pattern: re.Pattern) -> str | None:
     return "/" + match.group(1) + text[match.end():]
 
 
-def parse_code_args(args: str) -> tuple[int, int, int]:
-    """Parse "/code <days> <antispam_seconds> [count]". Raises ValueError with a message."""
+def parse_code_args(args: str) -> tuple[int, int, int, int, int]:
+    """Parse "/code <days> <antispam> <credits> [count]" or "/code <credits>".
+
+    Returns (days, cooldown, credits, count).  days=0 means credits-only.
+    """
     parts = args.split()
-    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
-        raise ValueError("Usage: /code <days> <antispam_seconds> [count]\nExample: /code 25 0")
-    days, cooldown = int(parts[0]), int(parts[1])
-    count = int(parts[2]) if len(parts) == 3 else 1
+    usage = (
+        "Usage:\n"
+        "/code <days> <antispam_seconds> <credits> [count]\n"
+        "/code <credits>  (adds credits to an existing plan)\n"
+        "Example: /code 7 20 5000"
+    )
+    if not parts or not all(p.isdigit() for p in parts):
+        raise ValueError(usage)
+    if len(parts) == 1:
+        credits = int(parts[0])
+        if credits < 1 or credits > MAX_CREDITS:
+            raise ValueError(f"Credits must be between 1 and {MAX_CREDITS}.")
+        return 0, 0, credits, 1
+    if len(parts) not in (3, 4):
+        raise ValueError(usage)
+    days, cooldown, credits = int(parts[0]), int(parts[1]), int(parts[2])
+    count = int(parts[3]) if len(parts) == 4 else 1
     if not 1 <= days <= MAX_DAYS:
         raise ValueError(f"Days must be between 1 and {MAX_DAYS}.")
     if cooldown > MAX_COOLDOWN:
         raise ValueError(f"Anti-spam must be between 0 and {MAX_COOLDOWN} seconds.")
+    if credits < 0 or credits > MAX_CREDITS:
+        raise ValueError(f"Credits must be between 0 and {MAX_CREDITS}.")
     if not 1 <= count <= MAX_CODES_AT_ONCE:
         raise ValueError(f"You can generate 1 to {MAX_CODES_AT_ONCE} codes at once.")
-    return days, cooldown, count
+    return days, cooldown, credits, count
 
 
 def format_duration(seconds: float) -> str:
