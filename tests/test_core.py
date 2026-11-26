@@ -37,9 +37,11 @@ def test_parse_command():
 
 
 def test_parse_code_args():
-    assert parse_code_args("25 0") == (25, 0, 1)
-    assert parse_code_args("7 30 5") == (7, 30, 5)
-    for bad in ["", "25", "a b", "25 -1", "0 0", "25 0 0", "25 0 51", "1 2 3 4", "99999 0"]:
+    assert parse_code_args("7 20 5000") == (7, 20, 5000, 1)
+    assert parse_code_args("7 20 5000 10") == (7, 20, 5000, 10)
+    assert parse_code_args("5000") == (0, 0, 5000, 1)  # credits-only
+    for bad in ["", "a b c", "25 0", "25 -1 0", "0 0 0", "7 20 5000 0", "7 20 5000 51",
+                "1 2 3 4 5", "99999 0 100"]:
         with pytest.raises(ValueError):
             parse_code_args(bad)
 
